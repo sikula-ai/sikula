@@ -1167,7 +1167,7 @@ repair ID beyond its initial snapshot, executes the normal child pipeline, and
 requires new candidate-bound final verification. Additional repair rounds and
 broader amendment/decision recovery remain separate work.
 
-**Flat integration checkpoints:** ordinary delivery preparation asks the LLM to
+**Integration checkpoints:** ordinary delivery preparation asks the LLM to
 select useful boundaries from source obligations, dependency structure, repository
 context and integration risks. Small cohesive plans can remain root-only. The
 model emits `checkpoints: [{id, unit_ids, obligation_ids}]`; the coordinator makes
@@ -1177,12 +1177,19 @@ checkpoint declarations while preserving unrelated boundaries and all unit graph
 scope and contract guardrails. Known prerequisite stops still preempt correction calls.
 
 Schema version 3 prevents old runtimes from silently ignoring checkpoint barriers.
-Each checkpoint has a unique safe ID (not `root`), a proper dependency-closed subset
+Each checkpoint has a unique safe ID (not `root`), a proper subset
 of active units, and nonempty due obligations whose contributors are in that group.
-The group must have downstream consumers. The validator includes barriers in its
-cycle check; overlapping groups cannot deadlock one another. Checkpoints reference
-units, not other checkpoints. Amendments replace a superseded member with its
-replacement units, preserving the boundary and revalidating dependency closure.
+The group must have downstream consumers. Flat groups retain dependency closure.
+An optional `parent_id` declares the immediate verification parent (omitted means
+`root`). In a hierarchy, `unit_ids` and `obligation_ids` cover the whole subtree;
+direct ownership is the remainder after immediate children. Child coverage is
+contained in the parent, siblings cannot duplicate owned units/outcomes, and all
+parents must exist in an acyclic hierarchy. Unit `depends_on` edges stay separate:
+an external prerequisite is evidence, not duplicate ownership by the consumer.
+The validator includes both child-before-parent edges and consumer barriers in its
+cycle check. A parent barrier excludes its own subtree; siblings cannot deadlock.
+Amendments replace superseded members in every affected ancestor with their
+replacement units, preserving boundaries and revalidating the combined graph.
 The existing bounded root packet and every declared node packet must fit before
 plan publication or unit execution; this slice does not remove large-plan limits.
 
@@ -1302,7 +1309,7 @@ successful checkpoint artifact.
 These results remain private historical evidence, not approval of a later tree.
 The final gate can consume them through bounded composition described below;
 it never embeds descendant review history. The existing source, packet and unit
-limits still apply to the full-review fallback. Hierarchy remains later work.
+limits still apply to the full-review fallback; nesting does not lift them.
 
 **Checkpoint candidate applicability:** `core/delivery_checkpoint_applicability.py`
 derives a decision for the current assembled candidate and effective policy from
@@ -1386,16 +1393,25 @@ prompts and provider output remain private evidence.
 
 The final gate is mandatory after all work, including repairs. It covers
 cross-group and future obligations and approves only the exact final candidate.
-Adaptive insertion/regrouping, nested checkpoint composition, rolling windows and
-plans beyond the bounded root packet remain later work.
+Adaptive insertion/regrouping, bounded subtree recovery without full fallback,
+rolling windows and plans beyond the bounded root packet remain later work.
 
 **Shared node composition:** `core/delivery_composition_scope.py` captures one
 parent verification scope, its explicitly selected immediate children, exact
 retained authority restored from validated receipts, and final-check applicability.
 The verification snapshot carries this immutable composition scope alongside its
-candidate identity. The current flat-plan adapter selects all declared checkpoints
-for the final gate; leaf checkpoints have no composition scope. Selection of
-children is adapter policy, never a traversal performed by the shared mechanism.
+candidate identity. The plan adapter selects only declared immediate children for
+the final gate or an intermediate checkpoint; leaf checkpoints have no composition
+scope. Selection is adapter policy, never a traversal by the shared mechanism.
+Preparation independently reviews delegation and interfaces at every composing
+node. `composition_authority` contains input-bound intermediate receipts alongside
+existing leaf and final receipts; private `verified_composition_authority` restores
+only unchanged, independently checked packets. No receipt can be minted from graph
+structure alone. Source attribution names affected ancestors as well as leaves,
+including for context-only fragments. If a missing receipt restores a child's full
+authority beyond its parent's scoped packet, composition is unavailable and each
+node requires its preflighted full review.
+`final_gate=false` delegates to one top-level subtree, not multiple unrelated owners.
 Compact capture checks direct/inherited unit and obligation coverage, constraints,
 source-fragment coverage and the exact set of independently checked interfaces.
 It cannot authorize new source omissions or replace independent attribution.
@@ -1416,13 +1432,31 @@ review and persistence operations; it retains finalization, assembly reconciliat
 final validation and progress ownership. Real verification, readiness, audit,
 resume and final evidence validation use these shared paths. Capturing a scope
 neither allocates another attempt nor changes accepted identities, recovery budgets,
-historical admission or terminal boundary precedence. Public plan/control formats
-and existing flat fallback behavior remain unchanged. This is the foundation for
-nested execution, not a nested plan schema or an increase in supported plan limits.
+historical admission or terminal boundary precedence. Composition reservations,
+accepted role decisions and finite re-verification control live on the executing
+node's record. Intermediate checkpoint artifacts may contain typed closures with
+direct results and immediate child references; recursive loaders check exact scope,
+record binding, immutable execution inputs and cycles. Nested execution inputs use
+canonical unit-ID ordering so closure reconstruction does not store descendant order
+lists. Flat evidence keeps its existing ordering. No descendant descriptions or
+history enter compact parent packets.
 
-**Bounded final-gate composition:** the flat adapter to `core/delivery_composition.py` supplies a
-supported flat path with at most eight nonoverlapping checkpoints and 32 direct
-units. Only obligations whose complete current ownership lies inside a child can
+Scheduling is children-first regardless of declaration order. Explicit verification
+also requires accepted immediate children. Existing selection, dry-run and direct
+child-resume barriers remain enforced; deterministic assembly reconciliation still
+precedes handoff checks. Repair adds ownership to the repaired node and its ancestors;
+other consumers receive dependency edges without duplicating repair ownership.
+Changed work invalidates affected evidence and must pass current verification.
+Security/read-only boundaries survive concurrent candidate changes and audit failures.
+
+Candidate re-review of a composing child deliberately uses bounded full-scope review
+in this first nested slice; recursive selective recovery comes later. Finalization,
+final-only validation and the mandatory exact-candidate final gate stay unchanged.
+All current global and fallback limits remain; this is not a large-plan capacity claim.
+
+**Bounded node composition:** the plan adapter to `core/delivery_composition.py`
+supplies at most eight nonoverlapping immediate children and 32 direct units per
+composing node, including the final gate. Only obligations whose complete current ownership lies inside a child can
 be inherited; later repair owners leave an obligation direct. Without separately
 verified final responsibility, the packet retains full source authority, constraints,
 source accounting and direct work, replacing covered unit metadata with typed receipt
@@ -1581,8 +1615,8 @@ Public status exposes only existing bounded candidate-evidence states: fresh chi
 evidence can show `reverified` while final integration remains pending. Neither
 control records, child internals, typed outcomes nor history enter parent prompts.
 Dry-run and finalization validate accepted references and exhausted reservations.
-This remains a flat supported path with the current full-fallback and plan limits;
-nested subtree scheduling and large-plan scaling are subsequent work.
+Selective child re-review retains the current full-fallback and plan limits;
+recursive selective subtree recovery and large-plan scaling are subsequent work.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
 plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.

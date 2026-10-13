@@ -18,7 +18,7 @@ from core.delivery_composition import (
     composition_example,
     parse_composition,
 )
-from core.delivery_composition_scope import flat_delivery_composition_scope
+from core.delivery_composition_scope import delivery_composition_scope
 from core.delivery_verification_model import DeliveryVerificationRecord
 from core.delivery_verification_review import DeliveryIntegrationReviewParseError
 from core.delivery_progress import (
@@ -372,7 +372,7 @@ def _packet_snapshot(status: DeliveryStatusResult, **identity: str) -> SimpleNam
     scope = DeliveryVerificationScope.from_plan(status.plan)
     return SimpleNamespace(
         scope=scope,
-        composition_scope=flat_delivery_composition_scope(status.plan, scope),
+        composition_scope=delivery_composition_scope(status.plan, scope),
         identity=SimpleNamespace(**identity),
     )
 

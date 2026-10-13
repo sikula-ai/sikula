@@ -52,7 +52,7 @@ from core.delivery_checkpoints import (
     verification_scope_complete,
 )
 from core.delivery_verification_scope import DeliveryVerificationScope
-from core.delivery_checkpoint_evidence import load_checkpoint_evidence, store_checkpoint_evidence, store_root_evidence
+from core.delivery_checkpoint_evidence import store_checkpoint_evidence, store_root_evidence
 from core.delivery_checkpoint_applicability import validate_root_evidence
 from core.delivery_verification_model import (
     DeliveryVerificationRecord,
@@ -337,31 +337,21 @@ def verify_delivery_plan(
                 started_at=_now(),
                 review_rule_fingerprints=rule_fingerprints,
                 plan_content_fingerprint=plan_content_fingerprint,
-                reverification=(
-                    existing.reverification
-                    if node_id == "root" and existing and existing.gate_id == identity.gate_id
-                    else None
-                ),
+                reverification=(existing.reverification if existing and existing.gate_id == identity.gate_id else None),
                 composition_attempted=bool(
-                    node_id == "root"
-                    and existing
-                    and existing.gate_id == identity.gate_id
-                    and existing.composition_attempted
+                    existing and existing.gate_id == identity.gate_id and existing.composition_attempted
                 ),
                 composition_evidence_fingerprint=(
                     existing.composition_evidence_fingerprint
-                    if node_id == "root" and existing and existing.gate_id == identity.gate_id
+                    if existing and existing.gate_id == identity.gate_id
                     else None
                 ),
                 security_composition_attempted=bool(
-                    node_id == "root"
-                    and existing
-                    and existing.gate_id == identity.gate_id
-                    and existing.security_composition_attempted
+                    existing and existing.gate_id == identity.gate_id and existing.security_composition_attempted
                 ),
                 security_composition_evidence_fingerprint=(
                     existing.security_composition_evidence_fingerprint
-                    if node_id == "root" and existing and existing.gate_id == identity.gate_id
+                    if existing and existing.gate_id == identity.gate_id
                     else None
                 ),
             )
@@ -950,7 +940,13 @@ def _execute_gate(
             if scope.node_id != "root":
                 try:
                     fingerprint = store_checkpoint_evidence(
-                        root, evidence_path.parent, snapshot, passed, semantic.assessment
+                        root,
+                        evidence_path.parent,
+                        snapshot,
+                        passed,
+                        semantic.assessment,
+                        composition=semantic.composition,
+                        status=status,
                     )
                 except (OSError, ValueError):
                     return replace(
@@ -1067,13 +1063,20 @@ def _save_reverification(
 ) -> DeliveryVerificationRecord:
     """Persist reservations/results against the captured parent, never admission."""
     from core.delivery_reverification import validate_reverification
-    from core.delivery_checkpoints import checkpoint_pass_is_usable
 
     root = Path(status.project_root)
     path = delivery_progress_path(root, status.plan.plan_id)
     with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.reverification"):
         progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
-        record = progress.verification if progress else None
+        record = (
+            (
+                progress.verification
+                if snapshot.scope.node_id == "root"
+                else progress.checkpoint_verifications.get(snapshot.scope.node_id)
+            )
+            if progress
+            else None
+        )
         if (
             errors
             or record is None
@@ -1083,19 +1086,45 @@ def _save_reverification(
             raise ValueError("Candidate review attempt changed.")
         updated = replace(record, reverification=control)
         if not boundary:
-            current = get_delivery_status(status.plan_path, project_root=root)
+            current = verification_node_status(
+                get_delivery_status(status.plan_path, project_root=root), snapshot.scope.node_id
+            )
             if (
                 build_delivery_verification_identity(current, cfg, candidate_commit=snapshot.identity.candidate_commit)
                 != snapshot.identity
                 or not _assembly_ref_matches(root, current, snapshot.identity.candidate_commit)
-                or current.checkpoint_verifications != status.checkpoint_verifications
-                or any(not checkpoint_pass_is_usable(current, child, cfg) for child in current.plan.checkpoints)
+                or not _composition_children_unchanged(status, current, snapshot, cfg)
             ):
                 raise ValueError("Candidate review authority changed.")
             validate_reverification(current, updated, cfg, scope=snapshot.composition_scope)
         # Boundary evidence is captured even if a concurrent assembly moved.
-        write_delivery_progress(path, replace(progress, verification=updated))
+        if snapshot.scope.node_id == "root":
+            updated_progress = replace(progress, verification=updated)
+        else:
+            updated_progress = replace(
+                progress,
+                checkpoint_verifications={**progress.checkpoint_verifications, snapshot.scope.node_id: updated},
+            )
+        write_delivery_progress(path, updated_progress)
         return updated
+
+
+def _composition_children_unchanged(
+    status: DeliveryStatusResult,
+    current: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    cfg: dict[str, Any],
+) -> bool:
+    from core.delivery_checkpoints import checkpoint_pass_is_usable
+
+    if snapshot.composition_scope is None:
+        return False
+    children = {child.node_id for child in snapshot.composition_scope.children}
+    return all(
+        current.checkpoint_verifications.get(key) == status.checkpoint_verifications.get(key) for key in children
+    ) and all(
+        checkpoint_pass_is_usable(current, child, cfg) for child in current.plan.checkpoints if child.id in children
+    )
 
 
 def _composition_review(
@@ -1488,22 +1517,29 @@ def _persist_composition_control(
     reverification: dict[str, Any] | None = None,
 ) -> DeliveryVerificationRecord:
     """Only this captured running attempt can reserve work or accept its proof."""
-    from core.delivery_checkpoints import checkpoint_pass_is_usable
 
     root = Path(status.project_root)
     with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.composition"):
-        current = get_delivery_status(status.plan_path, project_root=root)
+        current = verification_node_status(
+            get_delivery_status(status.plan_path, project_root=root), snapshot.scope.node_id
+        )
         if build_delivery_verification_identity(
             current, cfg, candidate_commit=snapshot.identity.candidate_commit
         ) != snapshot.identity or not _assembly_ref_matches(root, current, snapshot.identity.candidate_commit):
             raise ValueError("Composition candidate changed.")
-        if current.checkpoint_verifications != status.checkpoint_verifications or any(
-            not checkpoint_pass_is_usable(current, child, cfg) for child in status.plan.checkpoints
-        ):
+        if not _composition_children_unchanged(status, current, snapshot, cfg):
             raise ValueError("Composition checkpoint authority changed.")
         path = delivery_progress_path(root, status.plan.plan_id)
         progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
-        record = progress.verification if progress else None
+        record = (
+            (
+                progress.verification
+                if snapshot.scope.node_id == "root"
+                else progress.checkpoint_verifications.get(snapshot.scope.node_id)
+            )
+            if progress
+            else None
+        )
         if (
             errors
             or record is None
@@ -1518,7 +1554,7 @@ def _persist_composition_control(
             reverification=reverification if reverification is not None else record.reverification,
             **{prefix + "composition_attempted": attempted, prefix + "composition_evidence_fingerprint": fingerprint},
         )
-        write_delivery_progress(path, mark_delivery_verification(progress, updated))
+        write_delivery_progress(path, mark_delivery_verification(progress, updated, node_id=snapshot.scope.node_id))
         return updated
 
 
@@ -1690,16 +1726,15 @@ def _persist_terminal_if_current(
                 return None
             if record.gate_id != identity.gate_id or record.attempt != terminal.attempt or record.status != "running":
                 return None
-            if node_id == "root":
-                # Reservations and accepted composition survive interruption and outer error paths.
-                terminal = replace(
-                    terminal,
-                    reverification=record.reverification,
-                    composition_attempted=record.composition_attempted,
-                    composition_evidence_fingerprint=record.composition_evidence_fingerprint,
-                    security_composition_attempted=record.security_composition_attempted,
-                    security_composition_evidence_fingerprint=record.security_composition_evidence_fingerprint,
-                )
+            # Reservations and accepted composition survive interruption and outer error paths.
+            terminal = replace(
+                terminal,
+                reverification=record.reverification,
+                composition_attempted=record.composition_attempted,
+                composition_evidence_fingerprint=record.composition_evidence_fingerprint,
+                security_composition_attempted=record.security_composition_attempted,
+                security_composition_evidence_fingerprint=record.security_composition_evidence_fingerprint,
+            )
             if terminal.reverification:
                 from core.delivery_verification_model import parse_delivery_verification_record
 
@@ -1727,11 +1762,9 @@ def _persist_terminal_if_current(
                     return None
             if node_id != "root" and terminal.passed:
                 try:
-                    evidence = load_checkpoint_evidence(
-                        root, progress_path.parent, terminal, plan_id=plan_id, node_id=node_id
-                    )
-                    if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, node_id)):
-                        raise ValueError("Checkpoint evidence coverage changed.")
+                    from core.delivery_checkpoint_applicability import validate_node_evidence
+
+                    validate_node_evidence(status, terminal, node_id=node_id)
                 except (OSError, ValueError):
                     terminal = replace(
                         terminal,
@@ -1864,6 +1897,7 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
         )
     if readiness.required and status.plan and status.plan.checkpoints:
         from core.delivery_checkpoints import checkpoint_barrier_issue, checkpoint_pass_is_usable
+        from core.delivery_checkpoint_model import checkpoint_children
         from core.delivery_handoff import load_delivery_dependency_handoffs
 
         if (
@@ -1884,15 +1918,16 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
         issue = checkpoint_barrier_issue(status, project_config)
         if issue is not None and issue.code == "delivery_checkpoint.handoff_stale":
             return _blocked_result(status, issue.code, [issue])
-        if status.verification_node == "root" and any(
-            not checkpoint_pass_is_usable(status, checkpoint, project_config) for checkpoint in status.plan.checkpoints
+        if any(
+            not checkpoint_pass_is_usable(status, checkpoint, project_config)
+            for checkpoint in checkpoint_children(status.plan.checkpoints, status.verification_node)
         ):
             return _blocked_result(status, "delivery_checkpoint.required")
         scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
         _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), Path(status.project_root))
         if issues:
             return _blocked_result(status, issues[0].code, issues)
-    if status.verification_node == "root" and status.verification and status.verification.reverification:
+    if status.verification and status.verification.reverification:
         record = status.verification
         try:
             from core.delivery_reverification import validate_reverification, reverification_budget_exhausted

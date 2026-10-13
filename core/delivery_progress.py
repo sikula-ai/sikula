@@ -1410,9 +1410,10 @@ def delivery_verification_projection(
 
 def render_delivery_checkpoint_status(checkpoint: dict[str, Any]) -> str:
     """Render one checkpoint from the public status projection."""
+    parent = f"; parent: {checkpoint['parent_id']}" if checkpoint.get("parent_id") else ""
     return (
         f"Checkpoint {checkpoint['id']}: {checkpoint['status']} "
-        f"(candidate evidence: {checkpoint['candidate_evidence']})"
+        f"(candidate evidence: {checkpoint['candidate_evidence']}{parent})"
     )
 
 

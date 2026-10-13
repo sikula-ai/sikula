@@ -9,7 +9,7 @@ import subprocess
 from typing import Any
 
 from core.delivery_authority import verification_authority_fragments
-from core.delivery_composition_scope import DeliveryCompositionScope, flat_delivery_composition_scope
+from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_model import delivery_verification_covers_obligations
@@ -411,16 +411,12 @@ def check_delivery_verification_readiness(
             checkpoint_readiness = check_delivery_verification_readiness(status, project_config, node_id=checkpoint.id)
             errors.extend(issue for issue in checkpoint_readiness.errors if issue not in errors)
 
-    if scope is not None and scope.node_id == "root" and not errors and plan.verified_final_gate_authority:
-        from core.delivery_reverification import preflight_review_packets
+    composition_scope = delivery_composition_scope(plan, scope) if scope is not None and not errors else None
+    if composition_scope is not None and composition_scope.retained_authority_json:
+        from core.delivery_reverification import preflight_node_review_packets
 
         try:
-            preflight_review_packets(
-                status,
-                project_config,
-                root,
-                source_text,
-            )
+            preflight_node_review_packets(composition_scope, project_config, root, source_text)
         except (OSError, ValueError):
             errors.append(
                 DeliveryPlanIssue(
@@ -595,7 +591,9 @@ def build_delivery_verification_snapshot(
         for unit in status.units
         if unit.status == "done" and unit.id in scope.unit_ids
     )
-    # Preserve the root's persisted schema-1 identity and ordered evidence hash.
+    if any(node.parent_id != "root" for node in status.plan.checkpoints):
+        completed_units = tuple(sorted(completed_units, key=lambda unit: unit.unit_id))
+    # Preserve the flat root's persisted identity and ordered evidence hash.
     completed_scope_fingerprint = _fingerprint([unit.to_dict() for unit in completed_units])
     config_fingerprint = delivery_verification_config_fingerprint(
         project_config,
@@ -637,7 +635,7 @@ def build_delivery_verification_snapshot(
         scope=scope,
         completed_units=completed_units,
         identity=identity,
-        composition_scope=flat_delivery_composition_scope(status.plan, scope),
+        composition_scope=delivery_composition_scope(status.plan, scope),
     )
 
 

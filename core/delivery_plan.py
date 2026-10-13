@@ -332,6 +332,8 @@ class DeliveryPlan:
     verified_checkpoint_authority: dict[str, str] = field(default_factory=dict, repr=False)
     final_gate_authority: str | None = field(default=None, repr=False)
     verified_final_gate_authority: str | None = field(default=None, repr=False)
+    composition_authority: dict[str, str] = field(default_factory=dict, repr=False)
+    verified_composition_authority: dict[str, str] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -678,6 +680,10 @@ def _parse_delivery_plan(
                 obligation_sources={item.id: set(item.source_fragment_ids) for item in obligations},
                 constraint_ids={item.id for item in constraints},
                 private_rationales=False,
+                hierarchical=isinstance(data.get("checkpoints"), list)
+                and any(
+                    isinstance(node, dict) and node.get("parent_id", "root") != "root" for node in data["checkpoints"]
+                ),
             )
         except SourceAccountingError as exc:
             errors.append(DeliveryPlanIssue("error", exc.code, str(exc), "source_accounting"))
@@ -784,6 +790,19 @@ def _parse_delivery_plan(
                     "source_accounting",
                 )
             )
+    composition_authority = data.get("composition_authority", {})
+    if (
+        not isinstance(composition_authority, dict)
+        or not set(composition_authority) <= {node.parent_id for node in checkpoints} - {"root"}
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            for value in composition_authority.values()
+        )
+    ):
+        errors.append(
+            DeliveryPlanIssue("error", "checkpoints.authority_invalid", "Invalid node composition authority receipts.")
+        )
+        composition_authority = {}
     checkpoint_authority = data.get("checkpoint_authority", {})
     final_gate_authority = data.get("final_gate_authority")
     if final_gate_authority is not None and (
@@ -839,13 +858,18 @@ def _parse_delivery_plan(
         verification=verification,
         checkpoints=checkpoints,
         checkpoint_authority=checkpoint_authority,
+        composition_authority=composition_authority,
         final_gate_authority=final_gate_authority,
     )
     if not errors:
         plan.verified_checkpoint_authority.update(
             restore_checkpoint_authority(plan, source_task_description or "", project_root)
         )
-        from core.delivery_final_authority import restore_final_authority
+        from core.delivery_final_authority import restore_final_authority, restore_composition_authority
+
+        plan.verified_composition_authority.update(
+            restore_composition_authority(plan, source_task_description or "", project_root)
+        )
 
         plan = replace(
             plan,

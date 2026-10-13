@@ -59,6 +59,7 @@ def parse_source_accounting(
     constraint_ids: set[str],
     private_rationales: bool,
     allow_unresolved: bool = False,
+    hierarchical: bool = False,
 ) -> list[DeliverySourceAccounting]:
     """Validate exhaustive source and constraint coverage and obligation provenance."""
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
@@ -134,7 +135,9 @@ def parse_source_accounting(
                 )
             checkpoint_ids = list(checkpoint_ids)
         final_gate = item.get("final_gate", True)
-        if type(final_gate) is not bool or (not final_gate and (checkpoint_ids is None or len(checkpoint_ids) != 1)):
+        if type(final_gate) is not bool or (
+            not final_gate and (not checkpoint_ids or (not hierarchical and len(checkpoint_ids) != 1))
+        ):
             raise SourceAccountingError(
                 "checkpoint_invalid", "Delegated final authority requires one owning checkpoint."
             )

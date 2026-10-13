@@ -11,7 +11,13 @@ import posixpath
 import subprocess
 from typing import Any
 
-from core.delivery_checkpoint_model import DeliveryCheckpoint, checkpoint_guarded_units
+from core.delivery_checkpoint_model import (
+    DeliveryCheckpoint,
+    checkpoint_guarded_units,
+    checkpoint_children,
+    checkpoint_postorder,
+    checkpoint_input_units,
+)
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_scope import DeliveryVerificationScope
@@ -128,7 +134,7 @@ def verification_scope_complete(status: DeliveryStatusResult) -> bool:
         return False
     scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     done = {unit.id for unit in status.units if unit.status == "done"}
-    return bool(scope.unit_ids) and set(scope.unit_ids) <= done
+    return bool(scope.unit_ids) and checkpoint_input_units(scope.unit_ids, status.plan.units) <= done
 
 
 def checkpoint_policy_payload(status: DeliveryStatusResult, scope: DeliveryVerificationScope) -> dict[str, Any]:
@@ -136,15 +142,27 @@ def checkpoint_policy_payload(status: DeliveryStatusResult, scope: DeliveryVerif
 
     assert status.project_root is not None and status.plan is not None
     root = Path(status.project_root)
+    inputs = checkpoint_input_units(scope.unit_ids, status.plan.units)
     contracts = {
         unit.id: sha256(_read_assembly_contract(root, unit.task_path, private_artifact_roots=())).hexdigest()
         for unit in status.plan.units
-        if unit.id in scope.unit_ids
+        if unit.id in inputs
     }
     context = scope.plan_context()
     # Ownership added to a later group cannot change this group's inherited rule.
     for constraint in context["constraints"]:
         constraint["unit_ids"] = [key for key in constraint["unit_ids"] if key in scope.unit_ids]
+    prerequisites = inputs - set(scope.unit_ids)
+    if prerequisites:
+        context["prerequisites"] = [
+            {"id": unit.id, "commit": unit.commit, "handoff_fingerprint": unit.handoff_fingerprint}
+            for unit in status.units
+            if unit.id in prerequisites
+        ]
+    children = checkpoint_children(status.plan.checkpoints, scope.node_id)
+    if children:
+        context["composition_children"] = [child.to_dict() for child in children]
+        context["composition_authority"] = status.plan.verified_composition_authority.get(scope.node_id)
     return {
         "scope": context,
         "contracts": contracts,
@@ -190,6 +208,15 @@ def checkpoint_pass_is_usable(
         )
         if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)):
             return False
+        if checkpoint_children(status.plan.checkpoints, checkpoint.id):
+            from core.delivery_checkpoint_applicability import validate_node_evidence
+
+            validate_node_evidence(node, record, node_id=checkpoint.id)
+            if any(
+                not checkpoint_pass_is_usable(status, child, cfg)
+                for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+            ):
+                return False
         plan_path = Path(status.plan_path).relative_to(root).as_posix()
         if (
             _checkpoint_file_fingerprints(
@@ -199,7 +226,11 @@ def checkpoint_pass_is_usable(
         ):
             return False
         checkpoint_plan_fingerprint(status, status.assembled_commit)
-        contract_paths = [unit.task_path for unit in status.plan.units if unit.id in checkpoint.unit_ids]
+        contract_paths = [
+            unit.task_path
+            for unit in status.plan.units
+            if unit.id in checkpoint_input_units(checkpoint.unit_ids, status.plan.units)
+        ]
         # Checkout contracts bind the policy identity, but cannot attest to
         # downstream changes that exist only in the assembled candidate.
         reviewed_contracts = _checkpoint_file_fingerprints(
@@ -432,10 +463,15 @@ def _checkpoint_file_fingerprints(
 def due_delivery_checkpoint(status: DeliveryStatusResult, cfg: dict[str, Any] | None = None) -> str | None:
     if not status.valid or status.plan is None:
         return None
-    for checkpoint in getattr(status.plan, "checkpoints", ()):
-        if verification_scope_complete(
-            verification_node_status(status, checkpoint.id)
-        ) and not checkpoint_pass_is_usable(status, checkpoint, cfg):
+    for checkpoint in checkpoint_postorder(status.plan.checkpoints):
+        if (
+            verification_scope_complete(verification_node_status(status, checkpoint.id))
+            and all(
+                checkpoint_pass_is_usable(status, child, cfg)
+                for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+            )
+            and not checkpoint_pass_is_usable(status, checkpoint, cfg)
+        ):
             return checkpoint.id
     return None
 
@@ -495,6 +531,8 @@ def checkpoint_projection(status: DeliveryStatusResult) -> list[dict[str, Any]]:
             "obligation_count": len(checkpoint.obligation_ids),
             "candidate_evidence": (status.checkpoint_candidate_evidence or {}).get(checkpoint.id, "not_checked"),
         }
+        if checkpoint.parent_id != "root":
+            item["parent_id"] = checkpoint.parent_id
         if record:
             item.update(attempt=record.attempt, candidate_commit=record.candidate_commit)
             if record.stop_code:
@@ -573,6 +611,13 @@ def checkpoint_preflight_issue(
             )
         ):
             return DeliveryPlanIssue("error", record.stop_code, "Checkpoint retains a required recovery boundary.")
+    if any(
+        not checkpoint_pass_is_usable(status, child, cfg)
+        for child in checkpoint_children(status.plan.checkpoints, status.verification_node)
+    ):
+        return DeliveryPlanIssue(
+            "error", "delivery_checkpoint.required", "Immediate child checkpoints must pass before their parent."
+        )
     scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     root = Path(status.project_root)
     _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), root)
@@ -607,8 +652,9 @@ def checkpoint_authority_evidence_issue(
         private_roots = _configured_private_artifact_roots(root, cfg)
         # Batch each commit once, but never carry evidence across preflight calls.
         expected_by_commit: dict[str, list[tuple[str, str, bool]]] = {}
+        inputs = checkpoint_input_units(scope.unit_ids, status.plan.units)
         for unit in status.units:
-            if unit.id not in scope.unit_ids:
+            if unit.id not in inputs:
                 continue
             if unit.status != "done":
                 raise ValueError("Incomplete checkpoint input")

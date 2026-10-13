@@ -491,7 +491,12 @@ def parse_delivery_authoring_output(
     except DeliveryCheckpointError as exc:
         raise DeliveryAuthoringParseError("delivery_authoring.checkpoints_invalid", str(exc)) from None
     accounting = _parse_source_accounting(
-        data, source_task_description, obligations, constraints, required=require_source_accounting
+        data,
+        source_task_description,
+        obligations,
+        constraints,
+        required=require_source_accounting,
+        hierarchical=any(node.parent_id != "root" for node in checkpoints),
     )
     from core.delivery_authority import validate_checkpoint_attribution
 
@@ -522,6 +527,7 @@ def parse_delivery_constraint_verification_output(
     require_source_accounting: bool = False,
     require_obligations: bool = False,
     known_obligation_source_fragment_ids: set[str] | None = None,
+    hierarchical: bool = False,
 ) -> DeliveryConstraintVerification:
     data = _parse_output_object(output, schema_keys=_CONSTRAINT_VERIFICATION_SCHEMA_KEYS)
     _reject_unknown_fields(data, _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS, "constraint verification")
@@ -626,7 +632,12 @@ def parse_delivery_constraint_verification_output(
         obligations=obligations,
         obligation_gaps=obligation_gaps,
         source_accounting=_parse_source_accounting(
-            data, source_task_description, obligations, constraints, required=require_source_accounting
+            data,
+            source_task_description,
+            obligations,
+            constraints,
+            required=require_source_accounting,
+            hierarchical=hierarchical,
         )
         if require_source_accounting or data.get("source_accounting")
         else None,
@@ -647,6 +658,7 @@ def _parse_source_accounting(
     constraints: list[DeliveryAuthoringConstraintDraft],
     *,
     required: bool,
+    hierarchical: bool = False,
 ) -> list[DeliverySourceAccounting] | None:
     gaps = data.get("constraint_gaps", [])
     if any(item.kind == "stop_and_follow_up" for item in constraints) or (
@@ -663,6 +675,7 @@ def _parse_source_accounting(
             obligation_sources={item.id: set(item.source_fragment_ids) for item in obligations},
             constraint_ids={item.id for item in constraints},
             private_rationales=True,
+            hierarchical=hierarchical,
             allow_unresolved=True,
         )
     except SourceAccountingError as exc:

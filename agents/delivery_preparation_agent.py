@@ -99,11 +99,17 @@ Delivery-plan constraints:
   integration risk, and repository context. Return checkpoints as a list of objects with id,
   unit_ids, obligation_ids and optional integration_context. Small cohesive plans may use an empty list; use checkpoints when downstream
   work relies on an integrated outcome from several units. Do not ask the operator to place boundaries.
-  Each group must be a proper dependency-closed subset of active units with downstream consumers.
+  Each group must be a proper subset of active units with downstream consumers; flat groups are dependency-closed.
   Declare only obligations due at this boundary: all their contributing owners must be in the group.
   Future and cross-group outcomes remain due at the final root gate. IDs are unique safe slugs (80
   characters maximum); root is reserved. Barriers must not introduce dependency cycles. Include all
-  prerequisites, even when already covered by an earlier checkpoint. No nested checkpoint references.
+  prerequisites for flat groups. For a hierarchy, add parent_id naming the immediate parent
+  checkpoint (omitted means root). unit_ids and obligation_ids cover the node's entire subtree;
+  direct work/outcomes are the remainder after immediate children. Child coverage must be inside
+  its parent and siblings must not duplicate owned units or outcomes. External prerequisites remain
+  ordinary depends_on edges, not duplicate ownership. Place cross-child outcomes at their common
+  parent and include them in every ancestor. Parent barriers must not block their descendants.
+  Give each child a bounded integration_context describing its interface for its parent.
   Keep each packet bounded (256 units, 512 KiB rendered prompt); the full root review must still fit.
   Checkpoint validation never relaxes external prerequisite, security, ownership, or read-only stops.
 - constraints must explicitly list every hard source-task constraint that affects delivery, or be
@@ -120,9 +126,11 @@ Delivery-plan constraints:
   checkpoint IDs; [] reserves authority exclusively for the final gate. Include each checkpoint whose contributors need this fragment, even when an
   outcome needs future contributors. Include context-only fragments, enclosing context, prohibitions,
   required literals, asset references and cross-group/security rules; never route by obligation IDs alone.
+  In a hierarchy, include every assigned checkpoint's ancestors, including for context-only fragments.
   Explain semantic attribution in the private rationale. If relevance is uncertain, keep it global.
   final_gate defaults to true. Set it false ONLY for internal authority fully discharged by one named
-  checkpoint; shared, global and cross-group rules, security boundaries and integration requirements
+  checkpoint subtree; include its affected ancestors in checkpoint_ids. Shared, global and cross-group
+  rules, security boundaries and integration requirements
   remain final-gate authority. Propose a bounded integration_context (at most 4096 UTF-8 bytes) for each
   checkpoint: its contribution, interfaces, shared dependencies and security assumptions needed by
   the final reviewers. This context cannot replace required exact literals or governing source.
@@ -440,6 +448,12 @@ declared nodes. Otherwise report affected fragments in source_accounting_gaps fo
 Independently check final_gate=false exclusions and each checkpoint integration_context against the
 complete source and contracts. Confirm internal outcomes are fully discharged by exactly one child,
 and exact global/cross-group/security authority and relevant context remain with the final gate.
+For a hierarchy perform the same independent delegation check at EVERY composing node, including
+its retained direct and cross-child authority and each immediate-child interface. Ancestors must
+receive governing source in checkpoint_ids; shared prerequisites do not transfer outcome ownership.
+A fragment can be child-local only when exactly one immediate child owns all its obligations and
+constraints and its reviewed attribution includes that child. Otherwise it stays with the parent.
+The final_gate_authority_complete decision covers delegation at all composing nodes, not just root.
 The bounded integration context must suffice to assess later changes and shared dependencies without
 replaying every child obligation; it is not authority to replace source requirements with a summary.
 Set final_gate_authority_complete=true ONLY if this delegation is sound for BOTH semantic and security
@@ -1804,6 +1818,7 @@ Authoritative source:
                 unit_task_markdown_by_id={unit.id: unit.task_markdown for unit in units},
                 require_unit_context=verify_unit_context,
                 require_source_accounting=source_accounting is not None,
+                hierarchical=any(node.parent_id != "root" for node in checkpoints),
                 require_obligations=verify_obligations,
                 known_obligation_source_fragment_ids=known_obligation_source_fragment_ids,
             )
