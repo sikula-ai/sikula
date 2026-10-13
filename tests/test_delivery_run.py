@@ -89,7 +89,7 @@ def _status(unit_statuses: list[str], *, final_commit: str | None = None) -> Sim
         status=overall,
         errors=[],
         warnings=[],
-        plan=SimpleNamespace(final_branch="sikula/delivery/demo"),
+        plan=SimpleNamespace(final_branch="sikula/delivery/demo", checkpoints=[]),
         units=units,
         assembled_commit=final_commit,
         assembly_status="ready" if final_commit else None,
