@@ -1322,10 +1322,34 @@ def _render_plan_yaml(draft: DeliveryAuthoringDraft, unit_task_paths: dict[str, 
             for node in draft.checkpoints
         }
         if draft.constraint_verification.final_gate_authority_complete:
+            from dataclasses import replace
+            import json
+
+            checked_plan = replace(
+                checked.plan,
+                verified_checkpoint_authority={
+                    node.id: json.dumps(checkpoint_authority_context(checked.plan, node.id, source), ensure_ascii=True)
+                    for node in draft.checkpoints
+                },
+            )
+            from core.delivery_checkpoint_model import checkpoint_children
             from core.delivery_final_authority import final_authority_context
 
+            plan_data["composition_authority"] = {}
+            for node in draft.checkpoints:
+                if checkpoint_children(draft.checkpoints, node.id):
+                    try:
+                        context = final_authority_context(checked_plan, source, node.id)
+                    except (ValueError, KeyError):
+                        continue
+                    plan_data["composition_authority"][node.id] = checkpoint_authority_receipt(
+                        context, {key: contracts[key] for key in node.unit_ids}
+                    )
+            if not plan_data["composition_authority"]:
+                plan_data.pop("composition_authority")
+
             try:
-                final_context = final_authority_context(checked.plan, source)
+                final_context = final_authority_context(checked_plan, source)
             except (ValueError, KeyError):
                 pass  # Unsupported delegation retains the independently checked full review.
             else:

@@ -168,9 +168,26 @@ def store_checkpoint_evidence(
     snapshot: DeliveryVerificationSnapshot,
     record: DeliveryVerificationRecord,
     assessment: DeliveryIntegrationAssessment,
+    *,
+    composition: CompositionResult | None = None,
+    status: DeliveryStatusResult | None = None,
 ) -> str:
     if snapshot.scope.node_id == "root":
         raise ValueError("Checkpoint evidence requires a checkpoint scope.")
+    if composition is not None and composition.child_refs and not composition.fallback:
+        if status is None:
+            raise ValueError("Checkpoint closure requires accepted children.")
+        from core.delivery_composition_scope import capture_composition_attempt
+
+        attempt = capture_composition_attempt(status, record, snapshot.composition_scope)
+        payload = build_node_closure(root, directory, snapshot, record, assessment, composition, attempt)
+        path = checkpoint_evidence_path(directory, record)
+        existing = read_repair_state(root, path)
+        if existing is not None and existing != payload:
+            raise ValueError("Checkpoint closure for this attempt already exists.")
+        if existing is None:
+            write_repair_state(root, path, payload)
+        return _fingerprint(payload)
     return _store_evidence(root, directory, snapshot, record, assessment)
 
 
@@ -242,7 +259,13 @@ def _store_evidence(
 
 
 def load_checkpoint_evidence(
-    root: Path, directory: Path, record: DeliveryVerificationRecord, *, plan_id: str, node_id: str
+    root: Path,
+    directory: Path,
+    record: DeliveryVerificationRecord,
+    *,
+    plan_id: str,
+    node_id: str,
+    _ancestors: frozenset[str] = frozenset(),
 ) -> DeliveryVerificationEvidence:
     """Load explicit results, never infer them from counts or replay review audit."""
     if node_id == "root" or not record.passed or record.checkpoint_evidence_fingerprint is None:
@@ -254,6 +277,22 @@ def load_checkpoint_evidence(
         raise ValueError("Accepted checkpoint evidence is invalid.") from None
     if not intact:
         raise ValueError("Accepted checkpoint evidence is unavailable.")
+    if payload.get("child_evidence") is not None:
+        if node_id in _ancestors or len(_ancestors) >= 256:
+            raise ValueError("Invalid recursive checkpoint evidence.")
+        try:
+            return _parse_node_closure(
+                root,
+                directory,
+                payload,
+                record,
+                plan_id=plan_id,
+                node_id=node_id,
+                unit_order=None,
+                _ancestors=_ancestors | {node_id},
+            )
+        except (KeyError, TypeError, AttributeError, RecursionError):
+            raise ValueError("Accepted checkpoint closure is invalid.") from None
     return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id)
 
 
@@ -294,6 +333,7 @@ def _parse_node_closure(
     plan_id: str,
     node_id: str,
     unit_order: tuple[str, ...] | None,
+    _ancestors: frozenset[str] = frozenset(),
 ) -> DeliveryVerificationEvidence:
     """Resolve bounded immediate children for deterministic coverage, never into prompts."""
     from core.delivery_composition import MAX_COMPOSITION_CHILDREN, composition_evidence_path, fingerprint
@@ -340,7 +380,9 @@ def _parse_node_closure(
         if not isinstance(child, dict) or set(child) != {"node_id", "verification"} or child["node_id"] in origins:
             raise ValueError("Invalid child closure reference.")
         origin = parse_delivery_verification_record(child["verification"])
-        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=plan_id, node_id=child["node_id"])
+        evidence = load_checkpoint_evidence(
+            root, directory, origin, plan_id=plan_id, node_id=child["node_id"], _ancestors=_ancestors
+        )
         origins[child["node_id"]] = origin.checkpoint_evidence_fingerprint
         units.extend(unit.to_dict() for unit in evidence.completed_units)
         constraints.update(evidence.constraint_ids)
@@ -350,7 +392,9 @@ def _parse_node_closure(
     # Restore the captured declaration order, then use the same immutable execution
     # fingerprint check as full evidence. No per-unit order list enters the artifact.
     by_id = {unit["unit_id"]: unit for unit in units}
-    if unit_order is None or len(by_id) != len(units) or set(by_id) != set(unit_order):
+    if unit_order is None:
+        unit_order = tuple(sorted(by_id))
+    if len(by_id) != len(units) or set(by_id) != set(unit_order):
         raise ValueError("Root closure execution inputs changed.")
     expanded = {key: value for key, value in payload.items() if key != "child_evidence"}
     expanded.update(

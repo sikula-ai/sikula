@@ -1,4 +1,4 @@
-"""Explicit flat checkpoint declarations and deterministic barrier validation."""
+"""Checkpoint ownership hierarchy and deterministic dependency barriers."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ class DeliveryCheckpoint:
     unit_ids: tuple[str, ...]
     obligation_ids: tuple[str, ...]
     integration_context: str | None = None
+    parent_id: str = "root"
 
     def to_dict(self, *, public: bool = False) -> dict[str, Any]:
         identity = project_delivery_public_identity if public else lambda value: value
@@ -29,11 +30,47 @@ class DeliveryCheckpoint:
         }
         if self.integration_context is not None and not public:
             data["integration_context"] = self.integration_context
+        if self.parent_id != "root":
+            data["parent_id"] = identity(self.parent_id)
         return data
 
 
 class DeliveryCheckpointError(ValueError):
     pass
+
+
+def checkpoint_children(checkpoints: list[DeliveryCheckpoint], node_id: str = "root") -> list[DeliveryCheckpoint]:
+    return [node for node in checkpoints if node.parent_id == node_id]
+
+
+def checkpoint_input_units(unit_ids: tuple[str, ...], units: list[Any]) -> set[str]:
+    """Owned work plus transitive prerequisites, without transferring ownership."""
+    by_id = {unit.id: unit for unit in units}
+    inputs: set[str] = set()
+    pending = list(unit_ids)
+    while pending:
+        key = pending.pop()
+        if key in inputs:
+            continue
+        if key not in by_id:
+            raise DeliveryCheckpointError("Checkpoint prerequisite is unavailable.")
+        inputs.add(key)
+        pending.extend(by_id[key].depends_on)
+    return inputs
+
+
+def checkpoint_postorder(checkpoints: list[DeliveryCheckpoint]) -> list[DeliveryCheckpoint]:
+    """Stable children-first order; reject cycles even for unparsed callers."""
+    remaining = list(checkpoints)
+    ordered = []
+    while remaining:
+        parents = {node.parent_id for node in remaining}
+        leaves = [node for node in remaining if node.id not in parents]
+        if not leaves:
+            raise DeliveryCheckpointError("Checkpoint hierarchy contains a cycle.")
+        ordered.extend(leaves)
+        remaining = [node for node in remaining if node not in leaves]
+    return ordered
 
 
 def checkpoint_guarded_units(checkpoint: DeliveryCheckpoint, units: list[Any]) -> set[str]:
@@ -50,15 +87,20 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
     if value is None:
         return []
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_CHECKPOINTS:
-        raise DeliveryCheckpointError("checkpoints must be a bounded list of flat declarations.")
+        raise DeliveryCheckpointError("checkpoints must be a bounded list of declarations.")
+    hierarchical = any(isinstance(item, dict) and item.get("parent_id", "root") != "root" for item in value)
     active = {unit.id: unit for unit in units if not getattr(unit, "superseded", False)}
     outcomes = {item.id: item for item in obligations}
     result: list[DeliveryCheckpoint] = []
     seen: set[str] = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) - {"integration_context"} != {"id", "unit_ids", "obligation_ids"}:
+        if not isinstance(item, dict) or set(item) - {"integration_context", "parent_id"} != {
+            "id",
+            "unit_ids",
+            "obligation_ids",
+        }:
             raise DeliveryCheckpointError(
-                "Each checkpoint requires id, unit_ids, obligation_ids and optional integration_context."
+                "Each checkpoint requires id, unit_ids, obligation_ids and optional integration_context/parent_id."
             )
         identity = item["id"]
         if (
@@ -87,7 +129,7 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
             raise DeliveryCheckpointError(
                 "A checkpoint must cover a proper subset of active units; the root covers the full plan."
             )
-        if any(not set(active[unit_id].depends_on) <= covered for unit_id in covered):
+        if not hierarchical and any(not set(active[unit_id].depends_on) <= covered for unit_id in covered):
             raise DeliveryCheckpointError("Checkpoint unit_ids must include every prerequisite of its covered units.")
         for obligation_id in item["obligation_ids"]:
             obligation = outcomes.get(obligation_id)
@@ -117,13 +159,37 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
                 raise DeliveryCheckpointError(
                     "Checkpoint integration_context must be nonempty UTF-8 text within 4096 bytes."
                 )
+        parent_id = item.get("parent_id", "root")
+        if not isinstance(parent_id, str) or (parent_id != "root" and not _ID.fullmatch(parent_id)):
+            raise DeliveryCheckpointError("Checkpoint parent_id must identify a node or root.")
         checkpoint = DeliveryCheckpoint(
-            identity, tuple(item["unit_ids"]), tuple(item["obligation_ids"]), integration_context
+            identity, tuple(item["unit_ids"]), tuple(item["obligation_ids"]), integration_context, parent_id
         )
         if not checkpoint_guarded_units(checkpoint, units):
             raise DeliveryCheckpointError("A checkpoint must guard downstream consumers of its completed group.")
         seen.add(identity.casefold())
         result.append(checkpoint)
+
+    by_id = {node.id: node for node in result}
+    for node in result:
+        if node.parent_id != "root":
+            parent = by_id.get(node.parent_id)
+            if parent is None or parent.id == node.id:
+                raise DeliveryCheckpointError("Checkpoint parent must be a distinct declared node.")
+            if not set(node.unit_ids) <= set(parent.unit_ids) or not set(node.obligation_ids) <= set(
+                parent.obligation_ids
+            ):
+                raise DeliveryCheckpointError("Checkpoint child coverage must be contained in its parent.")
+    checkpoint_postorder(result)
+    if hierarchical:
+        for parent_id in ("root", *by_id):
+            owned_units: set[str] = set()
+            owned_outcomes: set[str] = set()
+            for child in checkpoint_children(result, parent_id):
+                if owned_units.intersection(child.unit_ids) or owned_outcomes.intersection(child.obligation_ids):
+                    raise DeliveryCheckpointError("Sibling checkpoints must not duplicate owned units or outcomes.")
+                owned_units.update(child.unit_ids)
+                owned_outcomes.update(child.obligation_ids)
 
     # Include barriers in the dependency graph: otherwise overlapping groups can
     # each wait for work that the other checkpoint prevents from starting.
@@ -131,6 +197,7 @@ def parse_delivery_checkpoints(value: Any, units: list[Any], obligations: list[A
     for checkpoint in result:
         node = "checkpoint:" + checkpoint.id
         graph[node] = {"unit:" + key for key in checkpoint.unit_ids}
+        graph[node].update("checkpoint:" + child.id for child in checkpoint_children(result, checkpoint.id))
         for key in checkpoint_guarded_units(checkpoint, units):
             graph["unit:" + key].add(node)
     while graph:

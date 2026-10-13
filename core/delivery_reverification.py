@@ -9,7 +9,7 @@ import re
 from typing import Any, TYPE_CHECKING, Callable
 
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
-from core.delivery_composition_scope import DeliveryCompositionScope, flat_delivery_composition_scope
+from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
 from core.delivery_verification_model import DeliveryVerificationRecord, parse_delivery_verification_record
 from core.delivery_verification_scope import DeliveryVerificationScope
@@ -121,7 +121,9 @@ def candidate_snapshot(
     identity = replace(
         identity, gate_id=fingerprint({key: val for key, val in vars(identity).items() if key != "gate_id"})
     )
-    return replace(snapshot, identity=identity)
+    # This first hierarchy slice uses the preflighted full child scope here.
+    # Recursive selective recovery needs its own durable subtree budget contract.
+    return replace(snapshot, identity=identity, composition_scope=None)
 
 
 def composition_origin(
@@ -168,7 +170,9 @@ def validate_reverification(
     if record.reverification is None:
         return
     parse_reverification(record.reverification, record.to_dict())
-    composition_scope = scope or flat_delivery_composition_scope(status.plan)
+    composition_scope = scope or delivery_composition_scope(
+        status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+    )
     if composition_scope is None:
         raise ValueError("Candidate review requires captured composition authority.")
     root = Path(status.project_root)
@@ -281,16 +285,6 @@ def load_full_result(
         known_unit_ids=set(scope.unit_ids),
         known_obligation_ids=set(scope.obligation_ids) if role == "semantic" else set(),
     )
-
-
-def preflight_review_packets(status: DeliveryStatusResult, cfg: dict[str, Any], cwd: Path, source: str) -> None:
-    """Size every potential child and full fallback before reserving provider work."""
-    scope = flat_delivery_composition_scope(status.plan)
-    if scope is None:
-        scope = DeliveryCompositionScope(
-            DeliveryVerificationScope.from_plan(status.plan), (), include_final_checks=True
-        )
-    preflight_node_review_packets(scope, cfg, cwd, source)
 
 
 def preflight_node_review_packets(

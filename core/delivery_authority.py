@@ -73,10 +73,28 @@ def validate_checkpoint_attribution(
         owners = {owner for key in record.obligation_ids for owner in outcomes[key].unit_ids} | {
             owner for key in record.constraint_ids for owner in rules[key].unit_ids
         }
+        if not record.final_gate:
+            top = set()
+            for key in record.checkpoint_ids:
+                node = nodes[key]
+                while node.parent_id != "root":
+                    node = nodes[node.parent_id]
+                top.add(node.id)
+            if len(top) != 1:
+                raise SourceAccountingError(
+                    "checkpoint_invalid", "Delegated authority requires one owning top-level subtree."
+                )
         required = {node.id for node in checkpoints if owners.intersection(node.unit_ids)}
+        # Context-only fragments have no contributing owner, but a parent's
+        # authority must still contain the authority delegated to its children.
+        for key in record.checkpoint_ids:
+            parent = nodes[key].parent_id
+            while parent != "root":
+                required.add(parent)
+                parent = nodes[parent].parent_id
         if not required <= set(record.checkpoint_ids):
             raise SourceAccountingError(
-                "checkpoint_incomplete", "Checkpoint attribution omits authority governing a covered contributor."
+                "checkpoint_incomplete", "Checkpoint attribution omits authority governing a contributor or ancestor."
             )
 
 

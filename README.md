@@ -300,9 +300,15 @@ first triggers a bounded review of the affected checkpoint on the final candidat
 including required security review. The final gate then reassesses integration.
 Historical admission and completed units stay unchanged. Unsupported cases, confirmed
 semantic gaps or repeated uncertainty use a bounded full-review fallback.
-Each checkpoint has its own persistent
-repair budget. Nested hierarchy and large-plan scaling remain later work: this
-slice still requires the full-review fallback to fit its existing limits.
+Preparation can nest checkpoints using `parent_id`: a parent checks its own
+integration requirements and the evidence of its immediate children. `unit_ids`
+and `obligation_ids` describe the whole subtree; `depends_on` still orders unit
+execution. Children pass before the parent releases its downstream consumers.
+Both reviewers use independently checked authority at each level, and accepted
+intermediate evidence survives interruption. Text and JSON identify a checkpoint's
+parent. Each checkpoint retains its own persistent repair budget.
+Large-plan scaling remains later work: candidate re-review and repair still
+require the conservative full-scope fallback to fit existing limits.
 Successful checkpoints retain private structured obligation results bound to the
 reviewed candidate and gate attempt. Handoff checks verify their integrity without
 replaying review logs or adding history to prompts. Missing or damaged evidence

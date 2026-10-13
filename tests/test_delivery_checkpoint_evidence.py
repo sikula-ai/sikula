@@ -372,8 +372,8 @@ def test_gate_rechecks_evidence_before_acceptance(checkpoint_plan):
     path, cfg = checkpoint_plan
     original = store_checkpoint_evidence
 
-    def damage(root, directory, snapshot, record, assessment):
-        fingerprint = original(root, directory, snapshot, record, assessment)
+    def damage(root, directory, snapshot, record, assessment, **kwargs):
+        fingerprint = original(root, directory, snapshot, record, assessment, **kwargs)
         checkpoint_evidence_path(directory, record).unlink()
         return fingerprint
 
@@ -387,8 +387,8 @@ def test_changed_authority_during_publication_leaves_only_unaccepted_evidence(ch
     path, cfg = checkpoint_plan
     original = store_checkpoint_evidence
 
-    def advance(root, directory, snapshot, record, assessment):
-        fingerprint = original(root, directory, snapshot, record, assessment)
+    def advance(root, directory, snapshot, record, assessment, **kwargs):
+        fingerprint = original(root, directory, snapshot, record, assessment, **kwargs)
         path.write_text(path.read_text() + "\n# concurrent plan change\n")
         return fingerprint
 

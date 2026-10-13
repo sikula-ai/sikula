@@ -867,7 +867,18 @@ def _appended_plan(
                 item["depends_on"] = [*item.get("depends_on", []), unit_id]
         # Unaccepted covering groups also inherit the repaired outcome, even when
         # they contain no direct consumer. Preserve earlier historical handoffs.
+        nodes = {item["id"]: item for item in data["checkpoints"]}
+        hierarchical = any(item.get("parent_id", "root") != "root" for item in nodes.values())
+        ancestors = {node_id}
+        parent = checkpoint.get("parent_id", "root")
+        while parent != "root":
+            ancestors.add(parent)
+            parent = nodes[parent].get("parent_id", "root")
         for item in data["checkpoints"]:
+            if hierarchical:
+                if item["id"] in ancestors:
+                    item["unit_ids"] = [*item["unit_ids"], unit_id]
+                continue
             if (
                 item["id"] == node_id
                 or guarded.intersection(item["unit_ids"])

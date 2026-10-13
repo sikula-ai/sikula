@@ -1,4 +1,4 @@
-"""Captured node composition inputs; flat delivery policy lives in the adapter.
+"""Captured node composition inputs; hierarchy policy lives in the adapter.
 
 These private objects do not grant authority. Retained packets must already have
 been restored from independently validated receipts by the plan loader.
@@ -128,23 +128,30 @@ class DeliveryCompositionAttempt:
                 raise ValueError("Composition candidate changed.")
 
 
-def flat_delivery_composition_scope(
+def delivery_composition_scope(
     plan: DeliveryPlan, parent: DeliveryVerificationScope | None = None
 ) -> DeliveryCompositionScope | None:
-    """The current flat schema delegates all checkpoints only to the final gate.
-
-    Keep schema knowledge here. Nested scheduling and reviewed intermediate-node
-    authority are intentionally not introduced by the shared mechanism.
-    """
+    """Select declared immediate children; graph policy stays out of the common cycle."""
     parent = parent or DeliveryVerificationScope.from_plan(plan)
-    if parent.node_id != "root" or not plan.checkpoints:
+    from core.delivery_checkpoint_model import checkpoint_children
+
+    children = checkpoint_children(plan.checkpoints, parent.node_id)
+    if not children:
         return None
-    return DeliveryCompositionScope(
-        parent,
-        tuple(DeliveryVerificationScope.from_plan(plan, child.id) for child in plan.checkpoints),
-        plan.verified_final_gate_authority,
-        include_final_checks=True,
-    )
+    try:
+        return DeliveryCompositionScope(
+            parent,
+            tuple(DeliveryVerificationScope.from_plan(plan, child.id) for child in children),
+            plan.verified_final_gate_authority
+            if parent.node_id == "root"
+            else plan.verified_composition_authority.get(parent.node_id),
+            include_final_checks=parent.node_id == "root",
+        )
+    except ValueError:
+        # Losing one child's attribution receipt restores its complete source
+        # packet, which may exceed the parent's independently scoped authority.
+        # Such packets cannot compose; use each node's preflighted full review.
+        return None
 
 
 def capture_composition_attempt(
@@ -152,7 +159,9 @@ def capture_composition_attempt(
     parent: DeliveryVerificationRecord | None,
     scope: DeliveryCompositionScope | None = None,
 ) -> DeliveryCompositionAttempt:
-    scope = scope or flat_delivery_composition_scope(status.plan)
+    scope = scope or delivery_composition_scope(
+        status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+    )
     if scope is None:
         raise ValueError("Composition scope is unavailable.")
     return DeliveryCompositionAttempt.capture(scope, status.checkpoint_verifications, parent)

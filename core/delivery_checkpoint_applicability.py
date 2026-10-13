@@ -28,26 +28,41 @@ class CheckpointApplicability:
     binding: str | None = None
 
 
-def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> None:
+def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, node_id: str) -> None:
     """Validate exact typed coverage; the caller separately validates freshness."""
     if not status.plan or not status.project_root:
-        raise ValueError("Root evidence requires plan authority.")
+        raise ValueError("Node evidence requires plan authority.")
     from core.delivery_reverification import validate_reverification
-    from core.delivery_composition_scope import flat_delivery_composition_scope
+    from core.delivery_composition_scope import delivery_composition_scope
 
-    scope = DeliveryVerificationScope.from_plan(status.plan, "root")
-    composition_scope = flat_delivery_composition_scope(status.plan, scope)
+    scope = DeliveryVerificationScope.from_plan(status.plan, node_id)
+    composition_scope = delivery_composition_scope(status.plan, scope)
     validate_reverification(status, record, scope=composition_scope)
     root = Path(status.project_root)
-    evidence = load_root_evidence(
-        root,
-        delivery_progress_path(root, status.plan.plan_id).parent,
-        record,
-        plan_id=status.plan.plan_id,
-        unit_order=tuple(unit.id for unit in status.units if unit.status == "done"),
-    )
+    if node_id == "root":
+        evidence = load_root_evidence(
+            root,
+            delivery_progress_path(root, status.plan.plan_id).parent,
+            record,
+            plan_id=status.plan.plan_id,
+            unit_order=(
+                tuple(sorted(unit.id for unit in status.units if unit.status == "done"))
+                if any(node.parent_id != "root" for node in status.plan.checkpoints)
+                else tuple(unit.id for unit in status.units if unit.status == "done")
+            ),
+        )
+    else:
+        from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+
+        evidence = load_checkpoint_evidence(
+            root,
+            delivery_progress_path(root, status.plan.plan_id).parent,
+            record,
+            plan_id=status.plan.plan_id,
+            node_id=node_id,
+        )
     if not evidence.covers(scope):
-        raise ValueError("Root evidence coverage changed.")
+        raise ValueError("Node evidence coverage changed.")
     if record.composition_evidence_fingerprint:
         from core.delivery_composition import load_composition
 
@@ -69,6 +84,10 @@ def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerific
         security = load_composition(status, record, review_kind="security", scope=composition_scope)
         if not security.fallback and not security.assessment.approved:
             raise ValueError("Security composition changed.")
+
+
+def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> None:
+    validate_node_evidence(status, record, node_id="root")
 
 
 def checkpoint_applicability(

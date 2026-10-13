@@ -914,8 +914,13 @@ python3 -m ruff format .
   budgets or discard a terminal boundary to obtain a reusable result.
 - **Always** drive shared composition, accepted evidence selection and packet
   preflight from a captured parent scope and explicit immediate children. Keep
-  flat-plan selection, final-only validation and finalization in the delivery
-  adapter/coordinator. Scope capture cannot grant authority, refill an attempt or
+  plan hierarchy selection, final-only validation and finalization in the delivery
+  adapter/coordinator. Keep prerequisite evidence separate from owned outcomes;
+  children precede parents, and a parent barrier cannot block its own subtree.
+  Independently check authority delegation at every composing node. Validate
+  recursive accepted closures without expanding descendant history into prompts.
+  Scope repair ownership to the repaired node and its ancestors; consumer dependency
+  edges do not grant sibling ownership. Scope capture cannot grant authority, refill an attempt or
   import unrelated checkpoints or descendant history into a parent prompt.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery

@@ -15,6 +15,7 @@ from core.delivery_authority import (
 )
 from core.delivery_obligations import delivery_authority_fragments
 from core.delivery_verification_scope import DeliveryVerificationScope
+from core.delivery_checkpoint_model import checkpoint_children
 
 if TYPE_CHECKING:
     from core.delivery_plan import DeliveryPlan
@@ -23,17 +24,21 @@ if TYPE_CHECKING:
 FINAL_AUTHORITY_POLICY = "final-authority-closure-v1"
 
 
-def final_authority_context(plan: DeliveryPlan, source: str) -> dict[str, Any]:
+def final_authority_context(plan: DeliveryPlan, source: str, node_id: str = "root") -> dict[str, Any]:
     """Build a proposed packet; only an independently issued receipt authorizes it."""
     if not plan.source_task or not plan.source_accounting or not plan.checkpoints:
         raise ValueError("Final delegation requires source-backed checkpoint authority.")
     covered: set[str] = set()
     inherited: set[str] = set()
-    nodes = {node.id: node for node in plan.checkpoints}
+    immediate = checkpoint_children(plan.checkpoints, node_id)
+    if not immediate:
+        raise ValueError("Composition authority requires immediate children.")
+    scope = DeliveryVerificationScope.from_plan(plan, node_id)
+    nodes = {node.id: node for node in immediate}
     outcomes = {item.id: item for item in plan.obligations}
     rules = {item.id: item for item in plan.constraints}
     children = []
-    for node in plan.checkpoints:
+    for node in immediate:
         if (
             not node.integration_context
             or covered.intersection(node.unit_ids)
@@ -55,7 +60,23 @@ def final_authority_context(plan: DeliveryPlan, source: str) -> dict[str, Any]:
             }
         )
     selected = set()
+    hierarchical = any(node.parent_id != "root" for node in plan.checkpoints)
     for record in plan.source_accounting:
+        if record.source_fragment_id not in scope.source_fragment_ids:
+            continue
+        if hierarchical:
+            # Independent preparation review approves this delegation at every level.
+            # Structural ownership alone never grants permission to use the packet.
+            owning_children = [
+                child
+                for child in immediate
+                if child.id in (record.checkpoint_ids or ())
+                and set(record.obligation_ids) <= set(child.obligation_ids)
+                and all(set(rules[key].unit_ids) <= set(child.unit_ids) for key in record.constraint_ids)
+            ]
+            if (node_id == "root" and record.final_gate) or len(owning_children) != 1:
+                selected.add(record.source_fragment_id)
+            continue
         if record.final_gate:
             selected.add(record.source_fragment_id)
             continue
@@ -67,15 +88,17 @@ def final_authority_context(plan: DeliveryPlan, source: str) -> dict[str, Any]:
         ):
             raise ValueError("Shared outcomes and constraints cannot be delegated as child-local authority.")
     selected = _enclosing_fragments(source, selected)
-    context = DeliveryVerificationScope.from_plan(plan).plan_context()
-    context.pop("title")
+    context = scope.plan_context()
+    context.pop("title", None)
+    if node_id != "root":
+        context["verification_node"] = {"id": node_id}
     context["units"] = [item for item in context["units"] if item["id"] not in covered]
     # Dependency edges to child internals are represented by a bounded node reference.
     for unit in context["units"]:
         unit["depends_on"] = [key for key in unit["depends_on"] if key not in covered]
         unit["checkpoint_dependencies"] = [
             node.id
-            for node in plan.checkpoints
+            for node in immediate
             if set(node.unit_ids).intersection(next(u.depends_on for u in plan.units if u.id == unit["id"]))
         ]
     context["obligations"] = [item for item in context["obligations"] if item["id"] not in inherited]
@@ -88,7 +111,7 @@ def final_authority_context(plan: DeliveryPlan, source: str) -> dict[str, Any]:
         {
             **item.to_context_dict(),
             "unit_ids": [key for key in item.unit_ids if key in direct_units],
-            "checkpoint_ids": [node.id for node in plan.checkpoints if set(node.unit_ids).intersection(item.unit_ids)],
+            "checkpoint_ids": [node.id for node in immediate if set(node.unit_ids).intersection(item.unit_ids)],
         }
         for item in plan.constraints
         if item.id in constraint_ids
@@ -97,7 +120,7 @@ def final_authority_context(plan: DeliveryPlan, source: str) -> dict[str, Any]:
     for item in context["obligations"]:
         owners = set(item["unit_ids"])
         item["unit_ids"] = [key for key in item["unit_ids"] if key in direct_units]
-        item["checkpoint_ids"] = [node.id for node in plan.checkpoints if owners.intersection(node.unit_ids)]
+        item["checkpoint_ids"] = [node.id for node in immediate if owners.intersection(node.unit_ids)]
     context["source_accounting"] = [
         {
             "source_fragment_id": item.source_fragment_id,
@@ -143,3 +166,30 @@ def restore_final_authority(plan: DeliveryPlan, source: str, root: Path) -> str 
     except (OSError, RuntimeError, ValueError, KeyError):
         pass
     return None
+
+
+def restore_composition_authority(plan: DeliveryPlan, source: str, root: Path) -> dict[str, str]:
+    from core.delivery_amendment import _read_assembly_contract
+
+    result = {}
+    for node_id, receipt in plan.composition_authority.items():
+        if node_id not in plan.verified_checkpoint_authority or any(
+            child.id not in plan.verified_checkpoint_authority
+            for child in checkpoint_children(plan.checkpoints, node_id)
+        ):
+            continue
+        try:
+            scope = DeliveryVerificationScope.from_plan(plan, node_id)
+            context = final_authority_context(plan, source, node_id)
+            contracts = {
+                unit.id: authority_contract_fingerprint(
+                    _read_assembly_contract(root, unit.task_path, private_artifact_roots=())
+                )
+                for unit in plan.units
+                if unit.id in scope.unit_ids
+            }
+            if checkpoint_authority_receipt(context, contracts) == receipt:
+                result[node_id] = json.dumps(context, ensure_ascii=True)
+        except (OSError, RuntimeError, ValueError, KeyError):
+            continue
+    return result
