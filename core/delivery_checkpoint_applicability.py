@@ -128,17 +128,21 @@ def checkpoint_applicability(
     root_current = root_matches and root_record.passed
     root_rejected = root_matches and root_record.semantic_status == "rejected"
     root_unavailable = False
-    current_children = set()
+    current_children = {}
     if root_matches and root_record.reverification:
         try:
             from core.delivery_reverification import validate_reverification
 
             validate_reverification(status, root_record, cfg)
-            current_children = {
-                key
-                for key, item in root_record.reverification["children"].items()
-                if item["verification"]["status"] == "passed"
-            }
+            from core.delivery_candidate_control import expanded_child
+
+            pending = list(root_record.reverification["children"].items())
+            while pending:
+                key, entry = pending.pop()
+                child = expanded_child(status, entry)
+                if child.passed:
+                    current_children[key] = child.checkpoint_evidence_fingerprint
+                pending.extend((child.reverification or {}).get("children", {}).items())
         except (OSError, RuntimeError, ValueError):
             root_unavailable = True
     if root_current:
@@ -172,13 +176,7 @@ def checkpoint_applicability(
                 "target": vars(identity),
                 "decision": decision,
                 "root_evidence": root_record.root_evidence_fingerprint if decision == "reverified" else None,
-                "candidate_evidence": (root_record.reverification or {})
-                .get("children", {})
-                .get(checkpoint.id, {})
-                .get("verification", {})
-                .get("checkpoint_evidence_fingerprint")
-                if root_matches
-                else None,
+                "candidate_evidence": current_children.get(checkpoint.id) if root_matches else None,
             }
             binding = "sha256:" + sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         result[checkpoint.id] = CheckpointApplicability(

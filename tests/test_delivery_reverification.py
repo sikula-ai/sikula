@@ -520,7 +520,7 @@ def test_security_requested_child_gap_invalidates_earlier_semantic_approval(clos
         from core import delivery_verify as verify
         from core.delivery_reverification import semantic_gap_ids
 
-        original_save = verify._save_reverification
+        original_save = verify._current_candidate_record
         interrupted = False
 
         def save(*args, **kwargs):
@@ -531,7 +531,7 @@ def test_security_requested_child_gap_invalidates_earlier_semantic_approval(clos
                 raise KeyboardInterrupt
             return record
 
-        monkeypatch.setattr(verify, "_save_reverification", save)
+        monkeypatch.setattr(verify, "_current_candidate_record", save)
         with pytest.raises(KeyboardInterrupt):
             _run(path, cfg, semantic, security, node_id="root")
         result, _ = _run(path, cfg, semantic, security, node_id="root")

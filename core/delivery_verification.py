@@ -146,6 +146,10 @@ class DeliveryVerificationSnapshot:
     completed_units: tuple[DeliveryVerificationCompletedUnit, ...]
     identity: DeliveryVerificationIdentity
     composition_scope: DeliveryCompositionScope | None = None
+    candidate_route: tuple[str, ...] = ()
+    candidate_anchor: str = "root"
+    candidate_anchor_gate_id: str | None = None
+    candidate_anchor_attempt: int | None = None
 
 
 def delivery_verification_security_required(status: DeliveryPlanCheckResult | DeliveryStatusResult) -> bool:
@@ -489,7 +493,7 @@ def with_delivery_verification_readiness(
                 verification.composition_evidence_fingerprint
                 or verification.security_composition_evidence_fingerprint
                 or verification.reverification
-            ) and status.verification_node == "root":
+            ):
                 from core.delivery_composition import load_composition
 
                 try:

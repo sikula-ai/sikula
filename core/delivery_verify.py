@@ -687,15 +687,10 @@ def _execute_gate(
                 )
 
             if snapshot.composition_scope and snapshot.composition_scope.retained_authority_json:
-                from core.delivery_reverification import preflight_node_review_packets
+                from core.delivery_reverification import preflight_candidate_tree
 
                 try:
-                    preflight_node_review_packets(
-                        snapshot.composition_scope,
-                        project_config,
-                        worktree,
-                        source_task,
-                    )
+                    preflight_candidate_tree(status, project_config, snapshot, worktree, source_task)
                 except ValueError:
                     return _review_blocked(running, validation, "delivery_verification.hierarchy_required")
             try:
@@ -925,6 +920,11 @@ def _execute_gate(
                         completed_at=_now(),
                     )
                 finding_count = len(security.assessment.findings)
+            if snapshot.candidate_route and running.completed_at is None:
+                # Reserve the completion identity before immutable evidence publication.
+                # If publication is interrupted, accepted exchanges can reconstruct the
+                # same artifact without inventing a new timestamp or provider attempt.
+                running = _update_candidate_record(status, snapshot, running, project_config, {"completed_at": _now()})
             passed = replace(
                 running,
                 status="passed",
@@ -935,7 +935,7 @@ def _execute_gate(
                 finding_count=finding_count,
                 obligation_satisfied_count=obligation_satisfied_count,
                 obligation_gap_count=obligation_gap_count,
-                completed_at=_now(),
+                completed_at=running.completed_at or _now(),
             )
             if scope.node_id != "root":
                 try:
@@ -1052,6 +1052,103 @@ class _CandidateReviewStopped(RuntimeError):
         self.record = record
 
 
+def _update_candidate_record(
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    running: DeliveryVerificationRecord,
+    cfg: dict[str, Any],
+    changes: dict[str, Any],
+    *,
+    boundary: bool = False,
+) -> DeliveryVerificationRecord:
+    """Publish one node and its immediate acceptance references under one lock."""
+    from core.delivery_candidate_control import CandidateBudgetExceeded, record_at, replace_at, reserved_node_count
+    from core.delivery_reverification import candidate_snapshot
+
+    root = Path(status.project_root)
+    path = delivery_progress_path(root, status.plan.plan_id)
+    anchor_id = snapshot.candidate_anchor if snapshot.candidate_route else snapshot.scope.node_id
+    with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.candidate"):
+        progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
+        anchor = (
+            (progress.verification if anchor_id == "root" else progress.checkpoint_verifications.get(anchor_id))
+            if progress
+            else None
+        )
+        if errors or anchor is None:
+            raise ValueError("Candidate review attempt unavailable.")
+        if (
+            snapshot.candidate_route
+            and not boundary
+            and (
+                anchor.status != "running"
+                or (anchor.gate_id, anchor.attempt)
+                != (snapshot.candidate_anchor_gate_id, snapshot.candidate_anchor_attempt)
+            )
+        ):
+            raise ValueError("Initiating candidate review attempt changed.")
+        record = record_at(root, path.parent, anchor, snapshot.candidate_route)
+        if (record.gate_id, record.attempt) != (running.gate_id, running.attempt) or (
+            record.status != "running" and not (boundary and delivery_verification_is_boundary_stop(record))
+        ):
+            raise ValueError("Candidate review attempt changed.")
+        if not boundary:
+            current = verification_node_status(get_delivery_status(status.plan_path, project_root=root), anchor_id)
+            expected = build_delivery_verification_snapshot(current, cfg, candidate_commit=anchor.candidate_commit)
+            if expected.identity.gate_id != anchor.gate_id or not _assembly_ref_matches(
+                root, current, anchor.candidate_commit
+            ):
+                raise ValueError("Candidate review authority changed.")
+            parent = anchor
+            for node_id in snapshot.candidate_route:
+                expected = candidate_snapshot(current, cfg, parent, node_id)
+                from core.delivery_candidate_control import expanded_child
+
+                parent = expanded_child(current, parent.reverification["children"][node_id])
+            if expected.identity != snapshot.identity or (
+                snapshot.composition_scope and not _composition_children_unchanged(status, current, snapshot, cfg)
+            ):
+                raise ValueError("Candidate review authority changed.")
+        updated = replace(record, **changes)
+        updated_anchor = replace_at(root, path.parent, anchor, snapshot.candidate_route, updated)
+        # The persisted tree is the reservation ledger. Charge the worst case for
+        # each node once, regardless of role, result, interruption or fallback.
+        if not boundary:
+            try:
+                reserved_node_count(root, path.parent, updated_anchor)
+            except CandidateBudgetExceeded as exc:
+                raise DeliveryIntegrationReviewAgentError(
+                    "delivery_verification.reverification_budget_exhausted",
+                    "Candidate subtree work budget exhausted.",
+                    [],
+                ) from exc
+        if not boundary:
+            from core.delivery_reverification import validate_reverification
+
+            validate_reverification(
+                replace(current, verification_node=snapshot.scope.node_id),
+                updated,
+                cfg,
+                scope=snapshot.composition_scope,
+            )
+            if updated.passed and snapshot.candidate_route:
+                from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+
+                evidence = load_checkpoint_evidence(
+                    root, path.parent, updated, plan_id=status.plan.plan_id, node_id=snapshot.scope.node_id
+                )
+                if not evidence.covers(snapshot.scope):
+                    raise ValueError("Candidate node coverage changed.")
+        if anchor_id == "root":
+            progress = replace(progress, verification=updated_anchor)
+        else:
+            progress = replace(
+                progress, checkpoint_verifications={**progress.checkpoint_verifications, anchor_id: updated_anchor}
+            )
+        write_delivery_progress(path, progress)
+        return updated
+
+
 def _save_reverification(
     status: DeliveryStatusResult,
     snapshot: DeliveryVerificationSnapshot,
@@ -1061,52 +1158,61 @@ def _save_reverification(
     *,
     boundary: bool = False,
 ) -> DeliveryVerificationRecord:
-    """Persist reservations/results against the captured parent, never admission."""
-    from core.delivery_reverification import validate_reverification
+    return _update_candidate_record(status, snapshot, running, cfg, {"reverification": control}, boundary=boundary)
 
+
+def _persist_candidate_boundary(
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    terminal: DeliveryVerificationRecord,
+) -> None:
+    """Latch the initiating gate's boundary without reading descendant sidecars."""
+    if not snapshot.candidate_route or not delivery_verification_is_boundary_stop(terminal):
+        raise ValueError("Candidate boundary evidence is unavailable.")
     root = Path(status.project_root)
     path = delivery_progress_path(root, status.plan.plan_id)
-    with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.reverification"):
+    anchor_id = snapshot.candidate_anchor
+    with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.boundary"):
         progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
-        record = (
-            (
-                progress.verification
-                if snapshot.scope.node_id == "root"
-                else progress.checkpoint_verifications.get(snapshot.scope.node_id)
-            )
+        anchor = (
+            (progress.verification if anchor_id == "root" else progress.checkpoint_verifications.get(anchor_id))
             if progress
             else None
         )
-        if (
-            errors
-            or record is None
-            or record.status != "running"
-            or (record.gate_id, record.attempt) != (running.gate_id, running.attempt)
-        ):
-            raise ValueError("Candidate review attempt changed.")
-        updated = replace(record, reverification=control)
-        if not boundary:
-            current = verification_node_status(
-                get_delivery_status(status.plan_path, project_root=root), snapshot.scope.node_id
-            )
-            if (
-                build_delivery_verification_identity(current, cfg, candidate_commit=snapshot.identity.candidate_commit)
-                != snapshot.identity
-                or not _assembly_ref_matches(root, current, snapshot.identity.candidate_commit)
-                or not _composition_children_unchanged(status, current, snapshot, cfg)
-            ):
-                raise ValueError("Candidate review authority changed.")
-            validate_reverification(current, updated, cfg, scope=snapshot.composition_scope)
-        # Boundary evidence is captured even if a concurrent assembly moved.
-        if snapshot.scope.node_id == "root":
-            updated_progress = replace(progress, verification=updated)
-        else:
-            updated_progress = replace(
-                progress,
-                checkpoint_verifications={**progress.checkpoint_verifications, snapshot.scope.node_id: updated},
-            )
-        write_delivery_progress(path, updated_progress)
-        return updated
+        if errors or anchor is None or anchor.gate_id != snapshot.candidate_anchor_gate_id:
+            raise ValueError("Initiating candidate review evidence is unavailable.")
+        if delivery_verification_is_boundary_stop(replace(anchor, reverification=None)):
+            return
+        anchor = replace(
+            anchor,
+            status="blocked",
+            stop_code=terminal.stop_code,
+            security_status=terminal.security_status,
+            completed_at=terminal.completed_at or _now(),
+        )
+        progress = (
+            replace(progress, verification=anchor)
+            if anchor_id == "root"
+            else replace(progress, checkpoint_verifications={**progress.checkpoint_verifications, anchor_id: anchor})
+        )
+        write_delivery_progress(path, progress)
+
+
+def _current_candidate_record(
+    status: DeliveryStatusResult, snapshot: DeliveryVerificationSnapshot
+) -> DeliveryVerificationRecord:
+    from core.delivery_candidate_control import record_at
+
+    root = Path(status.project_root)
+    path = delivery_progress_path(root, status.plan.plan_id)
+    progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
+    anchor_id = snapshot.candidate_anchor if snapshot.candidate_route else snapshot.scope.node_id
+    if errors or progress is None:
+        raise ValueError("Candidate control is unavailable.")
+    anchor = progress.verification if anchor_id == "root" else progress.checkpoint_verifications.get(anchor_id)
+    if anchor is None:
+        raise ValueError("Candidate control is unavailable.")
+    return record_at(root, path.parent, anchor, snapshot.candidate_route)
 
 
 def _composition_children_unchanged(
@@ -1186,49 +1292,62 @@ def _reverify_candidate_child(
 ) -> tuple[DeliveryVerificationRecord, bool]:
     from copy import deepcopy
     from core.delivery_reverification import candidate_snapshot
-    from core.delivery_verification_model import parse_delivery_verification_record
     from core.delivery_checkpoints import checkpoint_plan_fingerprint, checkpoint_review_rule_fingerprints
 
     if snapshot.composition_scope is None:
         raise ValueError("Candidate review requires a captured composition scope.")
     snapshot.composition_scope.child(node_id)
+    from core.delivery_candidate_control import MAX_CANDIDATE_NODES, MAX_NODE_PROVIDER_CALLS, expanded_child
+
     control = deepcopy(running.reverification)
     existing = control["children"].get(node_id)
-    if existing:
-        child = parse_delivery_verification_record(existing["verification"])
-        if delivery_verification_is_boundary_stop(child):
-            raise _CandidateReviewStopped(child)
-        # An explicit verification retry after prerequisite resolution can spend
-        # the remaining full fallback, but cannot reopen this child's exchange.
-        return running, child.passed
-    child_snapshot = candidate_snapshot(status, cfg, running, node_id)
     root = Path(status.project_root)
-    roles = ("reviewer", "security_reviewer") if child_snapshot.scope.security_required else ("reviewer",)
-    rules = checkpoint_review_rule_fingerprints(
-        root,
-        running.candidate_commit,
-        [Path(cfg[role]["extra_rules"]).as_posix() for role in roles if cfg.get(role, {}).get("extra_rules")],
+    child_snapshot = candidate_snapshot(status, cfg, running, node_id)
+    child_snapshot = replace(
+        child_snapshot,
+        candidate_route=(*snapshot.candidate_route, node_id),
+        candidate_anchor=snapshot.candidate_anchor if snapshot.candidate_route else snapshot.scope.node_id,
+        candidate_anchor_gate_id=snapshot.candidate_anchor_gate_id if snapshot.candidate_route else running.gate_id,
+        candidate_anchor_attempt=snapshot.candidate_anchor_attempt if snapshot.candidate_route else running.attempt,
     )
-    child = _record_for_identity(
-        child_snapshot.identity,
-        status="running",
-        attempt=1,
-        security_required=child_snapshot.scope.security_required,
-        obligation_count=len(child_snapshot.scope.obligation_ids),
-        evidence_path=evidence_path.relative_to(root).as_posix(),
-        started_at=_now(),
-        review_rule_fingerprints=rules,
-        plan_content_fingerprint=checkpoint_plan_fingerprint(status, running.candidate_commit),
-    )
-    control["children"][node_id] = {
-        "origin": status.checkpoint_verifications[node_id].checkpoint_evidence_fingerprint,
-        "verification": child.to_dict(),
-    }
-    running = _save_reverification(status, snapshot, running, cfg, control)
+    if existing:
+        child = expanded_child(status, existing)
+        if (
+            delivery_verification_is_boundary_stop(child)
+            or child.stop_code == "delivery_verification.reverification_budget_exhausted"
+        ):
+            raise _CandidateReviewStopped(child)
+        if child.status != "running" or child_snapshot.composition_scope is None:
+            return running, child.passed
+    else:
+        roles = ("reviewer", "security_reviewer") if child_snapshot.scope.security_required else ("reviewer",)
+        rules = checkpoint_review_rule_fingerprints(
+            root,
+            running.candidate_commit,
+            [Path(cfg[role]["extra_rules"]).as_posix() for role in roles if cfg.get(role, {}).get("extra_rules")],
+        )
+        child = _record_for_identity(
+            child_snapshot.identity,
+            status="running",
+            attempt=1,
+            security_required=child_snapshot.scope.security_required,
+            obligation_count=len(child_snapshot.scope.obligation_ids),
+            evidence_path=evidence_path.relative_to(root).as_posix(),
+            started_at=_now(),
+            review_rule_fingerprints=rules,
+            plan_content_fingerprint=checkpoint_plan_fingerprint(status, running.candidate_commit),
+        )
+        control["children"][node_id] = {
+            "origin": status.checkpoint_verifications[node_id].checkpoint_evidence_fingerprint,
+            "verification": child.to_dict(),
+        }
+        running = _save_reverification(status, snapshot, running, cfg, control)
     if not _safe_append_audit(
         evidence_path,
         {
             "event": "candidate_review_reserved",
+            "max_node_provider_calls": MAX_NODE_PROVIDER_CALLS,
+            "max_subtree_provider_calls": MAX_CANDIDATE_NODES * MAX_NODE_PROVIDER_CALLS,
             "node_id": node_id,
             "parent_gate": running.gate_id,
             "record": child.to_dict(),
@@ -1260,6 +1379,8 @@ def _reverify_candidate_child(
         child = exc.terminal
         deferred = {"validation_evidence": exc.validation_evidence}
     boundary = delivery_verification_is_boundary_stop(child)
+    if boundary:
+        _persist_candidate_boundary(status, child_snapshot, child)
     if (
         not _safe_append_audit(
             evidence_path,
@@ -1275,8 +1396,29 @@ def _reverify_candidate_child(
         and not boundary
     ):
         child = replace(child, status="blocked", stop_code="delivery_verification.audit_unavailable")
-    control["children"][node_id]["verification"] = child.to_dict()
-    running = _save_reverification(status, snapshot, running, cfg, control, boundary=boundary)
+    # Inner exchanges publish their own reservations. Refresh them before accepting
+    # the terminal result; an outer stack frame must never overwrite newer control.
+    try:
+        latest = _current_candidate_record(status, child_snapshot)
+        child = replace(
+            child,
+            reverification=latest.reverification,
+            composition_attempted=latest.composition_attempted,
+            composition_evidence_fingerprint=latest.composition_evidence_fingerprint,
+            security_composition_attempted=latest.security_composition_attempted,
+            security_composition_evidence_fingerprint=latest.security_composition_evidence_fingerprint,
+        )
+        _update_candidate_record(status, child_snapshot, latest, cfg, vars(child), boundary=boundary)
+        parent = _current_candidate_record(status, snapshot)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        if boundary:
+            # The stop is already durable. Missing detail must not turn it into
+            # a retryable evidence/internal failure while unwinding ancestors.
+            raise _CandidateReviewStopped(child) from None
+        raise
+    if not boundary and (parent.gate_id, parent.attempt) != (running.gate_id, running.attempt):
+        raise ValueError("Initiating candidate review attempt changed.")
+    running = parent
     if boundary or (not child.passed and child.stop_code != "delivery_verification.repair_required"):
         raise _CandidateReviewStopped(child)
     return running, child.passed
@@ -1301,6 +1443,16 @@ def _bounded_full_review(
     )
     from core.delivery_repair_storage import write_repair_state
 
+    if running.reverification is None and snapshot.candidate_route and snapshot.composition_scope is not None:
+        from core.delivery_reverification import new_reverification
+
+        running = _update_candidate_record(
+            status,
+            snapshot,
+            running,
+            project_config,
+            {"composition_attempted": True, "reverification": new_reverification()},
+        )
     if running.reverification is None:
         return _run_review(reviewer, **kwargs), running
     kwargs["guard_attempts"] = True
@@ -1516,46 +1668,11 @@ def _persist_composition_control(
     review_kind: str = "semantic",
     reverification: dict[str, Any] | None = None,
 ) -> DeliveryVerificationRecord:
-    """Only this captured running attempt can reserve work or accept its proof."""
-
-    root = Path(status.project_root)
-    with acquire_delivery_progress_lock(root, status.plan.plan_id, owner="delivery.verify.composition"):
-        current = verification_node_status(
-            get_delivery_status(status.plan_path, project_root=root), snapshot.scope.node_id
-        )
-        if build_delivery_verification_identity(
-            current, cfg, candidate_commit=snapshot.identity.candidate_commit
-        ) != snapshot.identity or not _assembly_ref_matches(root, current, snapshot.identity.candidate_commit):
-            raise ValueError("Composition candidate changed.")
-        if not _composition_children_unchanged(status, current, snapshot, cfg):
-            raise ValueError("Composition checkpoint authority changed.")
-        path = delivery_progress_path(root, status.plan.plan_id)
-        progress, errors = read_delivery_progress(path, plan_id=status.plan.plan_id)
-        record = (
-            (
-                progress.verification
-                if snapshot.scope.node_id == "root"
-                else progress.checkpoint_verifications.get(snapshot.scope.node_id)
-            )
-            if progress
-            else None
-        )
-        if (
-            errors
-            or record is None
-            or record.status != "running"
-            or record.gate_id != running.gate_id
-            or record.attempt != running.attempt
-        ):
-            raise ValueError("Composition attempt changed.")
-        prefix = "" if review_kind == "semantic" else "security_"
-        updated = replace(
-            record,
-            reverification=reverification if reverification is not None else record.reverification,
-            **{prefix + "composition_attempted": attempted, prefix + "composition_evidence_fingerprint": fingerprint},
-        )
-        write_delivery_progress(path, mark_delivery_verification(progress, updated, node_id=snapshot.scope.node_id))
-        return updated
+    prefix = "" if review_kind == "semantic" else "security_"
+    changes = {prefix + "composition_attempted": attempted, prefix + "composition_evidence_fingerprint": fingerprint}
+    if reverification is not None:
+        changes["reverification"] = reverification
+    return _update_candidate_record(status, snapshot, running, cfg, changes)
 
 
 def _run_review(
@@ -1724,7 +1841,11 @@ def _persist_terminal_if_current(
             )
             if progress is None or errors or record is None:
                 return None
-            if record.gate_id != identity.gate_id or record.attempt != terminal.attempt or record.status != "running":
+            if (
+                record.gate_id != identity.gate_id
+                or record.attempt != terminal.attempt
+                or (record.status != "running" and not delivery_verification_is_boundary_stop(record))
+            ):
                 return None
             # Reservations and accepted composition survive interruption and outer error paths.
             terminal = replace(
@@ -1794,7 +1915,22 @@ def _persist_terminal_if_current(
                             {"event": "evidence_unavailable", "record": terminal.to_dict()},
                             project_root=root,
                         )
-            progress = mark_delivery_verification(progress, terminal, node_id=node_id)
+            if delivery_verification_is_boundary_stop(record):
+                # A descendant already published this boundary under the same
+                # captured attempt. Finish its audit without readmitting an old
+                # candidate or requiring assembly to remain current.
+                terminal = replace(
+                    terminal, status=record.status, stop_code=record.stop_code, security_status=record.security_status
+                )
+                progress = (
+                    replace(progress, verification=terminal)
+                    if node_id == "root"
+                    else replace(
+                        progress, checkpoint_verifications={**progress.checkpoint_verifications, node_id: terminal}
+                    )
+                )
+            else:
+                progress = mark_delivery_verification(progress, terminal, node_id=node_id)
             write_delivery_progress(progress_path, progress)
             append_delivery_progress_event(
                 events_path,

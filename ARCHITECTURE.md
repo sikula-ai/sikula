@@ -1449,8 +1449,9 @@ other consumers receive dependency edges without duplicating repair ownership.
 Changed work invalidates affected evidence and must pass current verification.
 Security/read-only boundaries survive concurrent candidate changes and audit failures.
 
-Candidate re-review of a composing child deliberately uses bounded full-scope review
-in this first nested slice; recursive selective recovery comes later. Finalization,
+Candidate re-review uses the same bounded node cycle recursively: a composing child
+reviews its retained authority and immediate children, descending only when their
+applicability is uncertain and reassessing integration on the return path. Finalization,
 final-only validation and the mandatory exact-candidate final gate stay unchanged.
 All current global and fallback limits remain; this is not a large-plan capacity claim.
 
@@ -1557,10 +1558,26 @@ completed execution inputs against the final candidate in a detached read-only
 workspace, with configured validation and both required reviewer roles. Validation
 for a child excludes root-only final checks; final validation remains mandatory.
 
-The root record's private `reverification` control contains at most eight child
+Each composing node's private `reverification` control contains at most eight child
 reservations/results, each bound to its original admission evidence fingerprint,
-and per-role reassessment and fallback reservations. Each child has a distinct
-identity derived from its checkpoint policy and the captured final gate, with one
+and per-role reassessment and fallback reservations. A candidate child's control is
+stored in a content-addressed `candidate-node-<sha>.json` artifact; its parent keeps
+only the immediate child's bounded record and a `reverification.reference` pointer.
+These files bind the owning gate and contain local control, never recursively embedded
+descendant control. Publishing updates references along the captured path under the
+delivery lock. Ordinary descendant writes also require the captured initiating gate
+identity and attempt to remain running, so an older invocation cannot overwrite a
+resumed attempt's reservations or results. Terminal boundary capture remains exempt
+from this freshness check. Candidate completion timestamps are reserved before immutable evidence
+publication so interruption can reconstruct the same accepted result. Orphan files do not authorize reuse. Missing, altered, cyclic or
+out-of-scope references block before providers. Terminal boundary classifications
+propagate to ancestors independently of freshness and remain visible without loading
+sidecars. The initiating record receives the terminal classification before descendant
+control is refreshed; missing or unreadable sidecars cannot erase a detected boundary
+or turn it into a retryable failure. Historical checkpoint admission records are
+never overwritten.
+Each child has a distinct
+identity derived from its checkpoint policy and the captured parent gate, with one
 attempt. Successful typed checkpoint artifacts use the existing immutable storage
 and strict coverage parser; only the accepted control pointer authorizes reuse.
 Original admission records, contracts, completed units and repair budgets are never
@@ -1569,11 +1586,17 @@ was established or newly accepted exact-candidate evidence. A child pass alone d
 not satisfy the final gate's retained/global authority or cross-group integration.
 Required security establishes applicability independently.
 
-For one unchanged compact final gate the maximum is one initial composition, one parent
-reassessment and one full fallback per role, plus one review of each requested
-child including required security. Each exchange permits at most two calls for
-format correction: at most 4N+12 reviewer calls for N <= 8 children when both roles
-are required. The bound includes spent/interrupted exchanges, not just successes.
+For each unchanged composing node the maximum is one initial composition, one parent
+reassessment and one full fallback per role. Each exchange permits at most two calls
+for format correction. Before entering a candidate node, its durable reservation
+charges the worst case of 12 calls, including both roles, even if less work is needed.
+The initiating gate and all recursively requested nodes share a maximum of 32 node
+reservations (384 possible provider calls); reservations are the accepted control tree,
+not a count inferred from audit or successful results. This is a recovery work bound,
+not a plan-size limit. Repeated requests, role changes and resume do not refund or
+refill it. Child identities bind the parent gate and therefore the captured authority
+and hierarchy; reparenting cannot reuse reservations against changed authority.
+The bound includes spent/interrupted exchanges, not just successes.
 Children already accepted for one role's request serve the other role's request
 without another child execution. Parent reassessment still reviews integration.
 Repeated uncertainty, a consumed child exchange without accepted evidence or a
@@ -1584,8 +1607,10 @@ verification can spend the remaining full fallback without reopening the child
 exchange. Security/read-only child boundaries remain durable even
 if auditing fails or assembly advances; they also block after candidate/policy changes.
 
-A semantic rejection from a child requested by security also supersedes the earlier
-semantic composition pass. Before continuing security or accepting the final gate,
+A semantic rejection from a descendant requested by security also supersedes earlier
+semantic composition passes along the affected ancestor path. Immediate references
+retain a monotonic `semantic_gap` flag even when a descendant's local fallback later
+approves; no descendant history or finding list is copied into ancestors. Before continuing security or accepting the final gate,
 the coordinator uses the remaining full semantic fallback and its normal repair
 outcome. Fallback evidence binds the child rejections known at that review; an
 earlier fallback cannot cover a later rejection or receive a new budget. This
@@ -1606,17 +1631,20 @@ or advertise a successful resumable pause. This requires operator investigation 
 follow-up work, not an automatic budget reset. Candidate changes invalidate ordinary
 applicability; they do not reset logical-node repair budgets or terminal boundaries.
 
-Shared readiness sizes every potential child's semantic/security packet and full
+Shared readiness sizes every declared node's semantic/security packet and full
 fallback, including actual templates, rules, JSON escaping and correction headroom.
 Sizing includes the possible executed and reused validation phase metadata, so reused
 root validation cannot underestimate a child that must execute its named checks.
-Execution repeats the check in the captured candidate workspace before composition.
+Execution traverses eligible descendants privately and checks their actual composed
+packets (including deltas) and fallbacks in the captured candidate workspace before
+the first composition call. Each parent prompt still contains only its local inputs.
 Public status exposes only existing bounded candidate-evidence states: fresh child
 evidence can show `reverified` while final integration remains pending. Neither
 control records, child internals, typed outcomes nor history enter parent prompts.
 Dry-run and finalization validate accepted references and exhausted reservations.
 Selective child re-review retains the current full-fallback and plan limits;
-recursive selective subtree recovery and large-plan scaling are subsequent work.
+bounded corrective work without full-subtree fallback and large-plan scaling remain
+subsequent work.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
 plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.
@@ -1690,8 +1718,8 @@ the checkpoint policy fingerprint and therefore typed evidence, handoff reuse an
 resume identity. Readiness includes escaped source/context, rules, security context,
 response templates and protocol/correction allowance. Terminal security/read-only
 stops and all retry/repair budgets are unchanged. The full-source fallback and current
-whole-plan limits still apply; this is not recursive verification or unbounded plan
-support. Failed composed semantic assessments use full review before repair so repair
+whole-plan limits still apply; recursive node review does not yet provide unbounded
+plan support. Failed composed semantic assessments use full review before repair so repair
 input keeps complete obligation provenance; changed repair ownership invalidates final
 attribution and selects full authority.
 
@@ -1774,8 +1802,8 @@ plan context, effective validation and final-check policy, applicable reviewer
 rules, security context, the generated response template with every obligation ID,
 and bounded protocol overhead. It also checks each exact
 rendered reviewer prompt immediately before provider execution. Oversized
-authority packets fail with `delivery_verification.hierarchy_required`; recursive
-checkpoint scheduling and unbounded authority graphs remain future extensions.
+authority packets fail with `delivery_verification.hierarchy_required`; lifting global
+authority and fallback limits remains subsequent scaling work.
 
 **Delivery final branch command:** `sikula delivery finalize PLAN_FILE` records the
 verified final candidate for a completed delivery plan. Its CLI wrapper lives in

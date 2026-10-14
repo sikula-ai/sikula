@@ -268,6 +268,10 @@ def load_checkpoint_evidence(
     _ancestors: frozenset[str] = frozenset(),
 ) -> DeliveryVerificationEvidence:
     """Load explicit results, never infer them from counts or replay review audit."""
+    from core.delivery_candidate_control import expand_record
+
+    record = expand_record(root, directory, record)
+
     if node_id == "root" or not record.passed or record.checkpoint_evidence_fingerprint is None:
         raise ValueError("Accepted checkpoint evidence is unavailable.")
     try:
@@ -464,7 +468,9 @@ def build_node_closure(
             raise ValueError("Root closure child execution changed.")
         covered.update(unit.unit_id for unit in child.completed_units)
         inherited_constraints.update(child.constraint_ids)
-        children.append({"node_id": ref["id"], "verification": origin.to_dict()})
+        from core.delivery_candidate_control import compact_record
+
+        children.append({"node_id": ref["id"], "verification": compact_record(root, directory, origin).to_dict()})
     payload = {
         "schema_version": 1,
         "plan_id": snapshot.scope.plan_id,

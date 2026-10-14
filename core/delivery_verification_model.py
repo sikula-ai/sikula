@@ -59,7 +59,7 @@ def delivery_verification_is_boundary_stop(record: DeliveryVerificationRecord) -
     """Security and read-only failures remain stops even after candidate changes."""
     if record.reverification and any(
         delivery_verification_is_boundary_stop(parse_delivery_verification_record(entry["verification"]))
-        for entry in record.reverification["children"].values()
+        for entry in record.reverification.get("children", {}).values()
     ):
         return True
     return record.status in {"blocked", "failed"} and (
