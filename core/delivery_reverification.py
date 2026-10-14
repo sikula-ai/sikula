@@ -26,12 +26,22 @@ _ROLES = {"semantic", "security"}
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+class CandidateReviewBoundsError(ValueError):
+    """Candidate hierarchy or rendered packets exceed supported review bounds."""
+
+
 def new_reverification() -> dict[str, Any]:
     return {"children": {}, "reassessments": {}, "fallbacks": {}}
 
 
 def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
-    """Reject recursive records and unbounded work before loading control state."""
+    """Accept bounded local records; descendants are content-addressed references."""
+    if isinstance(value, dict) and set(value) == {"reference"}:
+        if not isinstance(value["reference"], str) or not _DIGEST.fullmatch(value["reference"]):
+            raise ValueError("Invalid candidate node reference.")
+        if not parent.get("composition_attempted") and not parent.get("security_composition_attempted"):
+            raise ValueError("Candidate node reference requires a reserved exchange.")
+        return dict(value)
     if not isinstance(value, dict) or set(value) != {"children", "reassessments", "fallbacks"}:
         raise ValueError("Invalid candidate re-verification control.")
     if not parent.get("composition_attempted") and not parent.get("security_composition_attempted"):
@@ -46,11 +56,18 @@ def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
             not isinstance(key, str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", key)
             or not isinstance(child, dict)
-            or set(child) != {"origin", "verification"}
+            or set(child) not in ({"origin", "verification"}, {"origin", "verification", "semantic_gap"})
+            or ("semantic_gap" in child and child["semantic_gap"] is not True)
             or not isinstance(child["origin"], str)
             or not _DIGEST.fullmatch(child["origin"])
             or not isinstance(child["verification"], dict)
-            or "reverification" in child["verification"]
+            or (
+                "reverification" in child["verification"]
+                and (
+                    not isinstance(child["verification"]["reverification"], dict)
+                    or set(child["verification"]["reverification"]) != {"reference"}
+                )
+            )
         ):
             raise ValueError("Invalid candidate re-verification child.")
         record = parse_delivery_verification_record(child["verification"])
@@ -67,12 +84,7 @@ def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("Candidate re-verification target changed.")
         if record.security_required != parent.get("security_required", False):
             raise ValueError("Candidate security policy changed.")
-        if (
-            record.attempt != 1
-            or record.root_evidence_fingerprint
-            or record.composition_attempted
-            or record.security_composition_attempted
-        ):
+        if record.attempt != 1 or record.root_evidence_fingerprint:
             raise ValueError("Invalid candidate re-verification attempt.")
     rounds = value["reassessments"]
     if not isinstance(rounds, dict) or set(rounds) - _ROLES:
@@ -121,9 +133,7 @@ def candidate_snapshot(
     identity = replace(
         identity, gate_id=fingerprint({key: val for key, val in vars(identity).items() if key != "gate_id"})
     )
-    # This first hierarchy slice uses the preflighted full child scope here.
-    # Recursive selective recovery needs its own durable subtree budget contract.
-    return replace(snapshot, identity=identity, composition_scope=None)
+    return replace(snapshot, identity=identity)
 
 
 def composition_origin(
@@ -166,9 +176,21 @@ def validate_reverification(
     cfg: dict[str, Any] | None = None,
     *,
     scope: DeliveryCompositionScope | None = None,
+    _seen: set[str] | None = None,
 ) -> None:
+    from core.delivery_candidate_control import MAX_CANDIDATE_NODES, expanded_child
+
+    _seen = set() if _seen is None else _seen
+    if record.gate_id in _seen or len(_seen) >= MAX_CANDIDATE_NODES:
+        raise ValueError("Repeated or oversized candidate review tree.")
+    _seen.add(record.gate_id)
     if record.reverification is None:
         return
+    if "reference" in record.reverification:
+        from core.delivery_candidate_control import expand_record
+
+        root = Path(status.project_root)
+        record = expand_record(root, delivery_progress_path(root, status.plan.plan_id).parent, record)
     parse_reverification(record.reverification, record.to_dict())
     composition_scope = scope or delivery_composition_scope(
         status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
@@ -179,6 +201,12 @@ def validate_reverification(
     directory = delivery_progress_path(root, status.plan.plan_id).parent
     from core.delivery_composition import load_composition
 
+    for role, digest in (
+        ("semantic", record.composition_evidence_fingerprint),
+        ("security", record.security_composition_evidence_fingerprint),
+    ):
+        if digest:
+            load_composition(status, record, review_kind=role, scope=composition_scope)
     for role, round_state in record.reverification["reassessments"].items():
         field = (
             "composition_evidence_fingerprint" if role == "semantic" else "security_composition_evidence_fingerprint"
@@ -196,13 +224,15 @@ def validate_reverification(
         historical = status.checkpoint_verifications.get(node_id)
         if historical is None or historical.checkpoint_evidence_fingerprint != entry["origin"]:
             raise ValueError("Candidate re-verification admission changed.")
-        child = parse_delivery_verification_record(entry["verification"])
+        child = expanded_child(status, entry)
         if cfg is not None:
             snapshot = candidate_snapshot(status, cfg, record, node_id)
             if snapshot.scope != child_scope or any(
                 getattr(child, key) != val for key, val in vars(snapshot.identity).items()
             ):
                 raise ValueError("Candidate re-verification authority changed.")
+        child_status = replace(status, verification_node=node_id)
+        validate_reverification(child_status, child, cfg, _seen=_seen)
         if child.passed:
             evidence = load_checkpoint_evidence(root, directory, child, plan_id=status.plan.plan_id, node_id=node_id)
             if not evidence.covers(child_scope):
@@ -246,7 +276,7 @@ def semantic_gap_ids(record: DeliveryVerificationRecord) -> list[str]:
     return sorted(
         key
         for key, entry in (record.reverification or {}).get("children", {}).items()
-        if entry["verification"]["semantic_status"] == "rejected"
+        if entry["verification"]["semantic_status"] == "rejected" or entry.get("semantic_gap", False)
     )
 
 
@@ -260,11 +290,22 @@ def semantic_fallback_covers_gaps(status: DeliveryStatusResult, record: Delivery
 def reverification_budget_exhausted(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> bool:
     from core.delivery_verification_model import delivery_verification_is_boundary_stop
 
-    if record.reverification is None or delivery_verification_is_boundary_stop(record):
+    from core.delivery_candidate_control import expanded_child
+
+    if delivery_verification_is_boundary_stop(record):
+        return False
+    if record.stop_code == "delivery_verification.reverification_budget_exhausted":
+        return True
+    if record.reverification is None:
         return False
     fallbacks = record.reverification["fallbacks"]
-    return any(digest is None for digest in fallbacks.values()) or (
-        "semantic" in fallbacks and not semantic_fallback_covers_gaps(status, record)
+    return (
+        any(digest is None for digest in fallbacks.values())
+        or ("semantic" in fallbacks and not semantic_fallback_covers_gaps(status, record))
+        or any(
+            reverification_budget_exhausted(status, expanded_child(status, entry))
+            for entry in record.reverification["children"].values()
+        )
     )
 
 
@@ -314,7 +355,58 @@ def preflight_node_review_packets(
                 known_obligation_ids=set(scope.obligation_ids) if role == "semantic" else set(),
             )
             if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
-                raise ValueError("Candidate re-verification packet exceeds the prompt limit.")
+                raise CandidateReviewBoundsError("Candidate re-verification packet exceeds the prompt limit.")
+
+
+def preflight_candidate_tree(
+    status: DeliveryStatusResult, cfg: dict[str, Any], snapshot: DeliveryVerificationSnapshot, cwd: Path, source: str
+) -> None:
+    """Size possible node exchanges privately, never flatten them into a prompt."""
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
+    from core.delivery_composition import build_composition_context
+    from core.delivery_verification import build_delivery_verification_snapshot, delivery_verification_prompt_is_bounded
+    from core.delivery_verification_validation import preview_delivery_validation_summary
+
+    pending = [snapshot]
+    seen = set()
+    reviewer = DeliveryIntegrationReviewAgent(None, cfg)
+    while pending:
+        current = pending.pop()
+        node = current.scope.node_id
+        if node in seen or len(seen) >= 257:
+            raise CandidateReviewBoundsError("Invalid candidate preflight hierarchy.")
+        seen.add(node)
+        scope = current.composition_scope
+        if scope is None:
+            continue
+        preflight_node_review_packets(scope, cfg, cwd, source)
+        for role in ("semantic", "security") if current.scope.security_required else ("semantic",):
+            context = build_composition_context(status, current, cfg, review_kind=role)
+            if context is None:
+                continue
+            prompt = reviewer._prompt(
+                cwd=cwd,
+                review_kind=role,
+                source_task=source,
+                plan_context=context,
+                validation_summary=preview_delivery_validation_summary(
+                    cfg, project_root=cwd, include_final_checks=node == "root"
+                ),
+                candidate_commit=current.identity.candidate_commit,
+                candidate_tree=current.identity.candidate_tree,
+                known_obligation_ids=set(current.scope.obligation_ids) if role == "semantic" else set(),
+            )
+            if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
+                raise CandidateReviewBoundsError("Candidate composition packet exceeds the prompt limit.")
+        if scope.retained_authority_json:
+            pending.extend(
+                build_delivery_verification_snapshot(
+                    replace(status, verification_node=child.node_id),
+                    cfg,
+                    candidate_commit=snapshot.identity.candidate_commit,
+                )
+                for child in scope.children
+            )
 
 
 class SemanticRecheckRequired(RuntimeError):
@@ -362,9 +454,11 @@ def run_node_composition_cycle(
         scope.child(node_id)
     for node_id in nodes:
         running, passed = review_child(running, node_id)
-        if not passed:
-            if role == "security" and semantic_gap_ids(running) and not semantic_fallback_covers(running):
+        if semantic_gap_ids(running) and not semantic_fallback_covers(running):
+            if role == "security":
                 raise SemanticRecheckRequired(running)
+            return None, running
+        if not passed:
             return None, running
     if not nodes:
         return None, running

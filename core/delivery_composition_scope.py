@@ -91,6 +91,7 @@ class DeliveryCompositionAttempt:
     scope: DeliveryCompositionScope
     _historical_json: str = field(repr=False)
     _parent_json: str | None = field(default=None, repr=False)
+    _project_root: str | None = field(default=None, repr=False)
 
     @classmethod
     def capture(
@@ -115,7 +116,17 @@ class DeliveryCompositionAttempt:
         parent = parse_delivery_verification_record(json.loads(self._parent_json)) if self._parent_json else None
         from core.delivery_reverification import accepted_composition_origin
 
-        return accepted_composition_origin(historical, parent, node_id, digest=digest)
+        record = accepted_composition_origin(historical, parent, node_id, digest=digest)
+        if record.reverification and "reference" in record.reverification:
+            from pathlib import Path
+            from core.delivery_candidate_control import expand_record
+            from core.delivery_progress import delivery_progress_path
+
+            if self._project_root is None:
+                raise ValueError("Candidate control requires an evidence store.")
+            root = Path(self._project_root)
+            record = expand_record(root, delivery_progress_path(root, self.scope.parent.plan_id).parent, record)
+        return record
 
     def assert_record(self, record: DeliveryVerificationRecord) -> None:
         if self._parent_json is None or json.loads(self._parent_json) != record.to_dict():
@@ -164,4 +175,9 @@ def capture_composition_attempt(
     )
     if scope is None:
         raise ValueError("Composition scope is unavailable.")
-    return DeliveryCompositionAttempt.capture(scope, status.checkpoint_verifications, parent)
+    from dataclasses import replace
+
+    return replace(
+        DeliveryCompositionAttempt.capture(scope, status.checkpoint_verifications, parent),
+        _project_root=status.project_root,
+    )
