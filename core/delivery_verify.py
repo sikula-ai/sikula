@@ -691,6 +691,8 @@ def _execute_gate(
 
                 try:
                     preflight_candidate_tree(status, project_config, snapshot, worktree, source_task)
+                except OSError:
+                    return _review_blocked(running, validation, "delivery_verification.evidence_unavailable")
                 except ValueError:
                     return _review_blocked(running, validation, "delivery_verification.hierarchy_required")
             try:

@@ -67,6 +67,51 @@ def _reviewers(outputs, *, interrupt=False):
     return semantic, security
 
 
+@pytest.mark.parametrize("storage_error", [OSError, PermissionError])
+def test_recursive_preflight_storage_failure_is_persisted(candidate, monkeypatch, storage_error):
+    from core import delivery_composition, delivery_reverification
+    from core.delivery_progress import delivery_events_path, read_delivery_progress
+
+    path, cfg = candidate
+    root = Path(cfg["project"]["root_path"])
+    preflight = delivery_reverification.preflight_candidate_tree
+    load_evidence = delivery_composition.load_checkpoint_evidence
+    failed_reads = []
+
+    def unavailable(*args, **kwargs):
+        if kwargs["node_id"] == "storage":
+            failed_reads.append(kwargs["node_id"])
+            raise storage_error("Private evidence storage diagnostic")
+        return load_evidence(*args, **kwargs)
+
+    def preflight_with_storage_failure(*args, **kwargs):
+        # Initial capture succeeds; the nested checkpoint becomes unreadable
+        # only when recursive packet preflight loads its authority evidence.
+        with patch.object(delivery_composition, "load_checkpoint_evidence", side_effect=unavailable):
+            return preflight(*args, **kwargs)
+
+    monkeypatch.setattr(delivery_reverification, "preflight_candidate_tree", preflight_with_storage_failure)
+    unused = _LLM()
+    result, _ = _run(path, cfg, unused, unused, node_id="root")
+    expected = "delivery_verification.evidence_unavailable"
+    assert failed_reads == ["storage"]
+    assert not result.succeeded and result.status == "blocked"
+    assert result.stop_code == expected
+    assert not unused.calls
+    assert "Private evidence storage diagnostic" not in json.dumps(result.to_dict())
+    progress_path = delivery_progress_path(root, "team-invites")
+    progress, errors = read_delivery_progress(progress_path, plan_id="team-invites")
+    assert not errors
+    record = progress.verification
+    assert record.status == "blocked" and record.stop_code == expected
+    assert record.completed_at and record.validation_executed
+    assert not record.composition_attempted and record.reverification is None
+    audit = [json.loads(line) for line in (root / record.evidence_path).read_text().splitlines()]
+    assert audit[-1]["event"] == "blocked" and audit[-1]["record"]["stop_code"] == expected
+    events = [json.loads(line) for line in delivery_events_path(root, "team-invites").read_text().splitlines()]
+    assert events[-1]["event_type"] == "verification.blocked"
+
+
 def test_checkpoint_can_initiate_candidate_review(tmp_path):
     path, cfg = nested.nested_plan.__wrapped__(tmp_path)
     result, _ = _run(path, cfg, _LLM(delivery_integration_review_control_example({"deliver-team-invites"})))
