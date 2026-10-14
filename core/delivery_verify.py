@@ -1252,31 +1252,38 @@ def _composition_review(
 
     role = kwargs.get("review_kind", "semantic")
     scope = kwargs["snapshot"].composition_scope
-    return run_node_composition_cycle(
-        scope,
-        kwargs["running"],
-        role,
-        exchange=lambda running, reassessment: _composition_exchange(
-            **{**kwargs, "running": running, "reassessment": reassessment}
-        ),
-        validate=lambda running: validate_reverification(
-            kwargs["status"], running, kwargs["project_config"], scope=scope
-        ),
-        load=lambda running: load_composition(kwargs["status"], running, review_kind=role, scope=scope),
-        review_child=lambda running, node_id: _reverify_candidate_child(
-            status=kwargs["status"],
-            snapshot=kwargs["snapshot"],
-            running=running,
-            cfg=kwargs["project_config"],
-            node_id=node_id,
-            source_task=kwargs["source_task"],
-            evidence_path=kwargs["evidence_path"],
-            state_store=state_store,
-            semantic_reviewer=semantic_reviewer,
-            security_reviewer=security_reviewer,
-        ),
-        semantic_fallback_covers=lambda running: semantic_fallback_covers_gaps(kwargs["status"], running),
-    )
+    try:
+        return run_node_composition_cycle(
+            scope,
+            kwargs["running"],
+            role,
+            exchange=lambda running, reassessment: _composition_exchange(
+                **{**kwargs, "running": running, "reassessment": reassessment}
+            ),
+            validate=lambda running: validate_reverification(
+                kwargs["status"], running, kwargs["project_config"], scope=scope
+            ),
+            load=lambda running: load_composition(kwargs["status"], running, review_kind=role, scope=scope),
+            review_child=lambda running, node_id: _reverify_candidate_child(
+                status=kwargs["status"],
+                snapshot=kwargs["snapshot"],
+                running=running,
+                cfg=kwargs["project_config"],
+                node_id=node_id,
+                source_task=kwargs["source_task"],
+                evidence_path=kwargs["evidence_path"],
+                state_store=state_store,
+                semantic_reviewer=semantic_reviewer,
+                security_reviewer=security_reviewer,
+            ),
+            semantic_fallback_covers=lambda running: semantic_fallback_covers_gaps(kwargs["status"], running),
+        )
+    except (OSError, ValueError, KeyError, DeliveryProgressLockError):
+        # Validation and accepted-result loading also read private evidence
+        # between exchanges; storage loss must stop the entire cycle safely.
+        raise DeliveryIntegrationReviewAgentError(
+            "delivery_verification.evidence_unavailable", "Composition evidence is unavailable.", []
+        ) from None
 
 
 def _reverify_candidate_child(

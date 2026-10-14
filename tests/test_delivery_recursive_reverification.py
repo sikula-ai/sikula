@@ -214,6 +214,68 @@ def test_missing_recursive_control_preempts_calls(candidate):
     assert not unused.calls
 
 
+@pytest.mark.parametrize("damage", ["missing", "unreadable"])
+def test_recursive_validation_storage_failure_preserves_reservations(candidate, monkeypatch, damage):
+    from core import delivery_candidate_control, delivery_verify
+    from core.delivery_progress import read_delivery_progress
+
+    path, cfg = candidate
+    root = Path(cfg["project"]["root_path"])
+    semantic = _LLM(_outputs(path, cfg)["root", "semantic"][1], KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _run(path, cfg, semantic, _LLM(), node_id="root")
+    before = get_delivery_status(path).verification
+    digest = before.reverification["children"]["integration"]["verification"]["reverification"]["reference"]
+    progress_path = delivery_progress_path(root, "team-invites")
+    sidecar = progress_path.parent / f"candidate-node-{digest[7:]}.json"
+    exchange = delivery_verify._composition_exchange
+    read_control = delivery_candidate_control.read_repair_state
+    damaged = []
+    failed_reads = []
+
+    def unreadable(project_root, file):
+        if file == sidecar:
+            failed_reads.append(file)
+            raise PermissionError("Private candidate control diagnostic")
+        return read_control(project_root, file)
+
+    def lose_control_after_exchange(**kwargs):
+        result = exchange(**kwargs)
+        assert kwargs["snapshot"].scope.node_id == "root" and not kwargs["reassessment"]
+        assert not damaged and sidecar.is_file()
+        damaged.append(sidecar)
+        if damage == "missing":
+            sidecar.unlink()
+        else:
+            monkeypatch.setattr(delivery_candidate_control, "read_repair_state", unreadable)
+        return result
+
+    monkeypatch.setattr(delivery_verify, "_composition_exchange", lose_control_after_exchange)
+    unused = _LLM()
+    result, _ = _run(path, cfg, unused, unused, node_id="root")
+    expected = "delivery_verification.evidence_unavailable"
+    assert damaged == [sidecar]
+    if damage == "unreadable":
+        assert failed_reads
+    assert result.status == "blocked" and not result.succeeded and result.stop_code == expected
+    assert not unused.calls
+    assert "Private candidate control diagnostic" not in json.dumps(result.to_dict())
+    progress, errors = read_delivery_progress(progress_path, plan_id="team-invites")
+    assert not errors
+    saved = progress.verification
+    assert saved.status == "blocked" and saved.stop_code == expected
+    assert saved.attempt == before.attempt + 1
+    assert saved.reverification == before.reverification
+    assert (
+        saved.composition_attempted
+        and saved.composition_evidence_fingerprint == before.composition_evidence_fingerprint
+    )
+    audit = [json.loads(line) for line in (root / saved.evidence_path).read_text().splitlines()]
+    assert audit[-1]["event"] == "blocked" and audit[-1]["record"]["stop_code"] == expected
+    resumed, _ = _run(path, cfg, unused, unused, node_id="root")
+    assert resumed.stop_code == expected and not unused.calls
+
+
 @pytest.mark.parametrize("boundary", [False, True])
 def test_superseded_invocation_preserves_descendant_reservations(candidate, boundary):
     from core.llm_client import LLMReadOnlyViolation
