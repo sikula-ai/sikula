@@ -26,6 +26,10 @@ _ROLES = {"semantic", "security"}
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+class CandidateReviewBoundsError(ValueError):
+    """Candidate hierarchy or rendered packets exceed supported review bounds."""
+
+
 def new_reverification() -> dict[str, Any]:
     return {"children": {}, "reassessments": {}, "fallbacks": {}}
 
@@ -351,7 +355,7 @@ def preflight_node_review_packets(
                 known_obligation_ids=set(scope.obligation_ids) if role == "semantic" else set(),
             )
             if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
-                raise ValueError("Candidate re-verification packet exceeds the prompt limit.")
+                raise CandidateReviewBoundsError("Candidate re-verification packet exceeds the prompt limit.")
 
 
 def preflight_candidate_tree(
@@ -370,7 +374,7 @@ def preflight_candidate_tree(
         current = pending.pop()
         node = current.scope.node_id
         if node in seen or len(seen) >= 257:
-            raise ValueError("Invalid candidate preflight hierarchy.")
+            raise CandidateReviewBoundsError("Invalid candidate preflight hierarchy.")
         seen.add(node)
         scope = current.composition_scope
         if scope is None:
@@ -393,7 +397,7 @@ def preflight_candidate_tree(
                 known_obligation_ids=set(current.scope.obligation_ids) if role == "semantic" else set(),
             )
             if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
-                raise ValueError("Candidate composition packet exceeds the prompt limit.")
+                raise CandidateReviewBoundsError("Candidate composition packet exceeds the prompt limit.")
         if scope.retained_authority_json:
             pending.extend(
                 build_delivery_verification_snapshot(

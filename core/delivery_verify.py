@@ -687,14 +687,14 @@ def _execute_gate(
                 )
 
             if snapshot.composition_scope and snapshot.composition_scope.retained_authority_json:
-                from core.delivery_reverification import preflight_candidate_tree
+                from core.delivery_reverification import CandidateReviewBoundsError, preflight_candidate_tree
 
                 try:
                     preflight_candidate_tree(status, project_config, snapshot, worktree, source_task)
-                except OSError:
-                    return _review_blocked(running, validation, "delivery_verification.evidence_unavailable")
-                except ValueError:
+                except CandidateReviewBoundsError:
                     return _review_blocked(running, validation, "delivery_verification.hierarchy_required")
+                except (OSError, ValueError):
+                    return _review_blocked(running, validation, "delivery_verification.evidence_unavailable")
             try:
                 semantic_reviewer.prepare_workspace(worktree)
             except LLMReadOnlyViolation:

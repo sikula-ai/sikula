@@ -67,9 +67,11 @@ def _reviewers(outputs, *, interrupt=False):
     return semantic, security
 
 
-@pytest.mark.parametrize("storage_error", [OSError, PermissionError])
-def test_recursive_preflight_storage_failure_is_persisted(candidate, monkeypatch, storage_error):
+@pytest.mark.parametrize("failure", ["io", "permission", "missing", "malformed", "packet_limit"])
+def test_recursive_preflight_failure_is_classified_and_persisted(candidate, monkeypatch, failure):
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
     from core import delivery_composition, delivery_reverification
+    from core.delivery_checkpoint_evidence import checkpoint_evidence_path
     from core.delivery_progress import delivery_events_path, read_delivery_progress
 
     path, cfg = candidate
@@ -81,20 +83,36 @@ def test_recursive_preflight_storage_failure_is_persisted(candidate, monkeypatch
     def unavailable(*args, **kwargs):
         if kwargs["node_id"] == "storage":
             failed_reads.append(kwargs["node_id"])
-            raise storage_error("Private evidence storage diagnostic")
+            if failure in {"io", "permission"}:
+                error = OSError if failure == "io" else PermissionError
+                raise error("Private evidence storage diagnostic")
+            artifact = checkpoint_evidence_path(args[1], args[2])
+            content = artifact.read_bytes()
+            try:
+                if failure == "missing":
+                    artifact.unlink()
+                else:
+                    artifact.write_bytes(b"{")
+                return load_evidence(*args, **kwargs)
+            finally:
+                artifact.write_bytes(content)
         return load_evidence(*args, **kwargs)
 
     def preflight_with_storage_failure(*args, **kwargs):
-        # Initial capture succeeds; the nested checkpoint becomes unreadable
-        # only when recursive packet preflight loads its authority evidence.
+        # Inject after initial capture, while sizing recursive review packets.
+        if failure == "packet_limit":
+            with patch.object(DeliveryIntegrationReviewAgent, "_prompt", return_value="x" * (512 * 1024 + 1)):
+                return preflight(*args, **kwargs)
         with patch.object(delivery_composition, "load_checkpoint_evidence", side_effect=unavailable):
             return preflight(*args, **kwargs)
 
     monkeypatch.setattr(delivery_reverification, "preflight_candidate_tree", preflight_with_storage_failure)
     unused = _LLM()
     result, _ = _run(path, cfg, unused, unused, node_id="root")
-    expected = "delivery_verification.evidence_unavailable"
-    assert failed_reads == ["storage"]
+    expected = "delivery_verification." + (
+        "hierarchy_required" if failure == "packet_limit" else "evidence_unavailable"
+    )
+    assert failed_reads == ([] if failure == "packet_limit" else ["storage"])
     assert not result.succeeded and result.status == "blocked"
     assert result.stop_code == expected
     assert not unused.calls
