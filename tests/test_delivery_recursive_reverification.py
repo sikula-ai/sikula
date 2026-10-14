@@ -276,6 +276,63 @@ def test_recursive_validation_storage_failure_preserves_reservations(candidate, 
     assert resumed.stop_code == expected and not unused.calls
 
 
+@pytest.mark.parametrize("damage", ["missing", "unreadable"])
+def test_readiness_handles_sidecar_loss_during_budget_rescan(candidate, monkeypatch, damage):
+    from core import delivery_candidate_control, delivery_reverification
+    from core.delivery_verification import with_delivery_verification_readiness
+
+    path, cfg = candidate
+    semantic = _LLM(_outputs(path, cfg)["root", "semantic"][1], KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _run(path, cfg, semantic, _LLM(), node_id="root")
+    status = get_delivery_status(path)
+    record = status.verification
+    progress_path = delivery_progress_path(Path(status.project_root), status.plan.plan_id)
+    progress_before = progress_path.read_bytes()
+    digest = record.reverification["children"]["integration"]["verification"]["reverification"]["reference"]
+    sidecar = progress_path.parent / f"candidate-node-{digest[7:]}.json"
+    validate = delivery_reverification.validate_reverification
+    budget_exhausted = delivery_reverification.reverification_budget_exhausted
+    read_control = delivery_candidate_control.read_repair_state
+    validated = []
+    damaged = []
+    failed_reads = []
+
+    def validate_record(current, verification, *args, **kwargs):
+        result = validate(current, verification, *args, **kwargs)
+        validated.append(verification.gate_id)
+        return result
+
+    def unreadable(project_root, file):
+        if file == sidecar:
+            failed_reads.append(file)
+            raise PermissionError("Private candidate control diagnostic")
+        return read_control(project_root, file)
+
+    def rescan_after_storage_failure(current, verification):
+        if verification.gate_id == record.gate_id:
+            assert record.gate_id in validated
+            assert not damaged and sidecar.is_file()
+            damaged.append(sidecar)
+            if damage == "missing":
+                sidecar.unlink()
+            else:
+                monkeypatch.setattr(delivery_candidate_control, "read_repair_state", unreadable)
+        return budget_exhausted(current, verification)
+
+    monkeypatch.setattr(delivery_reverification, "validate_reverification", validate_record)
+    monkeypatch.setattr(delivery_reverification, "reverification_budget_exhausted", rescan_after_storage_failure)
+    projected = with_delivery_verification_readiness(status, cfg)
+    assert damaged == [sidecar]
+    if damage == "unreadable":
+        assert failed_reads
+    assert not projected.valid and projected.verification_status == "blocked"
+    assert {issue.code for issue in projected.errors} == {"delivery_verification.evidence_unavailable"}
+    assert projected.verification == record
+    assert progress_path.read_bytes() == progress_before
+    assert "Private candidate control diagnostic" not in json.dumps(projected.to_dict())
+
+
 @pytest.mark.parametrize("boundary", [False, True])
 def test_superseded_invocation_preserves_descendant_reservations(candidate, boundary):
     from core.llm_client import LLMReadOnlyViolation

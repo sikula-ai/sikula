@@ -489,38 +489,38 @@ def with_delivery_verification_readiness(
         ):
             from core.delivery_repair import delivery_repair_input_needs_refresh
 
-            if (
-                verification.composition_evidence_fingerprint
-                or verification.security_composition_evidence_fingerprint
-                or verification.reverification
-            ):
-                from core.delivery_composition import load_composition
+            from core.delivery_reverification import validate_reverification, reverification_budget_exhausted
 
-                try:
-                    from core.delivery_reverification import validate_reverification
+            try:
+                if (
+                    verification.composition_evidence_fingerprint
+                    or verification.security_composition_evidence_fingerprint
+                    or verification.reverification
+                ):
+                    from core.delivery_composition import load_composition
 
                     validate_reverification(status, verification, project_config)
                     if verification.composition_evidence_fingerprint:
                         load_composition(status, verification)
                     if verification.security_composition_evidence_fingerprint:
                         load_composition(status, verification, review_kind="security")
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                    return replace(
-                        status,
-                        status="invalid",
-                        verification_status="blocked",
-                        errors=[
-                            *status.errors,
-                            DeliveryPlanIssue(
-                                "error",
-                                "delivery_verification.evidence_unavailable",
-                                "Restore the accepted composition evidence before continuing.",
-                            ),
-                        ],
-                    )
-            from core.delivery_reverification import reverification_budget_exhausted
+                exhausted = reverification_budget_exhausted(status, verification)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                return replace(
+                    status,
+                    status="invalid",
+                    verification_status="blocked",
+                    errors=[
+                        *status.errors,
+                        DeliveryPlanIssue(
+                            "error",
+                            "delivery_verification.evidence_unavailable",
+                            "Restore the accepted composition evidence before continuing.",
+                        ),
+                    ],
+                )
 
-            if reverification_budget_exhausted(status, verification):
+            if exhausted:
                 return replace(
                     status,
                     status="invalid",
