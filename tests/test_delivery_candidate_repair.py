@@ -21,6 +21,70 @@ def candidate(tmp_path):
     return recursive.candidate.__wrapped__(tmp_path)
 
 
+@pytest.mark.parametrize("repair_done", [False, True])
+def test_repair_barrier_propagates_through_completed_consumers(repair_done):
+    from core.delivery_checkpoint_model import DeliveryCheckpoint
+    from core.delivery_checkpoints import checkpoint_barrier_issue, with_checkpoint_barriers
+    from core.delivery_plan import DeliveryPlan, DeliveryPlanUnit
+    from core.delivery_progress import DeliveryStatusResult, DeliveryStatusUnit, select_next_delivery_unit
+
+    units = [
+        DeliveryPlanUnit(key, None, key + ".md", depends_on=deps)
+        for key, deps in (
+            ("foundation", []),
+            ("consumer", ["foundation"]),
+            ("shipping", ["consumer"]),
+            ("downstream", ["shipping"]),
+            ("repair", ["foundation"]),
+            ("independent", []),
+        )
+    ]
+    checkpoint = DeliveryCheckpoint("storage", ("foundation", "repair"), ())
+    done = {"foundation", "consumer"} | ({"repair"} if repair_done else set())
+    status = DeliveryStatusResult(
+        "plan.yaml",
+        None,
+        None,
+        True,
+        "pending",
+        [],
+        [],
+        plan=DeliveryPlan(3, "example", "Example", "delivery/example", units, [], checkpoints=[checkpoint]),
+        units=[
+            DeliveryStatusUnit(
+                unit.id,
+                "done" if unit.id in done else "pending",
+                None,
+                unit.task_path,
+                unit.depends_on,
+                blocked_by=[key for key in unit.depends_on if key not in done],
+            )
+            for unit in units
+        ],
+    )
+    with (
+        patch("core.delivery_checkpoints.checkpoint_pass_is_usable", return_value=False) as usable,
+        patch("core.delivery_checkpoint_applicability.checkpoint_applicability", return_value={}),
+        patch("core.delivery_repair.candidate_repair_reconciles_checkpoint", return_value=True) as reconciled,
+    ):
+        projected = with_checkpoint_barriers(status)
+        for key in ("shipping", "downstream"):
+            assert next(unit for unit in projected.units if unit.id == key).blocked_by_checkpoints == ["storage"]
+            assert checkpoint_barrier_issue(projected, unit_id=key).code == "delivery_checkpoint.required"
+        assert checkpoint_barrier_issue(projected, unit_id="repair") is None
+        assert checkpoint_barrier_issue(projected, unit_id="independent") is None
+        assert select_next_delivery_unit(projected).id == ("independent" if repair_done else "repair")
+        barrier = checkpoint_barrier_issue(projected)
+        assert (barrier.code if barrier else None) == ("delivery_checkpoint.required" if repair_done else None)
+        reconciled.return_value = False
+        assert checkpoint_barrier_issue(projected).code == "delivery_checkpoint.handoff_stale"
+        if repair_done:
+            usable.return_value = True
+            released = with_checkpoint_barriers(status)
+            assert select_next_delivery_unit(released).id == "shipping"
+            assert checkpoint_barrier_issue(released, unit_id="shipping") is None
+
+
 @pytest.mark.parametrize(
     "role,interruption",
     [
@@ -270,7 +334,8 @@ def test_only_independently_attributed_local_semantic_gaps_qualify(tmp_path, mon
 def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_preparer_correction(tmp_path):
     from copy import deepcopy
     import json
-    from core.delivery_checkpoints import verification_node_status
+    from core.delivery_checkpoints import checkpoint_barrier_issue, verification_node_status
+    from core.delivery_progress import select_next_delivery_unit
     from core.delivery_composition import build_composition_context, composition_example
     from core.delivery_verification import build_delivery_verification_snapshot
     from tests.test_delivery_checkpoints import _complete
@@ -326,15 +391,27 @@ def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_pr
     units = {unit.id: unit for unit in after.plan.units}
     assert units["consumer"].depends_on == before.plan.units[1].depends_on
     assert _read_state(root, after.plan.plan_id, "storage")["candidate_recovery"]["node_id"] == "integration"
+    shipping = next(unit for unit in after.units if unit.id == "shipping")
+    assert "storage" in shipping.blocked_by_checkpoints
+    assert checkpoint_barrier_issue(after, cfg) is None
+    assert checkpoint_barrier_issue(after, cfg, unit_id=repaired.unit_id) is None
+    assert select_next_delivery_unit(after).id == repaired.unit_id
+    # Isolate the leaf barrier: the ancestor must not mask a missing transitive guard.
+    with patch(
+        "core.delivery_checkpoints.checkpoint_pass_is_usable", side_effect=lambda _, node, cfg: node.id == "integration"
+    ):
+        assert checkpoint_barrier_issue(after, cfg, unit_id="shipping").code == "delivery_checkpoint.required"
     _complete(path, repaired.unit_id)
+    assert (
+        "storage"
+        in next(unit for unit in get_delivery_status(path).units if unit.id == "shipping").blocked_by_checkpoints
+    )
     for node, obligations in (
         ("storage", {"deliver-team-invites"}),
         ("integration", {"deliver-team-invites", "visible"}),
     ):
         verified, _ = _run(path, cfg, _LLM(delivery_integration_review_control_example(obligations)), node_id=node)
         assert verified.succeeded, verified
-    from core.delivery_checkpoints import checkpoint_barrier_issue
-
     assert checkpoint_barrier_issue(get_delivery_status(path), cfg, unit_id="shipping") is None
 
 

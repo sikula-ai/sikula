@@ -1645,8 +1645,10 @@ repair state. One published repair and two authoring attempts remain the bound;
 a candidate-review identity never creates another allowance. All ordinary repair
 preflight, scope/asset/contract/handoff checks and provider workspace validation
 apply before authoring. Publication appends ownership to the leaf and its ancestors.
-Already completed consumers retain their execution dependencies; pending consumers
-retain normal dependency propagation and checkpoint barriers.
+Already completed consumers retain their execution dependencies. Runtime checkpoint
+barriers cover direct and transitive consumers, including paths through completed
+units, until the repaired scope passes again. Scope members (including the repair)
+and independent units remain outside that barrier.
 
 The prepared repair snapshot preserves prior progress/admission and binds the exact
 enlarged plan. Once publication completes, that evidence permits affected checkpoints
