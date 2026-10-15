@@ -977,6 +977,28 @@ def _execute_gate(
                     return replace(passed, status="blocked", stop_code="delivery_verification.evidence_unavailable")
                 passed = replace(passed, root_evidence_fingerprint=fingerprint)
             return passed
+    except _CandidateRepairRequired as exc:
+        from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, store_candidate_repair_handoff
+
+        running = exc.record
+        try:
+            digest = store_candidate_repair_handoff(status, running, exc.child_id, project_config)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return _review_blocked(running, validation, "delivery_verification.repair_input_unavailable")
+        return replace(
+            running,
+            status="failed",
+            semantic_status="rejected",
+            security_status="not_run",
+            stop_code=CANDIDATE_REPAIR_REQUIRED,
+            repair_input_fingerprint=digest,
+            finding_count=exc.child.finding_count,
+            obligation_satisfied_count=0,
+            obligation_gap_count=exc.child.obligation_gap_count,
+            validation_reused=validation.reused,
+            validation_executed=validation.executed,
+            completed_at=_now(),
+        )
     except _SemanticRecheckRequired as exc:
         # The child result is already durable. Re-enter semantic review with the
         # same reservations; it must use the remaining full fallback, not the
@@ -1047,6 +1069,22 @@ def _execute_gate(
             obligation_satisfied_count=obligation_satisfied_count,
             obligation_gap_count=obligation_gap_count,
         )
+
+
+class _CandidateRepairRequired(RuntimeError):
+    def __init__(self, record: DeliveryVerificationRecord, child_id: str, child: DeliveryVerificationRecord) -> None:
+        self.record = record
+        self.child_id = child_id
+        self.child = child
+
+
+def _route_candidate_repair(status, parent, child, child_id, cfg):
+    from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, eligible_local_finding
+
+    if child.stop_code == CANDIDATE_REPAIR_REQUIRED or eligible_local_finding(
+        replace(status, verification_node=child_id), child, cfg
+    ):
+        raise _CandidateRepairRequired(parent, child_id, child)
 
 
 class _CandidateReviewStopped(RuntimeError):
@@ -1327,6 +1365,7 @@ def _reverify_candidate_child(
         ):
             raise _CandidateReviewStopped(child)
         if child.status != "running" or child_snapshot.composition_scope is None:
+            _route_candidate_repair(status, running, child, node_id, cfg)
             return running, child.passed
     else:
         roles = ("reviewer", "security_reviewer") if child_snapshot.scope.security_required else ("reviewer",)
@@ -1428,6 +1467,8 @@ def _reverify_candidate_child(
     if not boundary and (parent.gate_id, parent.attempt) != (running.gate_id, running.attempt):
         raise ValueError("Initiating candidate review attempt changed.")
     running = parent
+    if not boundary:
+        _route_candidate_repair(status, running, child, node_id, cfg)
     if boundary or (not child.passed and child.stop_code != "delivery_verification.repair_required"):
         raise _CandidateReviewStopped(child)
     return running, child.passed
@@ -2095,6 +2136,18 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                 if reverification_budget_exhausted(status, record):
                     return _blocked_result(status, "delivery_verification.reverification_budget_exhausted")
         except (OSError, ValueError, KeyError, TypeError):
+            return _blocked_result(status, "delivery_verification.evidence_unavailable")
+    from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, resolve_candidate_repair
+
+    if status.verification and status.verification.stop_code == CANDIDATE_REPAIR_REQUIRED:
+        try:
+            current = build_delivery_verification_identity(
+                status, project_config or {}, candidate_commit=status.assembled_commit
+            )
+            if current.gate_id == status.verification.gate_id:
+                resolve_candidate_repair(status, project_config or {})
+                return _result_from_record(status, status.verification, succeeded=False, next_action="run_delivery")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return _blocked_result(status, "delivery_verification.evidence_unavailable")
     if readiness.required and not status.progress_exists:
         return _blocked_result(status, "delivery_verification.progress_missing")

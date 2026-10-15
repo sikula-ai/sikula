@@ -51,9 +51,12 @@ def load_repair_input(
     project_config: dict[str, Any],
     *,
     node_id: str = "root",
+    require_current_policy: bool = True,
 ) -> DeliveryIntegrationAssessment:
     payload = _load_bound_input(root, directory, record)
-    if payload.get("repair_policy_fingerprint") != repair_content_fingerprint(project_config):
+    if require_current_policy and payload.get("repair_policy_fingerprint") != repair_content_fingerprint(
+        project_config
+    ):
         raise ValueError("Current structured integration repair input is unavailable.")
     return _parse_assessment(payload, plan, node_id)
 

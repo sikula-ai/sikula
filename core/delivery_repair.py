@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import copy
+import json
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -148,6 +149,17 @@ def _read_state(root: Path, plan_id: str, node_id: str = "root") -> dict[str, An
             or any(not isinstance(value, str) for value in state["child_evidence"].values())
         ):
             _stop("state_invalid", "Prepared integration repair control state is invalid.")
+    binding = state.get("candidate_recovery")
+    if binding is not None:
+        from core.delivery_candidate_repair import validate_recovery_binding
+
+        validate_recovery_binding(binding)
+        if state["phase"] in {"prepared", "published"} and (
+            not isinstance(state.get("reconciled_plan_fingerprint"), str)
+            or len(state["reconciled_plan_fingerprint"]) != 71
+            or not state["reconciled_plan_fingerprint"].startswith("sha256:")
+        ):
+            _stop("state_invalid", "Candidate repair publication binding is unavailable.")
     if state["phase"] == "blocked" and state.get("stop_code") not in _TERMINAL_STOPS:
         _stop("state_invalid", "Integration repair terminal state is invalid.")
     return state
@@ -203,7 +215,9 @@ def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[
         return False
 
 
-def _current_input(status: DeliveryStatusResult, cfg: dict[str, Any]) -> DeliveryIntegrationAssessment:
+def _current_input(
+    status: DeliveryStatusResult, cfg: dict[str, Any], *, candidate_recovery: bool = False
+) -> DeliveryIntegrationAssessment:
     if (
         not status.valid
         or not verification_scope_complete(status)
@@ -236,16 +250,28 @@ def _current_input(status: DeliveryStatusResult, cfg: dict[str, Any]) -> Deliver
     ):
         _stop("input_unavailable", "No eligible structured semantic repair input is available.")
     root = Path(status.project_root)
-    identity = build_delivery_verification_identity(status, cfg, candidate_commit=record.candidate_commit)
+    # Candidate identities are already checked through their accepted parent chain;
+    # they intentionally differ from ordinary historical checkpoint identities.
+    identity = (
+        None
+        if candidate_recovery
+        else build_delivery_verification_identity(status, cfg, candidate_commit=record.candidate_commit)
+    )
     if (
-        any(getattr(record, key) != value for key, value in asdict(identity).items())
+        (identity is not None and any(getattr(record, key) != value for key, value in asdict(identity).items()))
         or status.assembled_commit != record.candidate_commit
         or status.assembly_status != "ready"
         or delivery_branch_commit(root, plan.final_branch) != record.candidate_commit
     ):
         _stop("stale", "The candidate or its authority changed after integration review.")
     assessment = load_repair_input(
-        root, delivery_progress_path(root, plan.plan_id).parent, record, plan, cfg, node_id=status.verification_node
+        root,
+        delivery_progress_path(root, plan.plan_id).parent,
+        record,
+        plan,
+        cfg,
+        node_id=status.verification_node,
+        require_current_policy=not candidate_recovery,
     )
     gaps = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
     if (
@@ -340,6 +366,29 @@ def _coordinate(
     audit_path = state_path.with_suffix(".jsonl")
     state = _read_state(root, plan_id, node_id)
     status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
+    from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, candidate_repair_status
+
+    binding = state.get("candidate_recovery") if state else None
+    resolve_handoff = (
+        state is None
+        or (state["phase"] == "authoring" and binding is not None)
+        or (
+            state["phase"] == "published"
+            and status.verification
+            and status.verification.stop_code == CANDIDATE_REPAIR_REQUIRED
+        )
+    )
+    if resolve_handoff:
+        # A consumed ancestor allowance is unrelated to a new finding owned by
+        # a descendant. Pending/terminal ancestor repairs still take precedence.
+        if state and state["phase"] == "published":
+            binding = None
+        status, binding = candidate_repair_status(path, root, node_id, cfg, binding)
+        if status.verification_node != node_id:
+            node_id = status.verification_node
+            state_path = _state_path(root, plan_id, node_id)
+            audit_path = state_path.with_suffix(".jsonl")
+            state = _read_state(root, plan_id, node_id)
     if state is not None:
         if state["phase"] == "blocked":
             raise DeliveryRepairError(
@@ -348,13 +397,15 @@ def _coordinate(
             )
         if state["phase"] == "published":
             _stop("budget_exhausted", "The plan's single automatic integration repair has already been published.")
+        if state.get("candidate_recovery") != binding:
+            _stop("stale", "Candidate repair handoff changed after preparation started.")
         if state["config_fingerprint"] != repair_content_fingerprint(cfg):
             _stop("stale", "Effective integration repair policy changed after preparation started.")
         if state["phase"] == "prepared":
             _assert_child_evidence(state.get("child_evidence", {}), state_store)
             return _publish(path, root, cfg, state, state_store=state_store, dry_run=dry_run)
 
-    assessment = _current_input(status, cfg)
+    assessment = _current_input(status, cfg, candidate_recovery=binding is not None)
     assert status.plan is not None and status.verification is not None
     child_evidence = _capture_child_evidence(status, state_store)
     if state is not None and state["verification"] != status.verification.to_dict():
@@ -375,6 +426,8 @@ def _coordinate(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "unit_id": "integration-repair-" + status.verification.gate_id[-16:],
         }
+    if binding is not None:
+        state["candidate_recovery"] = binding
     if "accepted_checkpoints" not in state:
         # Freeze effective handoff acceptance before authoring. Publication may
         # resume after source artifacts changed, so cannot recompute this set.
@@ -388,7 +441,16 @@ def _coordinate(
     ) as worktree:
         if not _candidate_config_matches_capture(root, worktree, cfg):
             _stop("config_changed", "Repair candidate configuration differs from the loaded policy.")
-        packet, unit, contracts = _repair_packet(status, root, worktree, cfg, assessment, state["unit_id"], state_store)
+        packet, unit, contracts = _repair_packet(
+            status,
+            root,
+            worktree,
+            cfg,
+            assessment,
+            state["unit_id"],
+            state_store,
+            candidate_recovery=binding is not None,
+        )
         _assert_dependency_handoffs(status, unit["depends_on"], root)
         _assert_child_evidence(child_evidence, state_store)
         _check_repair_prompt(packet)
@@ -404,6 +466,9 @@ def _coordinate(
             status.plan_path,
             node_id=node_id,
             accepted_checkpoints=frozenset(state["accepted_checkpoints"]),
+            completed_unit_ids=frozenset(item.id for item in status.units if item.status == "done")
+            if binding
+            else frozenset(),
         )
         if dry_run:
             return DeliveryRepairResult(ready=True)
@@ -422,8 +487,8 @@ def _coordinate(
                 _stop("readonly_mutation", "Repair workspace preparation changed its candidate.")
         before = _review_snapshot(worktree, cfg)
         while state["attempts"] < _MAX_AUTHORING_ATTEMPTS:
-            current = verification_node_status(get_delivery_status(path, project_root=root), node_id)
-            _current_input(current, cfg)
+            current, _ = candidate_repair_status(path, root, node_id, cfg, binding)
+            _current_input(current, cfg, candidate_recovery=binding is not None)
             if current.verification != status.verification:
                 _stop("stale", "Integration repair input changed before an authoring attempt.")
             _assert_child_evidence(child_evidence, state_store)
@@ -488,8 +553,8 @@ def _coordinate(
                     raise
                 packet["previous_error"] = exc.issue.message
                 continue
-            current = verification_node_status(get_delivery_status(path, project_root=root), node_id)
-            _current_input(current, cfg)
+            current, _ = candidate_repair_status(path, root, node_id, cfg, binding)
+            _current_input(current, cfg, candidate_recovery=binding is not None)
             if current.verification != status.verification:
                 _stop("stale", "Integration repair input changed during authoring.")
             state.update(
@@ -504,7 +569,9 @@ def _coordinate(
                 child_evidence=child_evidence,
             )
             _assert_child_evidence(child_evidence, state_store)
-            _prepared_plan(state, root, cfg, status.plan_path, asset_root=worktree)
+            prepared = _prepared_plan(state, root, cfg, status.plan_path, asset_root=worktree)
+            if binding:
+                state["reconciled_plan_fingerprint"] = "sha256:" + sha256(prepared).hexdigest()
             write_repair_state(root, state_path, state)
             break
     return _publish(path, root, cfg, state, state_store=state_store, dry_run=False)
@@ -550,6 +617,8 @@ def _repair_packet(
     assessment: DeliveryIntegrationAssessment,
     unit_id: str,
     state_store: StateStore | None,
+    *,
+    candidate_recovery: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     plan = status.plan
     assert plan is not None and plan.source_task is not None and status.verification is not None
@@ -647,6 +716,12 @@ def _repair_packet(
     if plan.schema_version == 3:
         unit["repair_node"] = status.verification_node
     source = (root / plan.source_task.path).read_text(encoding="utf-8")
+    if candidate_recovery:
+        from core.delivery_authority import verification_authority_fragments
+
+        # The independently checked packet, including shared/enclosing context,
+        # authorizes this omission. Obligation references alone never do.
+        source = json.dumps(verification_authority_fragments(source, plan_context), ensure_ascii=True)
     owner_contracts = {item.id: contracts[item.task_path] for item in scoped_units if item.id in owners}
     # Validate inherited declarations and candidate availability before authoring.
     inherited = _inherit_assets("", list(owner_contracts.values()), worktree, unit_id)
@@ -807,7 +882,7 @@ def _prepared_plan(
         for key in accepted_checkpoints
     ):
         _stop("state_invalid", "Prepared checkpoint acceptance evidence is unavailable.")
-    return _appended_plan(
+    prepared = _appended_plan(
         data,
         unit,
         state["obligation_ids"],
@@ -816,7 +891,19 @@ def _prepared_plan(
         plan_path,
         node_id=state.get("node_id", "root"),
         accepted_checkpoints=frozenset(accepted_checkpoints),
+        completed_unit_ids=frozenset(
+            item["unit_id"] for item in state["completed_progress"]["units"] if item["status"] == "done"
+        )
+        if state.get("candidate_recovery")
+        else frozenset(),
     )
+
+    if state.get("candidate_recovery") and state.get("reconciled_plan_fingerprint") not in {
+        None,
+        "sha256:" + sha256(prepared).hexdigest(),
+    }:
+        _stop("state_invalid", "Candidate repair publication differs from its prepared plan.")
+    return prepared
 
 
 def _appended_plan(
@@ -829,6 +916,7 @@ def _appended_plan(
     *,
     node_id: str = "root",
     accepted_checkpoints: frozenset[str] = frozenset(),
+    completed_unit_ids: frozenset[str] = frozenset(),
 ) -> bytes:
     """Build and preflight the exact enlarged plan independently of authored Markdown."""
     unit_id = unit["id"]
@@ -860,8 +948,14 @@ def _appended_plan(
             while ancestor and ancestor not in covered_lineage and ancestor not in guarded:
                 guarded.add(ancestor)
                 ancestor = by_id[ancestor].get("supersedes")
+        preserved_lineage = set(completed_unit_ids)
+        for key in completed_unit_ids:
+            ancestor = by_id[key].get("supersedes")
+            while ancestor and ancestor not in preserved_lineage:
+                preserved_lineage.add(ancestor)
+                ancestor = by_id[ancestor].get("supersedes")
         for item in data["units"]:
-            if item["id"] in guarded:
+            if item["id"] in guarded and item["id"] not in preserved_lineage:
                 if item.get("repair_node") is not None:
                     _stop("repair_lineage_bound", "Checkpoint recovery cannot rewrite an earlier coordinator repair.")
                 item["depends_on"] = [*item.get("depends_on", []), unit_id]
@@ -958,6 +1052,14 @@ def _publish(
     progress, errors = read_delivery_progress(delivery_progress_path(root, state["plan_id"]), plan_id=state["plan_id"])
     if progress is None or errors:
         _stop("progress_invalid", "Integration repair progress is unavailable.")
+    if state.get("candidate_recovery"):
+        from core.delivery_verification_model import delivery_verification_is_boundary_stop
+
+        if any(
+            item and delivery_verification_is_boundary_stop(item)
+            for item in [progress.verification, *progress.checkpoint_verifications.values()]
+        ):
+            _stop("security_stop", "Candidate repair cannot publish across a terminal verification boundary.")
     if progress.to_dict() != old_progress:
         if (
             not commit
@@ -987,11 +1089,19 @@ def _publish(
             observed.pop(field, None)
         if observed != expected:
             _stop("stale", "Delivery progress changed during repair publication.")
+    if state.get("candidate_recovery"):
+        from core.delivery_candidate_repair import validate_prepared_candidate_repair
+
+        validate_prepared_candidate_repair(get_delivery_status(plan_path, project_root=root), state, cfg)
     if current_plan == plan_before and commit is None:
-        _current_input(
-            verification_node_status(get_delivery_status(plan_path, project_root=root), state.get("node_id", "root")),
-            cfg,
+        from core.delivery_candidate_repair import candidate_repair_status
+
+        current, _ = candidate_repair_status(
+            plan_path, root, state.get("node_id", "root"), cfg, state.get("candidate_recovery")
         )
+        _current_input(current, cfg, candidate_recovery=bool(state.get("candidate_recovery")))
+        if current.verification.to_dict() != state["verification"]:
+            _stop("stale", "Candidate repair input changed before publication.")
     else:
         source = plan_data["source_task"]
         if (
@@ -1049,3 +1159,48 @@ def _publish(
     state.update(phase="published", publication_commit=commit)
     write_repair_state(root, _state_path(root, state["plan_id"], state.get("node_id", "root")), state)
     return DeliveryRepairResult(ready=True, unit_id=unit_id)
+
+
+def candidate_repair_reconciles_checkpoint(status: DeliveryStatusResult, checkpoint_id: str) -> bool:
+    """Authorize re-verification after an exact coordinator append, never admission.
+
+    Already completed consumers keep their execution prerequisites. The immutable
+    publication snapshot accounts for that history while ordinary barriers still
+    prevent new consumer work until the enlarged checkpoint passes.
+    """
+    if not status.plan or not status.project_root:
+        return False
+    root = Path(status.project_root)
+    try:
+        progress, errors = read_delivery_progress(
+            delivery_progress_path(root, status.plan.plan_id), plan_id=status.plan.plan_id
+        )
+        if progress is None or errors:
+            return False
+        checkpoint = next(item for item in status.plan.checkpoints if item.id == checkpoint_id)
+        for node_id in {unit.repair_node for unit in status.plan.units if unit.repair_node}:
+            state = _read_state(root, status.plan.plan_id, node_id)
+            if (
+                not state
+                or state["phase"] != "published"
+                or not state.get("candidate_recovery")
+                or state["unit_id"] not in checkpoint.unit_ids
+                or state.get("reconciled_plan_fingerprint") != status.plan_fingerprint
+            ):
+                continue
+            old = state["completed_progress"]
+            admitted = old.get("checkpoint_verifications", {}).get(checkpoint_id)
+            if not admitted or not parse_delivery_verification_record(admitted).passed:
+                continue
+            current_units = {item.unit_id: item.to_dict() for item in progress.units}
+            if any(current_units.get(item["unit_id"]) != item for item in old["units"]):
+                continue
+            # The publication must remain in the assembled lineage. A hand-edited
+            # plan or unrelated branch cannot claim this reconciliation allowance.
+            from core.delivery_assembly import delivery_commit_is_ancestor
+
+            if delivery_commit_is_ancestor(root, state["publication_commit"], status.assembled_commit):
+                return True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, StopIteration):
+        return False
+    return False

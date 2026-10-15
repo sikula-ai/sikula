@@ -485,7 +485,11 @@ def checkpoint_barrier_issue(
         if checkpoint_pass_is_usable(status, checkpoint, cfg):
             continue
         guarded = checkpoint_guarded_units(checkpoint, status.plan.units)
-        if any(unit.id in guarded and unit.status not in {"pending", "blocked", "superseded"} for unit in status.units):
+        from core.delivery_repair import candidate_repair_reconciles_checkpoint
+
+        if any(
+            unit.id in guarded and unit.status not in {"pending", "blocked", "superseded"} for unit in status.units
+        ) and not candidate_repair_reconciles_checkpoint(status, checkpoint.id):
             return DeliveryPlanIssue(
                 "error",
                 "delivery_checkpoint.handoff_stale",
@@ -603,7 +607,8 @@ def checkpoint_preflight_issue(
             )
         if (
             record.stop_code
-            and record.stop_code != "delivery_verification.repair_required"
+            and record.stop_code
+            not in {"delivery_verification.repair_required", "delivery_verification.candidate_repair_required"}
             and delivery_verification_recovery_action(record.stop_code) != "retry_delivery_verification"
             and (
                 current.verification_status != "stale"

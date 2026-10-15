@@ -463,7 +463,13 @@ def _gap(obligations):
 
 
 @pytest.mark.parametrize("intermediate_approved", [False, True])
-def test_security_requested_descendant_gap_invalidates_ancestor_approvals(candidate, intermediate_approved):
+def test_security_requested_descendant_gap_invalidates_ancestor_approvals(
+    candidate, intermediate_approved, monkeypatch
+):
+    from core import delivery_candidate_repair
+
+    # Unsupported local recovery still needs the conservative ancestor fallback.
+    monkeypatch.setattr(delivery_candidate_repair, "eligible_local_finding", lambda *args: False)
     path, cfg = candidate
     output = _outputs(path, cfg)
     semantic = _LLM(

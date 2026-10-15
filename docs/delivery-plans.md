@@ -677,9 +677,12 @@ relevant code, including shared dependencies. This replaces the repeated full
 semantic review when the composed prompt is smaller. With independently checked
 final responsibility, uncertain applicability first reviews the affected checkpoint
 on the final candidate, then reassesses integration. This includes required security
-review and configured validation. Unsupported cases, confirmed semantic gaps and
-repeated uncertainty select full review; external-dependency and security boundaries
-remain stops. Full-review findings feed bounded repair.
+review and configured validation. A confirmed semantic gap wholly owned by one
+independently attributed leaf checkpoint can feed its existing bounded repair
+directly, without full ancestor review merely to recreate that finding. This also
+applies when security requested the checkpoint review. Unsupported cases, cross-group
+gaps and repeated uncertainty select full review; external-dependency and security
+boundaries remain stops. Full-review findings also feed bounded repair.
 Historical admission records and already completed units remain unchanged.
 
 The composed path supports up to eight nonoverlapping checkpoints and 32 direct
@@ -704,6 +707,24 @@ All referenced evidence remains private and must be intact, including original
 checkpoint evidence. Candidate reviews never overwrite historical admission or
 rerun completed units, and they do not replenish repair budgets.
 
+When verification reports `delivery_verification.candidate_repair_required`,
+`delivery run` resolves its private evidence to the affected checkpoint and prepares
+one repair using that checkpoint's existing allowance. `--dry-run` performs the same
+evidence and repair preflight without authoring. Rerunning verification on the same
+candidate returns the pending recovery instead of spending another review attempt.
+Missing or changed handoff evidence blocks recovery before providers are called.
+Preparer-only overrides can be corrected before the first authoring reservation;
+authoring thereafter retains its captured effective policy and remaining attempts.
+
+The repair preserves completed units and their original dependencies, and appends
+new work to the affected verification branch. Only its exact published plan and
+preserved execution evidence allow reconciliation of already completed consumers.
+New dependent work remains behind the checkpoint barrier. After execution, the
+repaired checkpoint and affected ancestors must be verified again, followed by the
+mandatory final gate. Earlier checkpoint artifacts remain available for audit;
+the original pass cannot approve the repaired scope. Local repair exhaustion still
+requires follow-up work or operator action; this path does not reset budgets.
+
 Successful final verification of a plan with checkpoints retains exact typed
 results in private content-addressed evidence. Compact final evidence stores direct
 results and immediate child evidence references; deterministic checks resolve exact
@@ -725,9 +746,10 @@ dependencies, `delivery_repair.repair_lineage_bound` stops before authoring or
 consuming another attempt. Resolving that topology requires a follow-up plan.
 Plans without checkpoints retain their prior one-repair behavior.
 
-This is a flat, bounded implementation. The full-review fallback must still fit
-its existing limits (including 256 active units); nested composition, adaptive
-regrouping and large-plan scaling are subsequent work.
+Nested composition and selective candidate review use bounded per-node contexts.
+The full-review fallback must still fit its existing limits (including 256 active
+units). Broader corrective decomposition, bounded repair-time authority renewal,
+adaptive regrouping and large-plan scaling remain subsequent work.
 
 
 ## Current MVP Commands

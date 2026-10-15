@@ -903,10 +903,15 @@ python3 -m ruff format .
   disjoint paths, ancestry or passing tests. Bound child fan-in, direct context,
   change evidence and the complete rendered protocol. With verified final authority,
   ordinary uncertainty first reviews the named child on the current final candidate,
-  then reassesses parent integration; unsupported inputs, confirmed semantic gaps
-  and repeated uncertainty use a preflighted full-review fallback. Keep new child
-  evidence separate from historical admission. Reserve the entire finite cycle's
-  work durably before calls, including child reviews, parent reassessment, format
+  then reassesses parent integration. An eligible typed semantic gap wholly owned
+  by an independently attributed leaf may enter its existing bounded repair through
+  an accepted candidate/authority/attempt-bound handoff, without ancestor rediscovery.
+  Unsupported inputs, cross-group gaps and repeated uncertainty retain preflighted
+  full review. Keep new child evidence separate from historical admission. Candidate
+  repair cannot refill logical-node budgets or rewrite completed consumers' execution
+  dependencies; only the exact published repair can reconcile their history for
+  fresh checkpoint verification, never authorize new consumer work or finalization.
+  Reserve the entire finite cycle's work durably before calls, including child reviews, parent reassessment, format
   correction and fallback. Resume accepted results; never reconstruct missing
   evidence or repeat consumed exchanges to obtain approval. Preflight both roles'
   rendered child and fallback packets before the first call. Security/read-only
