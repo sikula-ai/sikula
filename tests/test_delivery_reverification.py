@@ -491,6 +491,10 @@ def test_review_prompt_only_includes_applicable_validation_policy(tmp_path, node
 
 @pytest.mark.parametrize("recovery", ["repair", "approved", "interrupted", "spent", "resume"])
 def test_security_requested_child_gap_invalidates_earlier_semantic_approval(closure_plan, recovery, monkeypatch):
+    from core import delivery_candidate_repair
+
+    # Keep exercising full fallback for gaps outside the supported local repair path.
+    monkeypatch.setattr(delivery_candidate_repair, "eligible_local_finding", lambda *args: False)
     path, cfg = closure_plan
     approved, uncertain, full = _outputs(path, cfg)
     gap = json.loads(full[0])

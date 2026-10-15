@@ -504,6 +504,10 @@ def with_delivery_verification_readiness(
                         load_composition(status, verification)
                     if verification.security_composition_evidence_fingerprint:
                         load_composition(status, verification, review_kind="security")
+                from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, resolve_candidate_repair
+
+                if verification.stop_code == CANDIDATE_REPAIR_REQUIRED:
+                    resolve_candidate_repair(status, project_config)
                 exhausted = reverification_budget_exhausted(status, verification)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 return replace(

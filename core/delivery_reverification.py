@@ -301,7 +301,11 @@ def reverification_budget_exhausted(status: DeliveryStatusResult, record: Delive
     fallbacks = record.reverification["fallbacks"]
     return (
         any(digest is None for digest in fallbacks.values())
-        or ("semantic" in fallbacks and not semantic_fallback_covers_gaps(status, record))
+        or (
+            "semantic" in fallbacks
+            and record.stop_code != "delivery_verification.candidate_repair_required"
+            and not semantic_fallback_covers_gaps(status, record)
+        )
         or any(
             reverification_budget_exhausted(status, expanded_child(status, entry))
             for entry in record.reverification["children"].values()

@@ -13,12 +13,11 @@ from typing import Any
 
 from core.delivery_checkpoint_model import (
     DeliveryCheckpoint,
-    checkpoint_guarded_units,
     checkpoint_children,
     checkpoint_postorder,
     checkpoint_input_units,
 )
-from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue
+from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue, DeliveryPlanUnit
 from core.delivery_progress import DeliveryStatusResult
 from core.delivery_verification_scope import DeliveryVerificationScope
 from core.state import StateStore
@@ -476,6 +475,26 @@ def due_delivery_checkpoint(status: DeliveryStatusResult, cfg: dict[str, Any] | 
     return None
 
 
+def _checkpoint_runtime_consumers(checkpoint: DeliveryCheckpoint, units: list[DeliveryPlanUnit]) -> set[str]:
+    """Propagate barriers even through consumers completed before a candidate repair."""
+    covered = set(checkpoint.unit_ids)
+    consumers: dict[str, list[str]] = {}
+    for unit in units:
+        if unit.superseded:
+            continue
+        for dependency in unit.depends_on:
+            consumers.setdefault(dependency, []).append(unit.id)
+    reached = set(covered)
+    pending = list(covered)
+    while pending:
+        for consumer in consumers.get(pending.pop(), ()):
+            if consumer not in reached:
+                reached.add(consumer)
+                pending.append(consumer)
+    # Members (including an appended repair) must be able to complete the scope.
+    return reached - covered
+
+
 def checkpoint_barrier_issue(
     status: DeliveryStatusResult, cfg: dict[str, Any] | None = None, *, unit_id: str | None = None
 ) -> DeliveryPlanIssue | None:
@@ -484,8 +503,12 @@ def checkpoint_barrier_issue(
     for checkpoint in getattr(status.plan, "checkpoints", ()):
         if checkpoint_pass_is_usable(status, checkpoint, cfg):
             continue
-        guarded = checkpoint_guarded_units(checkpoint, status.plan.units)
-        if any(unit.id in guarded and unit.status not in {"pending", "blocked", "superseded"} for unit in status.units):
+        guarded = _checkpoint_runtime_consumers(checkpoint, status.plan.units)
+        from core.delivery_repair import candidate_repair_reconciles_checkpoint
+
+        if any(
+            unit.id in guarded and unit.status not in {"pending", "blocked", "superseded"} for unit in status.units
+        ) and not candidate_repair_reconciles_checkpoint(status, checkpoint.id):
             return DeliveryPlanIssue(
                 "error",
                 "delivery_checkpoint.handoff_stale",
@@ -603,7 +626,8 @@ def checkpoint_preflight_issue(
             )
         if (
             record.stop_code
-            and record.stop_code != "delivery_verification.repair_required"
+            and record.stop_code
+            not in {"delivery_verification.repair_required", "delivery_verification.candidate_repair_required"}
             and delivery_verification_recovery_action(record.stop_code) != "retry_delivery_verification"
             and (
                 current.verification_status != "stale"
@@ -728,7 +752,7 @@ def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] |
 
     applicability = checkpoint_applicability(status, cfg, usable)
     guarded = {
-        item.id: checkpoint_guarded_units(item, status.plan.units)
+        item.id: _checkpoint_runtime_consumers(item, status.plan.units)
         for item in status.plan.checkpoints
         if item.id not in usable
     }

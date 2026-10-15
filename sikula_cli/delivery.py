@@ -18,6 +18,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any
 
+from core.delivery_candidate_repair import REPAIR_REQUIRED_CODES
 from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAssessmentDraft,
@@ -2309,7 +2310,7 @@ def _preview_delivery_run(
         node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
         issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
         recovery = _delivery_verification_recovery_stop_code(node)
-        if issue is None and recovery == "delivery_verification.repair_required":
+        if issue is None and recovery in REPAIR_REQUIRED_CODES:
             repair = coordinate_delivery_repair(
                 args.plan_file,
                 cfg,
@@ -2337,7 +2338,7 @@ def _preview_delivery_run(
     if delivery_repair_pending(args.plan_file, project_root=project_root) or (
         status.plan
         and getattr(status.plan, "obligations", None)
-        and _delivery_verification_recovery_stop_code(status) == "delivery_verification.repair_required"
+        and _delivery_verification_recovery_stop_code(status) in REPAIR_REQUIRED_CODES
     ):
         repair = coordinate_delivery_repair(
             args.plan_file,
@@ -2560,7 +2561,7 @@ def _run_delivery_plan(
             checkpoint_issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
             if checkpoint_issue is None:
                 recovery = _delivery_verification_recovery_stop_code(node)
-                if recovery == "delivery_verification.repair_required":
+                if recovery in REPAIR_REQUIRED_CODES:
                     repair_requested = checkpoint_id
                 elif recovery is not None:
                     checkpoint_issue = DeliveryPlanIssue(
@@ -2584,7 +2585,7 @@ def _run_delivery_plan(
                         checkpoint_issue = DeliveryPlanIssue(
                             "error", "delivery_checkpoint.no_progress", "Checkpoint did not leave a usable handoff."
                         )
-                    elif verification.stop_code == "delivery_verification.repair_required":
+                    elif verification.stop_code in REPAIR_REQUIRED_CODES:
                         repair_requested = checkpoint_id
                     else:
                         checkpoint_issue = DeliveryPlanIssue(
@@ -2697,7 +2698,7 @@ def _run_delivery_plan(
                 child_task_id=child_task_id,
             )
             if (
-                final_result.stop_code == "delivery_verification.repair_required"
+                final_result.stop_code in REPAIR_REQUIRED_CODES
                 and status.plan
                 and status.plan.obligations
                 and context.repair_agent_factory is not None

@@ -1600,9 +1600,9 @@ The bound includes spent/interrupted exchanges, not just successes.
 Children already accepted for one role's request serve the other role's request
 without another child execution. Parent reassessment still reviews integration.
 Repeated uncertainty, a consumed child exchange without accepted evidence or a
-confirmed semantic gap selects the preflighted full review and existing typed
-root repair path. Confirmed external/authority/security/read-only stops preempt
-further automatic review. After resolving an external prerequisite, explicit
+semantic gap outside the supported local recovery path selects the preflighted full
+review and existing typed repair path. Confirmed external/authority/security/read-only
+stops preempt further automatic review. After resolving an external prerequisite, explicit
 verification can spend the remaining full fallback without reopening the child
 exchange. Security/read-only child boundaries remain durable even
 if auditing fails or assembly advances; they also block after candidate/policy changes.
@@ -1611,13 +1611,56 @@ A semantic rejection from a descendant requested by security also supersedes ear
 semantic composition passes along the affected ancestor path. Immediate references
 retain a monotonic `semantic_gap` flag even when a descendant's local fallback later
 approves; no descendant history or finding list is copied into ancestors. Before continuing security or accepting the final gate,
-the coordinator uses the remaining full semantic fallback and its normal repair
-outcome. Fallback evidence binds the child rejections known at that review; an
-earlier fallback cannot cover a later rejection or receive a new budget. This
+the coordinator routes an eligible leaf finding to scoped candidate repair, or
+uses the remaining full semantic fallback and its normal repair outcome. Fallback
+evidence binds the child rejections known at that review; an earlier fallback cannot
+cover a later rejection or receive a new budget. This
 requirement survives interruption and is checked by readiness and final evidence
 validation. Security fallback rejection goes directly to terminal boundary
 persistence for the captured attempt, without ordinary acceptance/freshness checks
 that could discard it when assembly advances.
+
+**Scoped recovery from candidate findings:** a semantic `repair_required` assessment
+inside one independently attributed leaf can stop recursive composition with
+`delivery_verification.candidate_repair_required`. The local assessment stays in
+its existing private repair-input artifact. Each ancestor's repair-input artifact
+contains only a bound immediate-child reference (node, gate, attempt and input
+fingerprint), its own identity/attempt and captured repair policy. No flattened
+finding list or audit replay authorizes repair. Both reviewer request paths use the
+same handoff; a descendant semantic rejection invalidates prior ancestor approval.
+
+The repair coordinator validates current initiating authority and the accepted
+candidate-control chain before projecting the producing leaf record for repair.
+Historical admission is not overwritten by that projection. Only findings whose
+obligation owners and permitted scope lie inside the leaf qualify. Shared and
+enclosing source authority comes from its independently checked packet; the repair
+prompt includes exact selected fragments, local plan context and owner contracts.
+Missing attribution, cross-child findings and unsupported decomposition retain the
+existing full-review/stop path. Review authority must still match the candidate;
+preparer-only policy corrections are allowed before authoring reserves an attempt.
+Once reserved, the existing repair state's effective policy stays frozen.
+
+`delivery run` and dry-run resolve this handoff to the original logical node's
+repair state. One published repair and two authoring attempts remain the bound;
+a candidate-review identity never creates another allowance. All ordinary repair
+preflight, scope/asset/contract/handoff checks and provider workspace validation
+apply before authoring. Publication appends ownership to the leaf and its ancestors.
+Already completed consumers retain their execution dependencies. Runtime checkpoint
+barriers cover direct and transitive consumers, including paths through completed
+units, until the repaired scope passes again. Scope members (including the repair)
+and independent units remain outside that barrier.
+
+The prepared repair snapshot preserves prior progress/admission and binds the exact
+enlarged plan. Once publication completes, that evidence permits affected checkpoints
+to be reverified despite their already completed consumers, only while the original
+unit records, exact plan and publication lineage remain intact. It never makes the
+old receipt applicable to the enlarged scope or permits new downstream work. Fresh
+checkpoint results and ancestor assessments, required security and final validation,
+and a passing exact-candidate final gate are still required. Changed ownership
+invalidates old attribution receipts; safe full-authority fallback still applies.
+Interrupted handoff/authoring/publication resumes accepted evidence without resetting
+budgets, and superseded initiating attempts cannot publish ordinary review updates.
+Terminal security/read-only boundaries remain independent of evidence freshness.
 
 Reservations precede calls and private prompt/output audit precedes acceptance.
 Child and fallback exchanges check the read-only boundary before format retries.
@@ -1719,9 +1762,9 @@ resume identity. Readiness includes escaped source/context, rules, security cont
 response templates and protocol/correction allowance. Terminal security/read-only
 stops and all retry/repair budgets are unchanged. The full-source fallback and current
 whole-plan limits still apply; recursive node review does not yet provide unbounded
-plan support. Failed composed semantic assessments use full review before repair so repair
-input keeps complete obligation provenance; changed repair ownership invalidates final
-attribution and selects full authority.
+plan support. Failed composed semantic assessments outside eligible local candidate
+recovery use full review before repair to retain complete obligation provenance;
+changed repair ownership invalidates final attribution and selects full authority.
 
 `DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
 and handoff evidence and the exact candidate/config/source/plan/policy identity.

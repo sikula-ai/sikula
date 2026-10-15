@@ -298,8 +298,12 @@ checks that those results still apply to the current code. This reduces repeated
 context. With independently checked final responsibility, uncertain applicability
 first triggers a bounded review of the affected checkpoint on the final candidate,
 including required security review. The final gate then reassesses integration.
-Historical admission and completed units stay unchanged. Unsupported cases, confirmed
-semantic gaps or repeated uncertainty use a bounded full-review fallback.
+Historical admission and completed units stay unchanged. An eligible semantic gap
+inside one independently attributed leaf checkpoint can go directly to that node's
+bounded repair, including when security requested its re-verification. The repair
+uses the existing node budget; affected checkpoints and the final gate must pass
+again. Cross-group findings, unsupported cases and repeated uncertainty retain the
+bounded full-review fallback.
 Preparation can nest checkpoints using `parent_id`: a parent checks its own
 integration requirements and the evidence of its immediate children. `unit_ids`
 and `obligation_ids` describe the whole subtree; `depends_on` still orders unit

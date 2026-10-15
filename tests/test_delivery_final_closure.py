@@ -411,12 +411,15 @@ def test_failed_full_fallback_preserves_repair_provenance(closure_plan):
             "obligation_ids": [key],
         }
     ]
-    semantic = _LLM(json.dumps(uncertain), json.dumps(full), json.dumps(full))
-    security = _LLM()
+    # A confirmed local child gap now routes to candidate repair. Repeated
+    # composition uncertainty after a passing child still requires full fallback.
+    approved = delivery_integration_review_control_example(set(status.plan.checkpoints[0].obligation_ids))
+    semantic = _LLM(json.dumps(uncertain), approved, json.dumps(uncertain), json.dumps(full))
+    security = _LLM(delivery_integration_review_control_example(set()))
     result, _ = _run(path, cfg, semantic, security, node_id="root")
     assert result.stop_code == "delivery_verification.repair_required", result
-    assert not security.calls
-    assert len(semantic.calls) == 3 and "CHILD_INTERNAL" in semantic.calls[-1]
+    assert len(security.calls) == 1  # Child security; the failed root never reaches security.
+    assert len(semantic.calls) == 4 and "CHILD_INTERNAL" in semantic.calls[-1]
     before = get_delivery_status(path)
     contract = Path(cfg["project"]["root_path"]) / before.plan.units[0].task_path
     repaired = _repair(path, cfg, _LLM(_draft(markdown=contract.read_text())))
