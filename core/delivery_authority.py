@@ -52,10 +52,13 @@ def preparation_authority_fingerprint(
     )
 
 
+def authority_contract_text(content: bytes) -> str:
+    """Normalize Markdown authority independently of Git checkout newline policy."""
+    return content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def authority_contract_fingerprint(content: bytes) -> str:
-    # Markdown authority uses universal newlines, independently of Git checkout policy.
-    normalized = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    return "sha256:" + sha256(normalized.encode("utf-8")).hexdigest()
+    return "sha256:" + sha256(authority_contract_text(content).encode("utf-8")).hexdigest()
 
 
 def validate_checkpoint_attribution(

@@ -167,6 +167,34 @@ def test_renewal_binds_rule_contents_and_normalizes_contract_fingerprints(propos
     assert authority_contract_fingerprint(b"task\r\n") == authority_contract_fingerprint(b"task\n")
 
 
+@pytest.mark.parametrize("newline", [b"\r\n", b"\r"])
+def test_renewal_packet_identity_survives_checkout_newline_conversion(proposal, newline):
+    path, cfg, state, data = proposal
+    root = Path(cfg["project"]["root_path"])
+    before, renewed = build_renewal(state, data, root, root, cfg, str(path))
+    for packet in before:
+        state["authority_renewal"]["reviews"][packet["node_id"]] = {
+            "attempts": 1,
+            "fingerprint": packet["packet_fingerprint"],
+            "assessment": {
+                "schema_version": 1,
+                "packet_fingerprint": packet["packet_fingerprint"],
+                "disposition": "approved",
+                "summary": "Checked.",
+            },
+        }
+    state["authority_renewal"]["status"] = "accepted"
+    # Preview clones and real worktrees can apply different Git EOL settings.
+    # Cover both inherited contracts and the newly authored contract in the packet.
+    for unit in yaml.safe_load(state["source_plan"])["units"]:
+        contract = root / unit["task_path"]
+        contract.write_bytes(contract.read_text(encoding="utf-8").encode("utf-8").replace(b"\n", newline))
+    state["task_markdown"] = state["task_markdown"].replace("\n", newline.decode("ascii"))
+    after, _ = build_renewal(state, data, root, root, cfg, str(path))
+    assert before == after
+    assert apply_accepted_renewal(state, data, root, root, cfg, str(path)) == renewed
+
+
 def test_renewal_respects_configured_private_contract_directories(proposal):
     path, cfg, state, data = proposal
     root = Path(cfg["project"]["root_path"])
@@ -275,13 +303,18 @@ def repairable(tmp_path):
     return path, cfg
 
 
-def test_independent_renewal_resumes_without_reauthoring_or_repeating_accepted_nodes(repairable):
+@pytest.mark.parametrize("autocrlf", [False, True])
+def test_independent_renewal_resumes_without_reauthoring_or_repeating_accepted_nodes(repairable, autocrlf):
     from core.delivery_repair import _read_state
     from core.delivery_progress import get_delivery_status
     from tests.test_delivery_repair import _LLM, _draft, _repair
 
     path, cfg = repairable
     root = Path(cfg["project"]["root_path"])
+    if autocrlf:
+        from tests.test_delivery_checkpoints import _git
+
+        _git(root, "config", "core.autocrlf", "true")
     before = get_delivery_status(path)
     author = _LLM(_draft(markdown=(root / before.plan.units[0].task_path).read_text()))
     reviewer = AuthorityLLM("approved", KeyboardInterrupt())

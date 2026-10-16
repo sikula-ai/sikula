@@ -22,6 +22,7 @@ from agents.delivery_repair_authority_agent import (
 from core.delivery_amendment import _read_assembly_contract
 from core.delivery_authority import (
     authority_contract_fingerprint,
+    authority_contract_text,
     authority_digest,
     checkpoint_authority_context,
     checkpoint_authority_receipt,
@@ -119,10 +120,10 @@ def build_renewal(
     contracts = {}
     text = {}
     for unit in old.units:
-        content = captured[unit.task_path].decode("utf-8")
+        content = authority_contract_text(captured[unit.task_path])
         text[unit.id] = content
         contracts[unit.id] = authority_contract_fingerprint(content.encode("utf-8"))
-    text[state["unit_id"]] = state["task_markdown"]
+    text[state["unit_id"]] = authority_contract_text(state["task_markdown"].encode("utf-8"))
     updated = {**contracts, state["unit_id"]: authority_contract_fingerprint(state["task_markdown"].encode("utf-8"))}
     identity = authority_digest(
         {

@@ -95,6 +95,11 @@ def test_repair_barrier_propagates_through_completed_consumers(repair_done):
 )
 def test_nested_candidate_gap_routes_to_leaf_repair(candidate, role, interruption):
     path, cfg = candidate
+    from tests.test_delivery_checkpoints import _git
+
+    # Exercise different newline policies in real worktrees and preview clones
+    # on every platform, including publication and progress interruption recovery.
+    _git(Path(cfg["project"]["root_path"]), "config", "core.autocrlf", "true")
     before = get_delivery_status(path)
     outputs = _outputs(path, cfg)
     semantic = _LLM(

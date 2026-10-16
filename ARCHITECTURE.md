@@ -1679,6 +1679,8 @@ captured verification/repair lineage, authoring attempt, proposed plan and contr
 fingerprints, effective policy and candidate reviewer-rule contents. Existing receipts
 must match the captured candidate inputs before any renewal call. Unchanged receipts
 are retained only through their ordinary exact-input validation.
+Inlined contract text uses the same universal newline normalization as contract
+fingerprints, keeping packet identity stable across preview and execution checkouts.
 
 The private prepared repair snapshot contains `authority_renewal` with an ordered
 leaf-to-final-gate `nodes` chain, `pending`/`accepted` status and bounded per-node
