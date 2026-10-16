@@ -1657,10 +1657,51 @@ unit records, exact plan and publication lineage remain intact. It never makes t
 old receipt applicable to the enlarged scope or permits new downstream work. Fresh
 checkpoint results and ancestor assessments, required security and final validation,
 and a passing exact-candidate final gate are still required. Changed ownership
-invalidates old attribution receipts; safe full-authority fallback still applies.
+invalidates old attribution receipts; compact review requires independent renewal
+as described below. Unsupported authority changes retain safe full-authority fallback.
 Interrupted handoff/authoring/publication resumes accepted evidence without resetting
 budgets, and superseded initiating attempts cannot publish ordinary review updates.
 Terminal security/read-only boundaries remain independent of evidence freshness.
+
+**Independent authority renewal after repair:** an eligible leaf repair whose leaf,
+composing ancestors and final responsibility already have valid independent receipts
+renews that chain before publication. This operation preserves the accepted source
+partition and checks the exact coordinator-owned append; it cannot introduce new
+delegation, source intent, ownership outside the supported repair or broader scope.
+Unsupported hierarchies retain the existing full-authority path.
+
+The configured `reviewer`, separate from `delivery_preparer`, assesses bounded before/
+after authority packets. The leaf includes exact relevant source and local contracts,
+including the authored repair. Each composing ancestor sees its retained source,
+direct contracts, interfaces and an immediate-child renewal reference. Descendant
+contracts, findings and prior attempts are not expanded. Packet identity binds the
+captured verification/repair lineage, authoring attempt, proposed plan and contract
+fingerprints, effective policy and candidate reviewer-rule contents. Existing receipts
+must match the captured candidate inputs before any renewal call. Unchanged receipts
+are retained only through their ordinary exact-input validation.
+
+The private prepared repair snapshot contains `authority_renewal` with an ordered
+leaf-to-final-gate `nodes` chain, `pending`/`accepted` status and bounded per-node
+`reviews` (packet fingerprint, reserved attempts and accepted typed assessment).
+There are at most 32 nodes and two independent calls per node per authored draft;
+malformed, interrupted and failed calls consume reservations. The existing two
+authoring attempts remain the overall draft bound. A substantive rejection can
+send its private bounded feedback to the remaining authoring attempt, with fresh
+independent assessments for the corrected draft. Repeating the rejected contract
+does not authorize another review. Accepted nodes survive resume; missing outcomes
+never refill exhausted reservations. Prompts, outputs, usage and failed attempts
+remain in the private repair audit, including pending audit evidence on failure.
+
+Deterministically knowable packet, evidence and reviewer workspace checks precede
+authoring reservations; exact authored packets are sized before independent calls.
+Publication revalidates the captured attempt and all approvals and atomically binds
+the new contract/plan receipts through the existing recoverable assembly operation.
+Partial publication resume reconstructs those inputs against the original candidate,
+without reauthoring or repeating accepted review. Terminal security/read-only verdicts
+persist before audit failure can replace them. Authority renewal approves attribution
+only: affected consumer barriers, fresh semantic/security evidence, validation and
+the exact-candidate final gate remain mandatory. Full-fallback readiness and global
+capacity limits are unchanged.
 
 Reservations precede calls and private prompt/output audit precedes acceptance.
 Child and fallback exchanges check the read-only boundary before format retries.

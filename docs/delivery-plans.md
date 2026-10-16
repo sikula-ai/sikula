@@ -1097,6 +1097,8 @@ each child in the same way as `run-next`; reviewer and security-reviewer
 overrides also govern the final gate.
 `delivery_preparer` overrides govern integration repair authoring and are not
 forwarded to implementation agents.
+`reviewer` overrides also govern independent repair-authority renewal when the
+existing hierarchy supports it.
 
 The `delivery run` summary reports the separate `Final gate` status, its recorded
 gate ID, and, when an assessment exists, its satisfied/total obligation counts and gaps.
@@ -1123,6 +1125,24 @@ The contract must pass readiness and
 match enabled validation commands before publication. A newly discovered external
 dependency, missing required evidence, scope, or security blocker stops preparation
 without publishing substitute work or invoking another recovery provider.
+
+For a leaf with independently checked authority through its composing ancestors and
+final gate, Sikula also asks the separate reviewer to assess the proposed authority
+change before publication. The leaf receives its exact source and repair contract;
+ancestors receive their retained requirements and immediate-child references. New
+receipts permit compact subsequent verification, not approval of the implementation.
+Incomplete prior attribution or unsupported source repartition retains the conservative
+full-review/stop path.
+
+Independent renewal allows two calls per node per authored draft, along a chain of
+at most 32 nodes. Interrupted and malformed calls consume those reservations.
+An independent rejection can use the remaining repair authoring attempt to correct
+the contract; an unchanged rejected contract is not reviewed again. Accepted reviews
+survive resume, including interrupted publication. Exhausted assessment reservations
+report `delivery_repair.authority_budget_exhausted`; rejected repair proposals report
+`delivery_repair.authority_rejected`. Neither permits a successful resumable bound
+stop without remaining supported recovery. This does not add another repair unit
+allowance or bypass fresh checkpoint/security review and the mandatory final gate.
 
 Each verification node permits one published automatic repair unit and at most two authoring
 attempts (one node for root-only plans), including malformed-output corrections and interrupted calls. Attempts

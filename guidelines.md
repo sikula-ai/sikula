@@ -927,6 +927,15 @@ python3 -m ruff format .
   Scope repair ownership to the repaired node and its ancestors; consumer dependency
   edges do not grant sibling ownership. Scope capture cannot grant authority, refill an attempt or
   import unrelated checkpoints or descendant history into a parent prompt.
+- **Always** independently review authority changed by supported leaf repair before
+  renewing its receipts. The author/writer cannot approve attribution by rehashing
+  old approval. Bind exact proposed inputs, effective reviewer policy, captured
+  attempt and logical-node lineage; review local source/contracts at the leaf and
+  bounded retained authority plus immediate-child references at ancestors. Reserve
+  finite calls durably, reuse accepted results on resume and preserve publication
+  recovery. Rejection may use only the remaining authoring allowance; an unchanged
+  rejected contract cannot trigger another review. Renewal never approves code,
+  releases consumers, refills a budget or weakens terminal security/read-only stops.
 - **Never** expose final-gate source text, prompts, provider output, validation
   output, diffs, child state, credentials, or absolute paths through delivery
   status or JSON. Keep private material in append-only local evidence and publish

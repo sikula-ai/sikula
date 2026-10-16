@@ -264,6 +264,10 @@ def _verify(path: Path, cfg: dict, disposition: str = "repair_required") -> Deli
 
 
 def _repair(path: Path, cfg: dict, llm: _LLM, **kwargs):
+    from agents.delivery_repair_authority_agent import DeliveryRepairAuthorityAgent
+    from tests.test_delivery_repair_authority import AuthorityLLM
+
+    kwargs.setdefault("authority_agent_factory", lambda: DeliveryRepairAuthorityAgent(AuthorityLLM()))
     return coordinate_delivery_repair(
         path,
         cfg,
