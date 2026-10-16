@@ -25,8 +25,10 @@ from agents.delivery_repair_authority_agent import (
 )
 from core.delivery_repair_authority import (
     renewal_nodes,
+    captured_renewal_contracts,
     build_renewal,
     apply_accepted_renewal,
+    validate_renewal_contracts,
     validate_renewal_state,
 )
 from core.contract_check import check_contract
@@ -1236,9 +1238,13 @@ def _publish(
     record = parse_delivery_verification_record(state["verification"])
     # Partial publication may already have moved the assembly ref. Asset authority
     # still belongs to the exact candidate captured by the original gate.
+    renewal_contracts = {}
     with detached_delivery_verification_worktree(root, record.candidate_commit, preview=True) as worktree:
         if not _candidate_config_matches_capture(root, worktree, cfg):
             _stop("config_changed", "Repair candidate configuration differs from the loaded policy.")
+        if state.get("authority_renewal"):
+            renewal_contracts = captured_renewal_contracts(state, worktree)
+            validate_renewal_contracts(root, renewal_contracts)
         content = _prepared_plan(state, root, cfg, str(plan_path), asset_root=worktree)
     unit_id = state["unit_id"]
     task_path = root / state["unit"]["task_path"]
@@ -1367,6 +1373,7 @@ def _publish(
     current = get_delivery_status(plan_path, project_root=root)
     if not current.valid or _progress_snapshot(root, state["plan_id"]) != progress.to_dict():
         _stop("stale", "Source or progress changed during integration repair publication.")
+    validate_renewal_contracts(root, renewal_contracts)
     _assert_contracts_current(root, state["contracts"], private_roots)
     _assert_child_evidence(state["child_evidence"], state_store)
     _assert_dependency_handoffs(current, state["unit"]["depends_on"], root)

@@ -336,6 +336,86 @@ def test_independent_rejection_uses_remaining_authoring_budget(repairable):
     assert [packet["node_id"] for packet in reviewer.packets] == ["storage", "storage", "integration", "root"]
 
 
+@pytest.mark.parametrize("phase", ["review", "publication_resume", "assembly"])
+def test_renewal_revalidates_contracts_outside_repaired_checkpoint(repairable, monkeypatch, phase):
+    from core import delivery_repair as module
+    from core.delivery_progress import get_delivery_status
+    from tests.test_delivery_repair import _LLM, _draft, _repair
+
+    path, cfg = repairable
+    status = get_delivery_status(path)
+    root = Path(status.project_root)
+    target = root / next(unit.task_path for unit in status.plan.units if unit.id == "consumer")
+    original_contract = target.read_bytes()
+    author = _LLM(_draft(markdown=(root / status.plan.units[0].task_path).read_text()))
+    reviewer = AuthorityLLM()
+
+    def change_contract():
+        target.write_bytes(original_contract + b"\nChanged downstream acceptance criterion.\n")
+
+    def factory():
+        return DeliveryRepairAuthorityAgent(reviewer)
+
+    with monkeypatch.context() as context:
+        if phase == "review":
+
+            def approve_and_change(packet, cwd):
+                change_contract()
+                return json.dumps(
+                    {
+                        "schema_version": 1,
+                        "packet_fingerprint": packet["packet_fingerprint"],
+                        "disposition": "approved",
+                        "summary": "Checked.",
+                    }
+                )
+
+            reviewer.responses = [approve_and_change]
+        elif phase == "publication_resume":
+
+            def interrupt(*args, **kwargs):
+                raise KeyboardInterrupt()
+
+            context.setattr(module, "_atomic_replace_if_unchanged", interrupt)
+        else:
+            assemble = module.assemble_delivery_artifacts
+
+            def assemble_and_change(*args, **kwargs):
+                result = assemble(*args, **kwargs)
+                change_contract()
+                return result
+
+            context.setattr(module, "assemble_delivery_artifacts", assemble_and_change)
+        if phase == "publication_resume":
+            with pytest.raises(KeyboardInterrupt):
+                _repair(path, cfg, author, node_id="storage", authority_agent_factory=factory)
+            change_contract()
+        else:
+            result = _repair(path, cfg, author, node_id="storage", authority_agent_factory=factory)
+            assert not result.ready and result.issue.code == "delivery_repair.contract_evidence_changed"
+
+    state = module._read_state(root, status.plan.plan_id, "storage")
+    assert state["phase"] == "prepared" and state["attempts"] == 1
+    assert target.relative_to(root).as_posix() not in state["contracts"]
+    calls = len(reviewer.calls)
+    unused = _LLM()
+    for dry_run in (True, False):
+        result = _repair(path, cfg, unused, node_id="storage", dry_run=dry_run, authority_agent_factory=factory)
+        assert not result.ready and result.issue.code == "delivery_repair.contract_evidence_changed"
+        assert not unused.calls and len(reviewer.calls) == calls
+
+    # Equivalent checkout line endings must not invalidate authority receipts.
+    target.write_bytes(original_contract.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    result = _repair(path, cfg, unused, node_id="storage", authority_agent_factory=factory)
+    assert result.ready, result
+    assert not unused.calls and len(author.calls) == 1
+    assert len(reviewer.calls) == (4 if phase == "review" else 3)
+    restored = get_delivery_status(path).plan
+    assert restored.verified_final_gate_authority
+    assert set(restored.verified_composition_authority) == {"integration"}
+    assert set(restored.verified_checkpoint_authority) == {"storage", "integration"}
+
+
 def test_rejected_authority_feedback_is_sized_in_shared_preflight(repairable, monkeypatch):
     from agents import delivery_repair_agent
     from core import delivery_repair as module

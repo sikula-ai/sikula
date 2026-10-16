@@ -1696,6 +1696,9 @@ Deterministically knowable packet, evidence and reviewer workspace checks preced
 authoring reservations; exact authored packets are sized before independent calls.
 Publication revalidates the captured attempt and all approvals and atomically binds
 the new contract/plan receipts through the existing recoverable assembly operation.
+Every contract covered by renewed ancestor/final receipts, including contracts outside
+the repaired checkpoint, must still match captured authority before review, on resume
+and before and after publication. Comparison uses the receipt's normalized text identity.
 Partial publication resume reconstructs those inputs against the original candidate,
 without reauthoring or repeating accepted review. Terminal security/read-only verdicts
 persist before audit failure can replace them. Authority renewal approves attribution

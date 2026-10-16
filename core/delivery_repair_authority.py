@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from agents.delivery_repair_agent import DeliveryRepairAuthoringError
 from agents.delivery_repair_authority_agent import (
     authority_renewal_rules,
     build_authority_renewal_prompt,
@@ -49,6 +50,28 @@ def renewal_nodes(plan: DeliveryPlan, node_id: str) -> list[str]:
     if plan.verified_final_gate_authority is None:
         return []
     return [*result, "root"]
+
+
+def captured_renewal_contracts(state: dict[str, Any], candidate: Path) -> dict[str, bytes]:
+    """Read every contract bound by the renewed final receipt from captured authority."""
+    result = {}
+    for unit in yaml.safe_load(state["source_plan"])["units"]:
+        path = unit["task_path"]
+        content = state["contracts"].get(path)
+        result[path] = (
+            content.encode("utf-8")
+            if content is not None
+            else _read_assembly_contract(candidate, path, private_artifact_roots=())
+        )
+    return result
+
+
+def validate_renewal_contracts(root: Path, contracts: dict[str, bytes]) -> None:
+    """Keep operator artifacts compatible with every renewed receipt, including ancestors."""
+    for path, captured in contracts.items():
+        current = _read_assembly_contract(root, path, private_artifact_roots=())
+        if authority_contract_fingerprint(current) != authority_contract_fingerprint(captured):
+            raise DeliveryRepairAuthoringError("delivery_repair.contract_evidence_changed")
 
 
 def build_renewal(
@@ -91,12 +114,12 @@ def build_renewal(
         )
     old, new = plans
     source = (candidate / old.source_task.path).read_text(encoding="utf-8")
+    captured = captured_renewal_contracts(state, candidate)
+    validate_renewal_contracts(root, captured)
     contracts = {}
     text = {}
     for unit in old.units:
-        content = state["contracts"].get(unit.task_path)
-        if content is None:
-            content = _read_assembly_contract(candidate, unit.task_path, private_artifact_roots=()).decode("utf-8")
+        content = captured[unit.task_path].decode("utf-8")
         text[unit.id] = content
         contracts[unit.id] = authority_contract_fingerprint(content.encode("utf-8"))
     text[state["unit_id"]] = state["task_markdown"]
