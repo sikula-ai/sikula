@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Runtime Version JSON**: Added `sikula version --json` with an explicit `sikula.cli.v1` runtime-version projection, available without project configuration, provider setup, or state writes. Invalid or unavailable metadata fails with a sanitized diagnostic; `sikula --version` retains its text behavior.
 - **PR-Ready Task Summary**: Added `sikula summary <task-id>` to render deterministic, privacy-safe PR Markdown from a completed isolated task or review-fix with a publishable commit, without modifying state or exposing raw task text, prompts, provider output, review prose, diagnostics, or absolute paths.
 - **Antigravity Usage Metrics**: Antigravity calls now consume the CLI's structured JSON result and contribute explicit input, output, total, and cache-read token counts to provider-neutral usage records. The minimum supported Antigravity CLI version is now 1.1.12.
 - **Run Invocation Config Evidence**: New task states record the effective configuration of every actual run or resume invocation, while legacy states remain explicitly distinguishable so downstream audit and metrics tooling cannot treat partial configuration history as complete.
