@@ -76,6 +76,13 @@ cd sikula/
 pipx install --editable .
 ```
 
+Check the invoked runtime with `sikula --version`. For automation, use
+`sikula version --json`: it returns one `sikula.cli.v1` object with
+`sikula_version`, `command: "sikula version"`, `status: "done"`, and
+`next_action: "none"`. It works without project configuration or provider setup
+and does not write state. Unavailable or invalid version metadata produces a
+nonzero exit and a sanitized stderr diagnostic, with no JSON success output.
+
 ### Set Up Your Project
 
 Generated configs use Codex by default. Claude, Gemini, OpenCode, and Antigravity are supported too; see [Providers](docs/providers.md).

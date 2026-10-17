@@ -110,6 +110,7 @@ from sikula_cli import init as cli_init
 from sikula_cli import review as cli_review
 from sikula_cli import run as cli_run
 from sikula_cli import status as cli_status
+from sikula_cli import version as cli_version
 from sikula_cli import task as cli_task
 from sikula_cli.agent_overrides import DELIVERY_PREPARATION_AGENT_NAMES as _VALID_DELIVERY_PREPARATION_AGENTS
 from sikula_cli.agent_overrides import PREPARATION_AGENT_NAMES as _VALID_PREPARATION_AGENTS
@@ -3662,7 +3663,12 @@ def main() -> None:
         description="Sikula",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {_sikula_version()}")
+    parser.add_argument(
+        "--version",
+        action=cli_version.RuntimeVersionAction,
+        version_getter=_sikula_version,
+        help="show program's version number and exit",
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -3670,6 +3676,7 @@ def main() -> None:
     )
 
     sub = parser.add_subparsers(dest="command")
+    cli_version.register_parser(sub)
 
     task_p = sub.add_parser("task", help="Prepare product task descriptions")
     task_sub = task_p.add_subparsers(dest="task_command")
@@ -3692,6 +3699,10 @@ def main() -> None:
     cli_init.register_parser(sub)
 
     args = parser.parse_args()
+
+    if args.command == "version":
+        cli_version.cmd_version(args, version_getter=_sikula_version)
+        return
 
     if args.command == "init":
         cmd_init(args)

@@ -54,6 +54,21 @@
 
 ---
 
+## Runtime version (`sikula version`)
+
+`sikula_cli/version.py` owns the read-only version command and its explicit JSON
+projection. `sikula.py` dispatches it before project configuration loading or
+pipeline setup. It uses `core.version.sikula_version()` for the invoked runtime,
+including development metadata, and requires a valid SemVer string of 5–64 ASCII
+characters. Invalid or unavailable metadata exits nonzero with a fixed stderr
+diagnostic and no success object; it is never truncated or replaced with a fallback.
+
+`--json` emits exactly `schema_version: "sikula.cli.v1"`, `sikula_version`,
+`command: "sikula version"`, `status: "done"`, and `next_action: "none"`.
+This is runtime metadata only, not project readiness or a capabilities assertion.
+The existing `sikula --version` text flag retains its output and immediate parser
+exit; metadata is resolved when requested rather than while constructing the parser.
+
 ## Run flow (`sikula run`)
 
 `sikula run` parser registration and command flow live in `sikula_cli/run.py`.
