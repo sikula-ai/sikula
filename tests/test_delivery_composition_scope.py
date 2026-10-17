@@ -296,3 +296,51 @@ def test_common_cycle_checks_all_requested_children_before_work(node_input: Node
             semantic_fallback_covers=lambda record: False,
         )
     review.assert_not_called()
+
+
+@pytest.mark.parametrize("child_passes", [False, True])
+def test_parent_gap_rechecks_uncertain_child_before_reassessment(node_input: NodeInput, child_passes: bool) -> None:
+    root, _, _, snapshot, parent, _ = node_input
+    context = build_node_composition_context(root, snapshot, _attempt(node_input), {})
+    control = json.loads(composition_example(context))
+    control.update(disposition="repair_required", summary="Integration gap.")
+    control["obligation_results"][0]["outcome"] = "missing"
+    control["findings"] = [
+        {
+            "code": "integration.gap",
+            "summary": "Update is not visible.",
+            "unit_ids": ["consumer"],
+            "obligation_ids": ["visible"],
+        }
+    ]
+    control["checkpoint_results"][0]["outcome"] = "verification_required"
+    accepted = parse_composition(json.dumps(control), context, set(snapshot.scope.unit_ids))
+    assert accepted.has_parent_gap and accepted.fallback
+    parent = replace(
+        parent,
+        composition_attempted=True,
+        composition_evidence_fingerprint="sha256:" + "0" * 64,
+        reverification={"children": {}, "reassessments": {}, "fallbacks": {}},
+    )
+    calls = []
+
+    def exchange(record, retry):
+        calls.append(("exchange", retry))
+        return (accepted if retry else None), record
+
+    def review_child(record, node):
+        calls.append(("child", node))
+        return record, child_passes
+
+    result, _ = run_node_composition_cycle(
+        snapshot.composition_scope,
+        parent,
+        "semantic",
+        exchange=exchange,
+        validate=lambda record: None,
+        load=lambda record: accepted,
+        review_child=review_child,
+        semantic_fallback_covers=lambda record: False,
+    )
+    assert calls == [("exchange", False), ("child", "storage")] + ([("exchange", True)] if child_passes else [])
+    assert result is (accepted if child_passes else None)

@@ -266,6 +266,13 @@ class DeliveryIntegrationReviewAgent:
                     " and supplied complete deltas using the checked child integration context. If that context is insufficient,"
                     " return verification_required; never infer missing authority or approve from a summary alone."
                 )
+                if review_kind == "semantic":
+                    focus += (
+                        " For a repairable gap in a retained direct integration obligation, return repair_required"
+                        " and bind every finding to its unsatisfied direct obligation IDs. Assess all direct obligations"
+                        " and every child; accepted child evidence plus complete direct findings can feed bounded parent repair."
+                        " Do not relabel a child-local gap as parent-owned work."
+                    )
             if review_kind == "security":
                 focus += (
                     " This is an independent SECURITY applicability assessment. Every inherited child has an accepted security pass."

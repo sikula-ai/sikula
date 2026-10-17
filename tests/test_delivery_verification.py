@@ -800,6 +800,64 @@ def test_blocked_verification_reports_plan_obligation_total(tmp_path: Path) -> N
     assert result.to_dict()["obligation_count"] == 1
 
 
+@pytest.mark.parametrize("with_obligation", [False, True])
+def test_noncomposed_repair_required_allows_explicit_verification_retry(tmp_path: Path, with_obligation: bool) -> None:
+    base = _git_init(tmp_path)
+    plan_path = _write_plan(tmp_path, with_obligation=with_obligation)
+    unit_commit = _git_commit_all(tmp_path, "delivery unit")
+    progress_path = delivery_progress_path(tmp_path, "demo")
+    write_delivery_progress(
+        progress_path,
+        DeliveryProgress(
+            schema_version=1,
+            plan_id="demo",
+            units=[make_delivery_unit_progress("unit", "done", commit=unit_commit)],
+            assembly_base_commit=base,
+        ),
+    )
+    config = {**_config(tmp_path), "run_build": False, "run_tests": False, "run_checks": False}
+    obligations = ["deliver-source-behavior"] if with_obligation else []
+    rejection = {
+        "schema_version": 2,
+        "disposition": "repair_required",
+        "summary": "Integration needs repair.",
+        "findings": [
+            {
+                "code": "integration_gap",
+                "summary": "Repair integration.",
+                "unit_ids": ["unit"],
+                "obligation_ids": obligations,
+            }
+        ],
+        "obligation_results": [{"id": key, "outcome": "missing"} for key in obligations],
+    }
+    approval = {
+        **rejection,
+        "disposition": "approved",
+        "summary": "Complete.",
+        "findings": [],
+        "obligation_results": [{"id": key, "outcome": "satisfied"} for key in obligations],
+    }
+    llm = _ReadonlyLLM([json.dumps(rejection), json.dumps(approval)])
+    kwargs = {
+        "state_store": JsonStateStore(tmp_path / ".sikula" / "state"),
+        "semantic_reviewer": DeliveryIntegrationReviewAgent(llm, config),
+        "security_reviewer": None,
+        "project_root": tmp_path,
+    }
+    initial = verify_delivery_plan(plan_path, config, **kwargs)
+    assert initial.stop_code == "delivery_verification.repair_required"
+    before = get_delivery_status(plan_path).verification
+    assert bool(before.repair_input_fingerprint) == with_obligation
+    assert before.composition_evidence_fingerprint is None
+
+    retried = verify_delivery_plan(plan_path, config, **kwargs)
+
+    assert retried.succeeded, retried
+    assert len(llm.calls) == 2
+    assert get_delivery_status(plan_path).verification.attempt == before.attempt + 1
+
+
 def test_legacy_pass_without_obligation_closure_is_stale_and_not_reused(tmp_path: Path) -> None:
     base = _git_init(tmp_path)
     plan_path = _write_plan(tmp_path, with_obligation=True)

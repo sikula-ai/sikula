@@ -33,6 +33,9 @@ For a repair, include these Markdown sections: Goal, Current behavior, Desired b
 Acceptance criteria, Out of scope, Security and privacy, Reviewer focus, and Verification. Verification commands
 must be covered by the supplied effective validation policy. The coordinator copies existing
 asset declarations from the supplied contracts; do not write asset sections or declarations.
+For a composed parent repair, immediate-child interfaces and accepted evidence represent
+delegated contracts. Checkpoint dependencies stand for their completed units; do not expand
+their histories. The inherited_assets field, when present, also binds the repair's assets.
 
 Return exactly one JSON object with schema_version=1, disposition, and task_markdown.
 disposition is repair, scope_amendment_required, external_dependency_gap,

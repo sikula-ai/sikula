@@ -249,6 +249,21 @@ class CompositionResult:
     def inherited_count(self) -> int:
         return sum(child["obligation_count"] for child in self.child_refs)
 
+    @property
+    def has_parent_gap(self) -> bool:
+        return bool(self.child_refs) and _retained_repair_gap(self.assessment)
+
+
+def _retained_repair_gap(assessment: DeliveryIntegrationAssessment) -> bool:
+    """The parsed compact assessment covers all retained direct obligations."""
+    gaps = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
+    return (
+        assessment.disposition == "repair_required"
+        and bool(gaps)
+        and bool(assessment.findings)
+        and all(item.obligation_ids and set(item.obligation_ids) <= gaps for item in assessment.findings)
+    )
+
 
 def parse_composition(output: str, context: dict[str, Any], known_unit_ids: set[str]) -> CompositionResult:
     compact = context["checkpoint_composition"].get("compact", False)
@@ -300,7 +315,10 @@ def parse_composition(output: str, context: dict[str, Any], known_unit_ids: set[
             {key: child[key] for key in ("id", "evidence_fingerprint", "coverage_fingerprint", "obligation_count")}
             for child in children.values()
         ]
-        needs_full = fallback if security else (fallback or not assessment.approved)
+        # A complete assessment of retained parent obligations can authorize
+        # local integration repair without rediscovering the gap in full review.
+        parent_repair = not security and _retained_repair_gap(assessment)
+        needs_full = fallback if security else (fallback or not (assessment.approved or parent_repair))
         return CompositionResult(
             assessment,
             checkpoints,
