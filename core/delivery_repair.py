@@ -18,6 +18,19 @@ from agents.delivery_repair_agent import (
     DeliveryRepairAuthoringError,
     build_delivery_repair_prompt,
 )
+from agents.delivery_repair_authority_agent import (
+    DeliveryRepairAuthorityAgent,
+    build_authority_renewal_prompt,
+    parse_authority_renewal,
+)
+from core.delivery_repair_authority import (
+    renewal_nodes,
+    captured_renewal_contracts,
+    build_renewal,
+    apply_accepted_renewal,
+    validate_renewal_contracts,
+    validate_renewal_state,
+)
 from core.contract_check import check_contract
 from core.delivery_asset_assignment import DeliveryAssetAssignmentError, render_inherited_delivery_assets
 from core.delivery_checkpoints import checkpoint_pass_is_usable, verification_node_status, verification_scope_complete
@@ -162,6 +175,7 @@ def _read_state(root: Path, plan_id: str, node_id: str = "root") -> dict[str, An
             _stop("state_invalid", "Candidate repair publication binding is unavailable.")
     if state["phase"] == "blocked" and state.get("stop_code") not in _TERMINAL_STOPS:
         _stop("state_invalid", "Integration repair terminal state is invalid.")
+    validate_renewal_state(state)
     return state
 
 
@@ -292,6 +306,7 @@ def coordinate_delivery_repair(
     *,
     project_root: Path | None,
     agent_factory: Callable[[], DeliveryRepairAgent] | None,
+    authority_agent_factory: Callable[[], DeliveryRepairAuthorityAgent] | None = None,
     state_store: StateStore | None = None,
     dry_run: bool = False,
     node_id: str | None = None,
@@ -318,6 +333,7 @@ def coordinate_delivery_repair(
                 status.plan.plan_id,
                 cfg,
                 agent_factory=None,
+                authority_agent_factory=None,
                 state_store=state_store,
                 dry_run=True,
                 node_id=node_id,
@@ -329,6 +345,7 @@ def coordinate_delivery_repair(
                 status.plan.plan_id,
                 cfg,
                 agent_factory=agent_factory,
+                authority_agent_factory=authority_agent_factory,
                 state_store=state_store,
                 dry_run=False,
                 node_id=node_id,
@@ -341,6 +358,10 @@ def coordinate_delivery_repair(
         return DeliveryRepairResult(issue=exc.issue)
     except DeliveryAmendmentError as exc:
         return DeliveryRepairResult(issue=exc.issue)
+    except DeliveryRepairAuthoringError as exc:
+        return DeliveryRepairResult(
+            issue=DeliveryPlanIssue("error", exc.code, "Repair authority preflight or assessment failed.")
+        )
     except (OSError, RuntimeError, ValueError, TypeError, KeyError):
         return DeliveryRepairResult(
             issue=DeliveryPlanIssue(
@@ -358,12 +379,12 @@ def _coordinate(
     cfg: dict[str, Any],
     *,
     agent_factory: Callable[[], DeliveryRepairAgent] | None,
+    authority_agent_factory: Callable[[], DeliveryRepairAuthorityAgent] | None,
     state_store: StateStore | None,
     dry_run: bool,
     node_id: str = "root",
 ) -> DeliveryRepairResult:
     state_path = _state_path(root, plan_id, node_id)
-    audit_path = state_path.with_suffix(".jsonl")
     state = _read_state(root, plan_id, node_id)
     status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
     from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, candidate_repair_status
@@ -387,7 +408,6 @@ def _coordinate(
         if status.verification_node != node_id:
             node_id = status.verification_node
             state_path = _state_path(root, plan_id, node_id)
-            audit_path = state_path.with_suffix(".jsonl")
             state = _read_state(root, plan_id, node_id)
     if state is not None:
         if state["phase"] == "blocked":
@@ -403,7 +423,16 @@ def _coordinate(
             _stop("stale", "Effective integration repair policy changed after preparation started.")
         if state["phase"] == "prepared":
             _assert_child_evidence(state.get("child_evidence", {}), state_store)
-            return _publish(path, root, cfg, state, state_store=state_store, dry_run=dry_run)
+            return _finish_prepared(
+                path,
+                root,
+                cfg,
+                state,
+                state_store=state_store,
+                dry_run=dry_run,
+                agent_factory=agent_factory,
+                authority_agent_factory=authority_agent_factory,
+            )
 
     assessment = _current_input(status, cfg, candidate_recovery=binding is not None)
     assert status.plan is not None and status.verification is not None
@@ -453,11 +482,13 @@ def _coordinate(
         )
         _assert_dependency_handoffs(status, unit["depends_on"], root)
         _assert_child_evidence(child_evidence, state_store)
+        if state.get("authority_feedback"):
+            packet["authority_feedback"] = state["authority_feedback"]
         _check_repair_prompt(packet)
         source_plan = Path(status.plan_path).read_bytes().decode("utf-8")
         if "sha256:" + sha256(source_plan.encode("utf-8")).hexdigest() != status.verification.plan_fingerprint:
             _stop("stale", "The delivery plan changed before repair preflight.")
-        _appended_plan(
+        appended = _appended_plan(
             yaml.safe_load(source_plan),
             unit,
             [item.id for item in assessment.obligation_results if item.outcome != "satisfied"],
@@ -470,12 +501,35 @@ def _coordinate(
             if binding
             else frozenset(),
         )
+        nodes = renewal_nodes(status.plan, node_id)
+        if len(nodes) > 32:
+            _stop("hierarchy_required", "Repair authority renewal exceeds the bounded node allowance.")
+        if nodes:
+            build_renewal(
+                {
+                    **state,
+                    "source_plan": source_plan,
+                    "contracts": contracts,
+                    "task_markdown": "",
+                    "authority_renewal": {"nodes": nodes},
+                },
+                appended,
+                root,
+                worktree,
+                cfg,
+                status.plan_path,
+            )
         if dry_run:
             return DeliveryRepairResult(ready=True)
         assert agent_factory is not None
         agent = agent_factory()
+        if nodes and authority_agent_factory is None:
+            _stop("context_unavailable", "Independent repair authority reviewer is unavailable.")
+        authority_agent = authority_agent_factory() if nodes else None
         try:
             agent.prepare_workspace(worktree)
+            if authority_agent is not None:
+                authority_agent.prepare_workspace(worktree)
         except LLMReadOnlyViolation:
             state.update(phase="blocked", stop_code="delivery_repair.readonly_mutation")
             write_repair_state(root, state_path, state)
@@ -502,21 +556,7 @@ def _coordinate(
 
             def record(value: dict[str, Any]) -> None:
                 audit_record = {**value, "gate_id": status.verification.gate_id, "attempt": state["attempts"]}
-                try:
-                    _append_audit(audit_path, audit_record, project_root=root)
-                except OSError:
-                    state.update(phase="blocked", stop_code="delivery_repair.audit_unavailable")
-                    try:
-                        write_repair_state(root, state_path, state)
-                    finally:
-                        # Preserve the failed append separately from control data.
-                        # It is diagnostic evidence, never an input to recovery.
-                        write_repair_state(
-                            root,
-                            state_path.with_name(state_path.stem + "-pending-audit.json"),
-                            {"schema_version": 1, "record": audit_record},
-                        )
-                    _stop("audit_unavailable", "Integration repair stopped because its audit could not be appended.")
+                _record_repair_audit(root, state_path, state, audit_record)
 
             try:
                 try:
@@ -553,6 +593,10 @@ def _coordinate(
                     raise
                 packet["previous_error"] = exc.issue.message
                 continue
+            from core.delivery_authority import authority_contract_fingerprint
+
+            if state.get("rejected_authority_contract") == authority_contract_fingerprint(markdown.encode("utf-8")):
+                _stop("authority_rejected", "The corrected repair repeats its independently rejected contract.")
             current, _ = candidate_repair_status(path, root, node_id, cfg, binding)
             _current_input(current, cfg, candidate_recovery=binding is not None)
             if current.verification != status.verification:
@@ -569,11 +613,174 @@ def _coordinate(
                 child_evidence=child_evidence,
             )
             _assert_child_evidence(child_evidence, state_store)
+            if nodes:
+                state["authority_renewal"] = {"nodes": nodes, "status": "pending", "reviews": {}}
             prepared = _prepared_plan(state, root, cfg, status.plan_path, asset_root=worktree)
             if binding:
                 state["reconciled_plan_fingerprint"] = "sha256:" + sha256(prepared).hexdigest()
             write_repair_state(root, state_path, state)
             break
+    return _finish_prepared(
+        path,
+        root,
+        cfg,
+        state,
+        state_store=state_store,
+        dry_run=False,
+        agent_factory=agent_factory,
+        authority_agent_factory=authority_agent_factory,
+    )
+
+
+def _record_repair_audit(root: Path, state_path: Path, state: dict[str, Any], value: dict[str, Any]) -> None:
+    boundary = value.get("error")
+    if boundary in _TERMINAL_STOPS:
+        state.update(phase="blocked", stop_code=boundary)
+        write_repair_state(root, state_path, state)
+    try:
+        _append_audit(state_path.with_suffix(".jsonl"), value, project_root=root)
+    except OSError:
+        code = boundary if boundary in _TERMINAL_STOPS else "delivery_repair.audit_unavailable"
+        state.update(phase="blocked", stop_code=code)
+        try:
+            write_repair_state(root, state_path, state)
+        finally:
+            write_repair_state(
+                root,
+                state_path.with_name(state_path.stem + "-pending-audit.json"),
+                {"schema_version": 1, "record": value},
+            )
+        raise DeliveryRepairError(code, "Integration repair could not append required audit evidence.") from None
+
+
+def _finish_prepared(
+    path: Path,
+    root: Path,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    state_store: StateStore | None,
+    dry_run: bool,
+    agent_factory: Callable[[], DeliveryRepairAgent] | None,
+    authority_agent_factory: Callable[[], DeliveryRepairAuthorityAgent] | None,
+) -> DeliveryRepairResult:
+    renewal = state.get("authority_renewal")
+    if renewal is None or renewal["status"] == "accepted":
+        return _publish(path, root, cfg, state, state_store=state_store, dry_run=dry_run)
+    # Validate the captured attempt, completed evidence and partial publication
+    # before independent review, never use a stale authoring snapshot for approval.
+    _publish(path, root, cfg, state, state_store=state_store, dry_run=True)
+    state_path = _state_path(root, state["plan_id"], state["node_id"])
+    candidate = state["verification"]["candidate_commit"]
+    with detached_delivery_verification_worktree(root, candidate, preview=dry_run) as worktree:
+        proposed = _prepared_plan(state, root, cfg, str(path), asset_root=worktree)
+        packets, content = build_renewal(state, proposed, root, worktree, cfg, str(path))
+        for packet in packets:
+            record = renewal["reviews"].get(packet["node_id"])
+            if record and record["fingerprint"] != packet["packet_fingerprint"]:
+                _stop("stale", "Repair authority inputs changed after an independent reservation.")
+            if record and "assessment" in record:
+                try:
+                    accepted = parse_authority_renewal(json.dumps(record["assessment"]), packet["packet_fingerprint"])
+                except DeliveryRepairAuthoringError:
+                    _stop("evidence_unavailable", "Stored repair authority assessment is unavailable or invalid.")
+                if accepted["disposition"] not in {"approved", "rejected"}:
+                    _stop("evidence_unavailable", "Stored repair authority assessment cannot authorize further review.")
+            if record and not record.get("assessment") and record["attempts"] >= 2:
+                _stop("authority_budget_exhausted", "Independent repair authority assessment exhausted its budget.")
+            if record and record.get("assessment", {}).get("disposition") == "rejected" and state["attempts"] >= 2:
+                _stop("authority_rejected", "Independent authority review rejected the bounded repair attempts.")
+        if dry_run:
+            return DeliveryRepairResult(ready=True, unit_id=state["unit_id"])
+        if authority_agent_factory is None:
+            _stop("context_unavailable", "Independent repair authority reviewer is unavailable.")
+        reviewer = authority_agent_factory()
+        try:
+            reviewer.prepare_workspace(worktree)
+        except LLMReadOnlyViolation:
+            state.update(phase="blocked", stop_code="delivery_repair.readonly_mutation")
+            write_repair_state(root, state_path, state)
+            _stop("readonly_mutation", "Authority reviewer preparation violated its read-only boundary.")
+        finally:
+            if not _candidate_is_clean(worktree, candidate):
+                state.update(phase="blocked", stop_code="delivery_repair.readonly_mutation")
+                write_repair_state(root, state_path, state)
+                _stop("readonly_mutation", "Authority reviewer preparation changed the candidate.")
+        before = _review_snapshot(worktree, cfg)
+        for packet in packets:
+            node = packet["node_id"]
+            record = renewal["reviews"].get(node)
+            if record is None:
+                record = {"attempts": 0, "fingerprint": packet["packet_fingerprint"]}
+                renewal["reviews"][node] = record
+            while not record.get("assessment") and record["attempts"] < 2:
+                _publish(path, root, cfg, state, state_store=state_store, dry_run=True)
+                prompt = build_authority_renewal_prompt(packet, cfg, worktree, correction=record["attempts"] > 0)
+                record["attempts"] += 1
+                write_repair_state(root, state_path, state)
+
+                def audit(value: dict[str, Any]) -> None:
+                    _record_repair_audit(
+                        root,
+                        state_path,
+                        state,
+                        {
+                            **value,
+                            "gate_id": state["verification"]["gate_id"],
+                            "node_id": node,
+                            "authoring_attempt": state["attempts"],
+                            "attempt": record["attempts"],
+                            "packet_fingerprint": packet["packet_fingerprint"],
+                        },
+                    )
+
+                try:
+                    try:
+                        assessment = reviewer.review(
+                            cwd=worktree, prompt=prompt, fingerprint=packet["packet_fingerprint"], audit_recorder=audit
+                        )
+                    finally:
+                        _assert_readonly(worktree, cfg, before, candidate, root, state_path, state)
+                except DeliveryRepairAuthoringError as exc:
+                    if exc.code != "delivery_repair.output_invalid" or record["attempts"] >= 2:
+                        raise DeliveryRepairError(exc.code, "Independent repair authority review failed.") from None
+                    continue
+                if assessment["disposition"] not in {"approved", "rejected"}:
+                    _stop(assessment["disposition"], "Independent authority review found a required boundary.")
+                _publish(path, root, cfg, state, state_store=state_store, dry_run=True)
+                record["assessment"] = assessment
+                write_repair_state(root, state_path, state)
+            assessment = record["assessment"]
+            if assessment["disposition"] == "rejected":
+                if state["attempts"] >= _MAX_AUTHORING_ATTEMPTS:
+                    _stop("authority_rejected", "Independent authority review rejected the bounded repair attempts.")
+                state.update(phase="authoring", authority_feedback=assessment["summary"])
+                from core.delivery_authority import authority_contract_fingerprint
+
+                state["rejected_authority_contract"] = authority_contract_fingerprint(
+                    state["task_markdown"].encode("utf-8")
+                )
+                state.pop("authority_renewal")
+                state.pop("reconciled_plan_fingerprint", None)
+                write_repair_state(root, state_path, state)
+                break
+        else:
+            renewal["status"] = "accepted"
+            if state.get("candidate_recovery"):
+                state["reconciled_plan_fingerprint"] = "sha256:" + sha256(content).hexdigest()
+            write_repair_state(root, state_path, state)
+    if state["phase"] == "authoring":
+        return _coordinate(
+            path,
+            root,
+            state["plan_id"],
+            cfg,
+            agent_factory=agent_factory,
+            authority_agent_factory=authority_agent_factory,
+            state_store=state_store,
+            dry_run=False,
+            node_id=state["node_id"],
+        )
     return _publish(path, root, cfg, state, state_store=state_store, dry_run=False)
 
 
@@ -597,16 +804,29 @@ def _check_repair_prompt(packet: dict[str, Any]) -> None:
 def _assert_readonly(
     worktree: Path, cfg: dict[str, Any], before: Any, commit: str, root: Path, path: Path, state: dict[str, Any]
 ) -> None:
+    boundary = state.get("stop_code") if state.get("phase") == "blocked" else None
+    retained = (
+        boundary
+        if boundary
+        in {
+            "delivery_repair.security_stop",
+            "delivery_repair.readonly_mutation",
+            "delivery_repair.external_dependency_gap",
+        }
+        else None
+    )
     try:
         unchanged = _review_workspace_unchanged(worktree, cfg, before) and _candidate_is_clean(worktree, commit)
     except (OSError, RuntimeError, ValueError):
-        state.update(phase="blocked", stop_code="delivery_repair.evidence_unavailable")
+        code = retained or "delivery_repair.evidence_unavailable"
+        state.update(phase="blocked", stop_code=code)
         write_repair_state(root, path, state)
-        _stop("evidence_unavailable", "Read-only authoring could not preserve required workspace evidence.")
+        raise DeliveryRepairError(code, "Read-only review could not preserve required workspace evidence.") from None
     if not unchanged:
-        state.update(phase="blocked", stop_code="delivery_repair.readonly_mutation")
+        code = retained or "delivery_repair.readonly_mutation"
+        state.update(phase="blocked", stop_code=code)
         write_repair_state(root, path, state)
-        _stop("readonly_mutation", "Read-only integration repair authoring modified its candidate workspace.")
+        raise DeliveryRepairError(code, "Read-only integration repair modified its candidate workspace.")
 
 
 def _repair_packet(
@@ -898,6 +1118,7 @@ def _prepared_plan(
         else frozenset(),
     )
 
+    prepared = apply_accepted_renewal(state, prepared, root, asset_root, cfg, plan_path)
     if state.get("candidate_recovery") and state.get("reconciled_plan_fingerprint") not in {
         None,
         "sha256:" + sha256(prepared).hexdigest(),
@@ -1017,9 +1238,13 @@ def _publish(
     record = parse_delivery_verification_record(state["verification"])
     # Partial publication may already have moved the assembly ref. Asset authority
     # still belongs to the exact candidate captured by the original gate.
+    renewal_contracts = {}
     with detached_delivery_verification_worktree(root, record.candidate_commit, preview=True) as worktree:
         if not _candidate_config_matches_capture(root, worktree, cfg):
             _stop("config_changed", "Repair candidate configuration differs from the loaded policy.")
+        if state.get("authority_renewal"):
+            renewal_contracts = captured_renewal_contracts(state, worktree)
+            validate_renewal_contracts(root, renewal_contracts)
         content = _prepared_plan(state, root, cfg, str(plan_path), asset_root=worktree)
     unit_id = state["unit_id"]
     task_path = root / state["unit"]["task_path"]
@@ -1148,6 +1373,7 @@ def _publish(
     current = get_delivery_status(plan_path, project_root=root)
     if not current.valid or _progress_snapshot(root, state["plan_id"]) != progress.to_dict():
         _stop("stale", "Source or progress changed during integration repair publication.")
+    validate_renewal_contracts(root, renewal_contracts)
     _assert_contracts_current(root, state["contracts"], private_roots)
     _assert_child_evidence(state["child_evidence"], state_store)
     _assert_dependency_handoffs(current, state["unit"]["depends_on"], root)

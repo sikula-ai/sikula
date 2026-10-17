@@ -2625,6 +2625,9 @@ def _run_delivery_plan(
                 agent_factory=(lambda: context.repair_agent_factory(args, cfg))
                 if context.repair_agent_factory
                 else None,
+                authority_agent_factory=(lambda: context.repair_authority_agent_factory(args, cfg))
+                if context.repair_authority_agent_factory
+                else None,
                 dry_run=stop_code is not None,
                 node_id=repair_requested or pending_repair,
             )
@@ -3112,6 +3115,7 @@ class DeliveryRunNextContext:
     verify_plan: Callable[[argparse.Namespace, dict], Any] | None = None
     verification_config: Callable[[argparse.Namespace, dict], dict] | None = None
     repair_agent_factory: Callable[[argparse.Namespace, dict], Any] | None = None
+    repair_authority_agent_factory: Callable[[argparse.Namespace, dict], Any] | None = None
 
 
 @dataclass(frozen=True)

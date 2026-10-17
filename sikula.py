@@ -118,6 +118,7 @@ from sikula_cli.agent_overrides import parse_agent_llm_overrides as _parse_agent
 from sikula_cli.agent_overrides import with_agent_llm_overrides
 
 if TYPE_CHECKING:
+    from agents.delivery_repair_authority_agent import DeliveryRepairAuthorityAgent
     from agents.delivery_repair_agent import DeliveryRepairAgent
     from agents.delivery_preparation_agent import DeliveryPreparationAgent
     from core.delivery_authoring import (
@@ -3610,6 +3611,7 @@ def _delivery_run_next_context(cfg: dict) -> cli_delivery.DeliveryRunNextContext
         verify_plan=_run_delivery_verification,
         verification_config=_delivery_verification_effective_config,
         repair_agent_factory=_create_delivery_repair_agent,
+        repair_authority_agent_factory=_create_delivery_repair_authority_agent,
     )
 
 
@@ -3623,6 +3625,17 @@ def _create_delivery_repair_agent(args: argparse.Namespace, cfg: dict) -> Delive
     llm_config = _make_llm_config(base, effective)
     llm_config.usage_observer = lambda record: usage.append(dict(record))
     return DeliveryRepairAgent(create_llm_client(llm_config), usage_records=usage)
+
+
+def _create_delivery_repair_authority_agent(args: argparse.Namespace, cfg: dict) -> DeliveryRepairAuthorityAgent:
+    from agents.delivery_repair_authority_agent import DeliveryRepairAuthorityAgent
+    from core.llm_client import create_llm_client
+
+    effective = _effective_agent_llm_cfg(cfg, {}, "reviewer")
+    usage: list[dict[str, object]] = []
+    llm_config = _make_llm_config(cfg.get("llm", {}), effective)
+    llm_config.usage_observer = lambda record: usage.append(dict(record))
+    return DeliveryRepairAuthorityAgent(create_llm_client(llm_config), usage_records=usage)
 
 
 def cmd_delivery_run_next(args: argparse.Namespace, cfg: dict) -> None:

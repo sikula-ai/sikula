@@ -95,6 +95,11 @@ def test_repair_barrier_propagates_through_completed_consumers(repair_done):
 )
 def test_nested_candidate_gap_routes_to_leaf_repair(candidate, role, interruption):
     path, cfg = candidate
+    from tests.test_delivery_checkpoints import _git
+
+    # Exercise different newline policies in real worktrees and preview clones
+    # on every platform, including publication and progress interruption recovery.
+    _git(Path(cfg["project"]["root_path"]), "config", "core.autocrlf", "true")
     before = get_delivery_status(path)
     outputs = _outputs(path, cfg)
     semantic = _LLM(
@@ -189,6 +194,8 @@ def test_nested_candidate_gap_routes_to_leaf_repair(candidate, role, interruptio
     assert _read_state(root, status.plan.plan_id, "root") is None
     after = get_delivery_status(path)
     assert after.checkpoint_verifications == before.checkpoint_verifications
+    assert after.plan.verified_final_gate_authority
+    assert set(after.plan.verified_composition_authority) == {"integration"}
     assert {unit.id: unit.depends_on for unit in after.plan.units if unit.id != repaired.unit_id} == {
         unit.id: unit.depends_on for unit in before.plan.units
     }
@@ -217,7 +224,7 @@ def test_nested_candidate_gap_routes_to_leaf_repair(candidate, role, interruptio
             ("integration", {"deliver-team-invites", "visible"}),
             ("root", {"deliver-team-invites", "visible"}),
         ):
-            verified, _ = _run(path, cfg, _LLM(delivery_integration_review_control_example(obligations)), node_id=node)
+            verified = _verify_repaired_node(path, cfg, node, obligations)
             assert verified.succeeded, verified
         assert finalize_delivery_plan(path, project_config=cfg).finalized
     exhausted = _repair(path, cfg, _LLM(), node_id="storage", dry_run=True)
@@ -389,6 +396,8 @@ def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_pr
     assert len(author.calls) == 1
     after = get_delivery_status(path)
     units = {unit.id: unit for unit in after.plan.units}
+    assert after.plan.verified_final_gate_authority
+    assert set(after.plan.verified_composition_authority) == {"integration"}
     assert units["consumer"].depends_on == before.plan.units[1].depends_on
     assert _read_state(root, after.plan.plan_id, "storage")["candidate_recovery"]["node_id"] == "integration"
     shipping = next(unit for unit in after.units if unit.id == "shipping")
@@ -410,9 +419,23 @@ def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_pr
         ("storage", {"deliver-team-invites"}),
         ("integration", {"deliver-team-invites", "visible"}),
     ):
-        verified, _ = _run(path, cfg, _LLM(delivery_integration_review_control_example(obligations)), node_id=node)
+        verified = _verify_repaired_node(path, cfg, node, obligations)
         assert verified.succeeded, verified
     assert checkpoint_barrier_issue(get_delivery_status(path), cfg, unit_id="shipping") is None
+
+
+def _verify_repaired_node(path, cfg, node, obligations):
+    from core.delivery_checkpoints import verification_node_status
+    from core.delivery_composition import build_composition_context, composition_example
+    from core.delivery_verification import build_delivery_verification_snapshot
+
+    status = verification_node_status(get_delivery_status(path), node)
+    snapshot = build_delivery_verification_snapshot(status, cfg, candidate_commit=status.assembled_commit)
+    contexts = [build_composition_context(status, snapshot, cfg, review_kind=role) for role in ("semantic", "security")]
+    if contexts[0] is not None:
+        assert all(context["checkpoint_composition"]["compact"] for context in contexts)
+        return _run(path, cfg, *[_LLM(composition_example(context)) for context in contexts], node_id=node)[0]
+    return _run(path, cfg, _LLM(delivery_integration_review_control_example(obligations)), node_id=node)[0]
 
 
 def _finish_with_delivery_run(path, cfg, repair_id):
@@ -453,8 +476,7 @@ def _finish_with_delivery_run(path, cfg, repair_id):
         node = getattr(args, "verification_node", None) or "root"
         reviews.append(node)
         obligations = {"deliver-team-invites"} if node == "storage" else {"deliver-team-invites", "visible"}
-        result, _ = _run(path, config, _LLM(delivery_integration_review_control_example(obligations)), node_id=node)
-        return result
+        return _verify_repaired_node(path, config, node, obligations)
 
     context = DeliveryRunNextContext(
         state_store=store,
