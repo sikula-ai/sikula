@@ -680,8 +680,13 @@ on the final candidate, then reassesses integration. This includes required secu
 review and configured validation. A confirmed semantic gap wholly owned by one
 independently attributed leaf checkpoint can feed its existing bounded repair
 directly, without full ancestor review merely to recreate that finding. This also
-applies when security requested the checkpoint review. Unsupported cases, cross-group
-gaps and repeated uncertainty select full review; external-dependency and security
+applies when security requested the checkpoint review. A complete compact semantic
+review can also send a gap in a parent's retained integration requirement directly
+to that parent's bounded repair, including at the final gate. Every immediate child
+must have applicable evidence; uncertain children first need verification. The repair
+uses exact retained requirements, direct contracts and child interfaces, without
+expanding all descendant contracts or dependencies into its prompt. Unsupported
+findings and repeated uncertainty select full review; external-dependency and security
 boundaries remain stops. Full-review findings also feed bounded repair.
 Historical admission records and already completed units remain unchanged.
 
@@ -748,8 +753,8 @@ Plans without checkpoints retain their prior one-repair behavior.
 
 Nested composition and selective candidate review use bounded per-node contexts.
 The full-review fallback must still fit its existing limits (including 256 active
-units). Broader corrective decomposition, bounded repair-time authority renewal,
-adaptive regrouping and large-plan scaling remain subsequent work.
+units). Broader corrective decomposition, adaptive regrouping and large-plan scaling
+remain subsequent work.
 
 
 ## Current MVP Commands
@@ -1126,10 +1131,11 @@ match enabled validation commands before publication. A newly discovered externa
 dependency, missing required evidence, scope, or security blocker stops preparation
 without publishing substitute work or invoking another recovery provider.
 
-For a leaf with independently checked authority through its composing ancestors and
+For a leaf or composing parent with independently checked authority through the
 final gate, Sikula also asks the separate reviewer to assess the proposed authority
-change before publication. The leaf receives its exact source and repair contract;
-ancestors receive their retained requirements and immediate-child references. New
+change before publication. A leaf receives its exact source and repair contract;
+a composing node receives retained requirements, direct contracts and immediate-child
+references. A final-gate-owned repair renews final authority itself. New
 receipts permit compact subsequent verification, not approval of the implementation.
 Incomplete prior attribution or unsupported source repartition retains the conservative
 full-review/stop path.

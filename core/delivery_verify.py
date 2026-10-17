@@ -779,7 +779,7 @@ def _execute_gate(
                 and semantic.composition.child_refs
                 and not semantic.composition.fallback
             ):
-                if semantic.assessment.approved:
+                if semantic.assessment.approved or semantic.assessment.disposition == "repair_required":
                     obligation_satisfied_count += semantic.composition.inherited_count
                 else:
                     obligation_gap_count += semantic.composition.inherited_count
@@ -799,7 +799,17 @@ def _execute_gate(
 
                     try:
                         repair_fingerprint = store_repair_input(
-                            root, evidence_path.parent, identity, running.attempt, semantic.assessment, project_config
+                            root,
+                            evidence_path.parent,
+                            identity,
+                            running.attempt,
+                            semantic.assessment,
+                            project_config,
+                            composition_fingerprint=running.composition_evidence_fingerprint
+                            if semantic.composition is not None
+                            and semantic.composition.child_refs
+                            and not semantic.composition.fallback
+                            else None,
                         )
                     except (OSError, ValueError, TypeError):
                         return _review_blocked(
@@ -1683,7 +1693,11 @@ def _composition_exchange(
             )
         if result.composition is None:
             raise ValueError("Composition assessment unavailable.")
-        if not result.assessment.approved and not result.composition.fallback:
+        if (
+            not result.assessment.approved
+            and not result.composition.fallback
+            and not (review_kind == "semantic" and result.assessment.disposition == "repair_required")
+        ):
             # Preserve the stop, but do not cache an unavailable external input forever.
             # A later explicit retry uses full review within the existing recovery policy.
             return result, running
@@ -2137,14 +2151,24 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                     return _blocked_result(status, "delivery_verification.reverification_budget_exhausted")
         except (OSError, ValueError, KeyError, TypeError):
             return _blocked_result(status, "delivery_verification.evidence_unavailable")
-    from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED, resolve_candidate_repair
+    from core.delivery_candidate_repair import (
+        CANDIDATE_REPAIR_REQUIRED,
+        resolve_candidate_repair,
+        parent_repair_authority,
+    )
 
-    if status.verification and status.verification.stop_code == CANDIDATE_REPAIR_REQUIRED:
+    if status.verification and status.verification.stop_code in {
+        CANDIDATE_REPAIR_REQUIRED,
+        "delivery_verification.repair_required",
+    }:
         try:
             current = build_delivery_verification_identity(
                 status, project_config or {}, candidate_commit=status.assembled_commit
             )
-            if current.gate_id == status.verification.gate_id:
+            if current.gate_id == status.verification.gate_id and (
+                status.verification.stop_code == CANDIDATE_REPAIR_REQUIRED
+                or parent_repair_authority(status, status.verification) is not None
+            ):
                 resolve_candidate_repair(status, project_config or {})
                 return _result_from_record(status, status.verification, succeeded=False, next_action="run_delivery")
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):

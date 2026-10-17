@@ -216,6 +216,12 @@ def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[
         return False
     root = Path(status.project_root)
     try:
+        from core.delivery_candidate_repair import parent_repair_authority
+
+        # Compact parent input uses the same captured-review policy as a
+        # descendant handoff; the preparer policy freezes at authoring, not review.
+        if parent_repair_authority(status, record) is not None:
+            return False
         return _read_state(root, status.plan.plan_id, status.verification_node) is None and repair_input_policy_changed(
             root,
             delivery_progress_path(root, status.plan.plan_id).parent,
@@ -502,6 +508,13 @@ def _coordinate(
             else frozenset(),
         )
         nodes = renewal_nodes(status.plan, node_id)
+        if binding is None:
+            from core.delivery_checkpoint_model import checkpoint_children
+
+            # Full-scope fallback keeps its existing recovery contract. Only
+            # accepted compact findings authorize the new composing-node path.
+            if checkpoint_children(status.plan.checkpoints, node_id):
+                nodes = []
         if len(nodes) > 32:
             _stop("hierarchy_required", "Repair authority renewal exceeds the bounded node allowance.")
         if nodes:
@@ -584,8 +597,17 @@ def _coordinate(
                 )
             assert draft.task_markdown is not None
             try:
+                gap_ids = {result.id for result in assessment.obligation_results if result.outcome != "satisfied"}
+                owners = {owner for item in status.plan.obligations if item.id in gap_ids for owner in item.unit_ids}
                 markdown = _inherit_assets(
-                    draft.task_markdown, list(packet["unit_contracts"].values()), worktree, unit["id"]
+                    draft.task_markdown,
+                    [
+                        contracts[item.task_path]
+                        for item in status.plan.units
+                        if item.id in owners and item.task_path in contracts
+                    ],
+                    worktree,
+                    unit["id"],
                 )
                 _validate_contract(markdown, unit["task_path"], cfg, asset_root=worktree)
             except DeliveryRepairError as exc:
@@ -844,6 +866,11 @@ def _repair_packet(
     assert plan is not None and plan.source_task is not None and status.verification is not None
     verification_scope = DeliveryVerificationScope.from_plan(plan, status.verification_node)
     plan_context = verification_scope.plan_context()
+    from core.delivery_candidate_repair import parent_repair_authority
+
+    retained = parent_repair_authority(status, status.verification) if candidate_recovery else None
+    if retained is not None:
+        plan_context = retained
     scoped_units = [
         unit for unit in plan.units if status.verification_node == "root" or unit.id in verification_scope.unit_ids
     ]
@@ -852,12 +879,7 @@ def _repair_packet(
             "unit_conflict", "The deterministic integration repair unit already exists without matching control state."
         )
     affected_obligations = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
-    owners = {
-        owner
-        for item in plan_context["obligations"]
-        if item["id"] in affected_obligations
-        for owner in item["unit_ids"]
-    }
+    owners = {owner for item in plan.obligations if item.id in affected_obligations for owner in item.unit_ids}
     scope_paths: list[str] = []
     for unit in scoped_units:
         if unit.id in owners:
@@ -954,11 +976,26 @@ def _repair_packet(
     )
     if any(gap.severity == "blocking" and gap.id.startswith("gap.assets.") for gap in asset_check.gaps):
         _stop("contract_not_ready", "Inherited repair assets are not ready in the reviewed candidate.")
+    prompt_unit = unit
+    if retained is not None:
+        from core.delivery_checkpoint_model import checkpoint_children
+
+        children = checkpoint_children(plan.checkpoints, status.verification_node)
+        covered = {key for child in children for key in child.unit_ids}
+        prompt_unit = {
+            **unit,
+            "depends_on": [key for key in unit["depends_on"] if key not in covered],
+            "checkpoint_dependencies": [child.id for child in children],
+        }
+        # Child interfaces and accepted evidence carry delegated authority. Keep
+        # their contracts in deterministic checks, never expand them into prompts.
+        direct = {item["id"] for item in retained["units"]}
+        owner_contracts = {key: value for key, value in owner_contracts.items() if key in direct}
     packet = {
         "source_task": source,
         "plan": plan_context,
         "findings": assessment.to_dict(),
-        "repair_unit": unit,
+        "repair_unit": prompt_unit,
         "unit_contracts": owner_contracts,
         "inherited_constraints": plan_context["constraints"],
         "validation_policy": {
@@ -966,6 +1003,8 @@ def _repair_packet(
         },
         "allowed_read_paths": cfg.get("sandbox", {}).get("allowed_read_paths", ["."]),
     }
+    if retained is not None:
+        packet["inherited_assets"] = inherited
     return packet, unit, contracts
 
 

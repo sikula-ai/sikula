@@ -43,20 +43,23 @@ def validate_recovery_binding(binding: Any) -> None:
 
 
 def eligible_local_finding(status: DeliveryStatusResult, record: DeliveryVerificationRecord, cfg: dict) -> bool:
-    """Only independently attributed leaf authority can bypass ancestor rediscovery."""
+    """Independently attributed leaf or retained parent gaps need no rediscovery."""
     node_id = status.verification_node
     plan = status.plan
     if (
-        node_id == "root"
-        or checkpoint_children(plan.checkpoints, node_id)
-        or node_id not in plan.verified_checkpoint_authority
-        or record.status != "failed"
+        record.status != "failed"
         or record.stop_code != "delivery_verification.repair_required"
         or record.semantic_status != "rejected"
         or record.security_status not in {"not_run", "approved"}
         or not record.repair_input_fingerprint
         or delivery_verification_is_boundary_stop(record)
     ):
+        return False
+    composing = bool(checkpoint_children(plan.checkpoints, node_id))
+    if composing:
+        if not record.composition_evidence_fingerprint or parent_repair_authority(status, record) is None:
+            return False
+    elif node_id == "root" or node_id not in plan.verified_checkpoint_authority:
         return False
     scope = DeliveryVerificationScope.from_plan(plan, node_id)
     assessment = load_repair_input(
@@ -83,6 +86,51 @@ def eligible_local_finding(status: DeliveryStatusResult, record: DeliveryVerific
         )
         and all(set(item.unit_ids) <= set(scope.unit_ids) for item in plan.obligations if item.id in gaps)
     )
+
+
+def parent_repair_authority(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> dict[str, Any] | None:
+    """Restore retained authority only from the accepted complete negative review.
+
+    A full fallback assessment cannot acquire compact authority merely because an
+    earlier composition exchange exists on the same record.
+    """
+    # Non-composed gates use ordinary verification recovery. Without obligations,
+    # a repair_required assessment legitimately has no structured repair input.
+    if not checkpoint_children(status.plan.checkpoints, status.verification_node):
+        return None
+
+    from core.delivery_composition import load_composition
+    from core.delivery_composition_scope import delivery_composition_scope
+    from core.delivery_reverification import semantic_gap_ids
+
+    root = Path(status.project_root)
+    payload = _load_bound_input(root, delivery_progress_path(root, status.plan.plan_id).parent, record)
+    if "composition_fingerprint" not in payload:
+        return None
+    scope = delivery_composition_scope(
+        status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+    )
+    if (
+        scope is None
+        or scope.retained_authority_json is None
+        or payload["composition_fingerprint"] != record.composition_evidence_fingerprint
+        or semantic_gap_ids(record)
+    ):
+        raise ValueError("Parent repair authority or child evidence changed.")
+    composed = load_composition(status, record, scope=scope)
+    if (
+        composed.fallback
+        or not composed.child_refs
+        or composed.assessment.disposition != "repair_required"
+        or composed.assessment.to_dict() != payload.get("assessment")
+    ):
+        raise ValueError("Parent repair requires complete accepted composition evidence.")
+    authority = scope.retained_authority()
+    authority["repair_evidence"] = {
+        "composition_fingerprint": record.composition_evidence_fingerprint,
+        "children": composed.child_refs,
+    }
+    return authority
 
 
 def store_candidate_repair_handoff(
@@ -153,7 +201,7 @@ def _resolve_captured_candidate_repair(
         not status.valid
         or anchor is None
         or anchor.status != "failed"
-        or anchor.stop_code != CANDIDATE_REPAIR_REQUIRED
+        or anchor.stop_code not in REPAIR_REQUIRED_CODES
         or delivery_verification_is_boundary_stop(anchor)
         or any(delivery_verification_is_boundary_stop(item) for item in status.checkpoint_verifications.values())
         or status.assembly_status != "ready"
@@ -178,6 +226,8 @@ def _resolve_captured_candidate_repair(
     if expected is not None and binding != expected:
         raise ValueError("Candidate repair initiating attempt changed.")
     validate_reverification(status, anchor, cfg)
+    if anchor.stop_code != CANDIDATE_REPAIR_REQUIRED and parent_repair_authority(status, anchor) is None:
+        raise ValueError("Direct candidate repair requires retained parent evidence.")
     directory = delivery_progress_path(root, status.plan.plan_id).parent
     record = anchor
     seen = set()
@@ -226,7 +276,16 @@ def candidate_repair_status(
     status = verification_node_status(
         get_delivery_status(path, project_root=root), binding["node_id"] if binding else node_id
     )
-    if binding or (status.verification and status.verification.stop_code == CANDIDATE_REPAIR_REQUIRED):
+    record = status.verification
+    if (
+        binding
+        or (record and record.stop_code == CANDIDATE_REPAIR_REQUIRED)
+        or (
+            record
+            and record.stop_code == "delivery_verification.repair_required"
+            and parent_repair_authority(status, record) is not None
+        )
+    ):
         return resolve_candidate_repair(status, cfg, expected=binding)
     return status, None
 
