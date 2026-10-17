@@ -256,21 +256,24 @@ def test_fresh_child_does_not_approve_cross_group_gap(closure_plan):
         ],
     )
     rejection["obligation_results"][0]["outcome"] = "missing"
-    fallback = json.loads(
-        delivery_integration_review_control_example({item.id for item in get_delivery_status(path).plan.obligations})
-    )
-    fallback.update(disposition="repair_required", findings=rejection["findings"])
-    for outcome in fallback["obligation_results"]:
-        if outcome["id"] == "consumer-visible":
-            outcome["outcome"] = "missing"
-    semantic = _LLM(uncertain[0], full[0], json.dumps(rejection), json.dumps(fallback))
+    semantic = _LLM(uncertain[0], full[0], json.dumps(rejection))
     security = _LLM(full[1])
     result, _ = _run(path, cfg, semantic, security, node_id="root")
     assert result.stop_code == "delivery_verification.repair_required", result
     record = get_delivery_status(path).verification
     assert record.repair_input_fingerprint
     assert record.reverification["children"]["storage"]["verification"]["status"] == "passed"
-    assert len(semantic.calls) == 4 and len(security.calls) == 1
+    assert not record.reverification["fallbacks"]
+    assert len(semantic.calls) == 3 and len(security.calls) == 1
+    from core.delivery_repair_input import load_repair_input
+
+    status = get_delivery_status(path)
+    root = Path(status.project_root)
+    assessment = load_repair_input(
+        root, delivery_progress_path(root, status.plan.plan_id).parent, record, status.plan, cfg
+    )
+    assert assessment.disposition == "repair_required"
+    assert [item.id for item in assessment.obligation_results] == ["consumer-visible"]
 
 
 def test_rendered_child_prompt_preflight_is_read_only(tmp_path, monkeypatch):

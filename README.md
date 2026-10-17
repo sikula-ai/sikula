@@ -305,8 +305,13 @@ uses the existing node budget; affected checkpoints and the final gate must pass
 again. For an already independently attributed hierarchy, a separate reviewer checks
 the repair's changed authority before publication. The repaired checkpoint and its
 ancestors can then retain compact review packets without treating old approval as
-approval of the new contract. Cross-group findings, unsupported cases and repeated
-uncertainty retain the bounded full-review fallback.
+approval of the new contract. A complete compact review can also send a gap in a
+parent's retained integration requirement directly to that parent's repair budget,
+including at the final gate, when all immediate-child evidence is applicable.
+Repair authoring uses retained requirements and child interfaces instead of expanding
+all descendant contracts. Changed parent authority is independently reviewed before
+publication; implementation still needs fresh verification. Unsupported findings and
+repeated uncertainty retain the bounded full-review fallback.
 Preparation can nest checkpoints using `parent_id`: a parent checks its own
 integration requirements and the evidence of its immediate children. `unit_ids`
 and `obligation_ids` describe the whole subtree; `depends_on` still orders unit

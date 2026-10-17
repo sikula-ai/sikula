@@ -906,8 +906,13 @@ python3 -m ruff format .
   then reassesses parent integration. An eligible typed semantic gap wholly owned
   by an independently attributed leaf may enter its existing bounded repair through
   an accepted candidate/authority/attempt-bound handoff, without ancestor rediscovery.
-  Unsupported inputs, cross-group gaps and repeated uncertainty retain preflighted
-  full review. Keep new child evidence separate from historical admission. Candidate
+  A complete compact semantic assessment may similarly authorize repair of a retained
+  parent-owned obligation when every immediate child's evidence is applicable. Bind
+  that repair to the accepted composition and direct findings; never treat partial
+  evidence or delegated child gaps as parent-owned authority. Keep repair prompts
+  bounded by retained authority and immediate-child interfaces, with full dependency,
+  scope, asset and contract checks outside the prompt. Unsupported inputs and repeated
+  uncertainty retain preflighted full review. Keep new child evidence separate from historical admission. Candidate
   repair cannot refill logical-node budgets or rewrite completed consumers' execution
   dependencies; only the exact published repair can reconcile their history for
   fresh checkpoint verification, never authorize new consumer work or finalization.
@@ -927,7 +932,7 @@ python3 -m ruff format .
   Scope repair ownership to the repaired node and its ancestors; consumer dependency
   edges do not grant sibling ownership. Scope capture cannot grant authority, refill an attempt or
   import unrelated checkpoints or descendant history into a parent prompt.
-- **Always** independently review authority changed by supported leaf repair before
+- **Always** independently review authority changed by supported leaf or parent repair before
   renewing its receipts. The author/writer cannot approve attribution by rehashing
   old approval. Bind exact proposed inputs, effective reviewer policy, captured
   attempt and logical-node lineage; review local source/contracts at the leaf and

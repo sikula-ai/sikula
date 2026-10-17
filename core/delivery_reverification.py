@@ -214,7 +214,7 @@ def validate_reverification(
         initial = load_composition(
             status, replace(record, **{field: round_state["initial"]}), review_kind=role, scope=composition_scope
         )
-        if not initial.fallback or not initial.assessment.approved:
+        if not initial.fallback or not (initial.assessment.approved or (role == "semantic" and initial.has_parent_gap)):
             raise ValueError("Candidate review did not originate in ordinary uncertainty.")
     for role, digest in record.reverification["fallbacks"].items():
         if digest:
@@ -450,7 +450,11 @@ def run_node_composition_cycle(
     if role in running.reverification["reassessments"]:
         return exchange(running, True)
     accepted = load(running)
-    if not accepted.fallback or not accepted.assessment.approved or not accepted.child_refs:
+    if (
+        not accepted.fallback
+        or not accepted.child_refs
+        or not (accepted.assessment.approved or (role == "semantic" and accepted.has_parent_gap))
+    ):
         return None, running
     nodes = [item["id"] for item in accepted.checkpoints if item["outcome"] == "verification_required"]
     # Validate the entire selection before invoking any child, including on resume.

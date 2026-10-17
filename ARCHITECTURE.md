@@ -1611,7 +1611,7 @@ A semantic rejection from a descendant requested by security also supersedes ear
 semantic composition passes along the affected ancestor path. Immediate references
 retain a monotonic `semantic_gap` flag even when a descendant's local fallback later
 approves; no descendant history or finding list is copied into ancestors. Before continuing security or accepting the final gate,
-the coordinator routes an eligible leaf finding to scoped candidate repair, or
+the coordinator routes an eligible leaf or retained parent finding to scoped candidate repair, or
 uses the remaining full semantic fallback and its normal repair outcome. Fallback
 evidence binds the child rejections known at that review; an earlier fallback cannot
 cover a later rejection or receive a new budget. This
@@ -1635,8 +1635,8 @@ Historical admission is not overwritten by that projection. Only findings whose
 obligation owners and permitted scope lie inside the leaf qualify. Shared and
 enclosing source authority comes from its independently checked packet; the repair
 prompt includes exact selected fragments, local plan context and owner contracts.
-Missing attribution, cross-child findings and unsupported decomposition retain the
-existing full-review/stop path. Review authority must still match the candidate;
+Missing attribution and unsupported decomposition retain the full-review/stop path.
+Parent-owned integration findings have the separately checked compact path below. Review authority must still match the candidate;
 preparer-only policy corrections are allowed before authoring reserves an attempt.
 Once reserved, the existing repair state's effective policy stays frozen.
 
@@ -1663,9 +1663,40 @@ Interrupted handoff/authoring/publication resumes accepted evidence without rese
 budgets, and superseded initiating attempts cannot publish ordinary review updates.
 Terminal security/read-only boundaries remain independent of evidence freshness.
 
-**Independent authority renewal after repair:** an eligible leaf repair whose leaf,
-composing ancestors and final responsibility already have valid independent receipts
-renews that chain before publication. This operation preserves the accepted source
+**Bounded parent integration repair:** a compact semantic composition may return a
+complete `repair_required` assessment for its retained direct obligations while all
+immediate children remain applicable. The accepted composition is persisted before
+its repair input; that input additionally binds `composition_fingerprint` to the
+record's semantic composition artifact. Loading the repair input requires exactly
+the retained direct outcomes, not an invented satisfied result for every descendant.
+The coordinator also reloads the accepted composition and typed child closure and
+checks that the negative assessment is identical. An unowned finding, unresolved
+child applicability, missing child evidence or a descendant semantic gap cannot
+enter this parent-owned path. Security rejection remains a terminal boundary.
+
+This works at an intermediate checkpoint and the final gate. Direct pending parent
+repair is bound to its initiating attempt just like a descendant handoff; recursive
+review can propagate it through the existing immediate-child handoffs. Repeating
+verification on unchanged authority returns pending repair without another call.
+Preparer-only corrections remain possible before the first authoring reservation.
+The original logical parent's two authoring attempts and one published repair apply.
+
+The author receives exact retained source, direct obligations and constraints,
+relevant direct contracts, immediate-child interfaces and accepted evidence references.
+Inherited asset declarations still apply, including assets from contributing children.
+The prompt represents completed child dependencies through checkpoint references;
+execution retains the complete dependency graph. All contributing owners' recorded
+write scopes, required handoffs, completed contracts and captured execution evidence
+are checked deterministically before authoring and on publication resume. Descendant
+contracts, dependency lists and accumulated attempts are not expanded into the prompt.
+The repair is appended to its parent and ancestors, never to unrelated child ownership.
+Completed consumer dependencies and historical admissions remain unchanged; affected
+barriers and fresh candidate verification remain mandatory. Ordinary incomplete or
+oversized cases retain preflighted fallback/stop, and global limits are unchanged.
+
+**Independent authority renewal after repair:** an eligible leaf or composing-parent
+repair whose changed node, composing ancestors and final responsibility already have
+valid independent receipts renews that chain before publication. This operation preserves the accepted source
 partition and checks the exact coordinator-owned append; it cannot introduce new
 delegation, source intent, ownership outside the supported repair or broader scope.
 Unsupported hierarchies retain the existing full-authority path.
@@ -1683,7 +1714,7 @@ Inlined contract text uses the same universal newline normalization as contract
 fingerprints, keeping packet identity stable across preview and execution checkouts.
 
 The private prepared repair snapshot contains `authority_renewal` with an ordered
-leaf-to-final-gate `nodes` chain, `pending`/`accepted` status and bounded per-node
+repair-node-to-final-gate `nodes` chain, `pending`/`accepted` status and bounded per-node
 `reviews` (packet fingerprint, reserved attempts and accepted typed assessment).
 There are at most 32 nodes and two independent calls per node per authored draft;
 malformed, interrupted and failed calls consume reservations. The existing two
@@ -1809,8 +1840,10 @@ response templates and protocol/correction allowance. Terminal security/read-onl
 stops and all retry/repair budgets are unchanged. The full-source fallback and current
 whole-plan limits still apply; recursive node review does not yet provide unbounded
 plan support. Failed composed semantic assessments outside eligible local candidate
-recovery use full review before repair to retain complete obligation provenance;
-changed repair ownership invalidates final attribution and selects full authority.
+or retained parent recovery use full review before repair to retain complete
+obligation provenance. Changed repair ownership invalidates old attribution;
+supported independent renewal restores compact authority, otherwise full authority
+remains required.
 
 `DeliveryVerificationSnapshot` binds that declaration to completed-unit commit
 and handoff evidence and the exact candidate/config/source/plan/policy identity.

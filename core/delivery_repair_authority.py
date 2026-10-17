@@ -1,4 +1,4 @@
-"""Exact, independently reviewable authority changes for one supported leaf repair.
+"""Exact, independently reviewable authority changes for one supported leaf or parent repair.
 
 The coordinator owns the append. These proposals cannot authorize themselves:
 only matching durable independent approvals may install their receipts.
@@ -35,11 +35,13 @@ from core.delivery_verification import delivery_verification_source_task_is_priv
 
 
 def renewal_nodes(plan: DeliveryPlan, node_id: str) -> list[str]:
-    """Renew only an already independently attributed leaf and its composing chain."""
-    if node_id == "root" or checkpoint_children(plan.checkpoints, node_id):
-        return []
+    """Renew an independently attributed repair node and its composing chain."""
+    if node_id == "root":
+        return ["root"] if plan.verified_final_gate_authority is not None else []
     nodes = {node.id: node for node in plan.checkpoints}
     if node_id not in plan.verified_checkpoint_authority:
+        return []
+    if checkpoint_children(plan.checkpoints, node_id) and node_id not in plan.verified_composition_authority:
         return []
     result = [node_id]
     parent = nodes[node_id].parent_id
