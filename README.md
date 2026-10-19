@@ -305,6 +305,10 @@ checks that those results still apply to the current code. This reduces repeated
 context. With independently checked final responsibility, uncertain applicability
 first triggers a bounded review of the affected checkpoint on the final candidate,
 including required security review. The final gate then reassesses integration.
+With intact independent authority, an oversized textual change diff also triggers
+bounded checkpoint refresh before parent review, including at intermediate levels.
+The parent still reviews integration; refresh reuses existing budgets and does not
+increase plan-size limits or bypass missing evidence and security stops.
 Historical admission and completed units stay unchanged. An eligible semantic gap
 inside one independently attributed leaf checkpoint can go directly to that node's
 bounded repair, including when security requested its re-verification. The repair
