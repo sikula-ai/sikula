@@ -413,7 +413,10 @@ def test_unsupported_composition_selects_full_review_before_calls(
             checkpoint_verifications={f"storage-{i}": origin for i in range(9 if reason == "fan_in" else 2)},
         )
     snapshot = _packet_snapshot(status, candidate_commit="b" * 40, candidate_tree="b" * 40)
-    outputs = [names, ValueError("delta budget")] if reason == "large_delta" else [names, diff]
+    stats = "".join("1\t1\t" + name + "\0" for name in names.split("\0")[1:-1:2])
+    from core.delivery_composition import CompositionDeltaLimit
+
+    outputs = [names, stats, CompositionDeltaLimit("delta budget")] if reason == "large_delta" else [names, stats, diff]
     with (
         patch(
             "core.delivery_composition.load_checkpoint_evidence",

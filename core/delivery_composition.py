@@ -38,6 +38,23 @@ MAX_COMPOSITION_DIRECT_UNITS = 32
 MAX_COMPOSITION_DELTA_BYTES = 64 * 1024
 MAX_COMPOSITION_PACKET_BYTES = 128 * 1024
 
+
+class CompositionDeltaLimit(ValueError):
+    """A bounded Git read exceeded its byte allowance, not an evidence failure."""
+
+
+@dataclass(frozen=True)
+class CompositionRefresh:
+    """Required child reviews, with a sizing-only preview of the eventual packet.
+
+    The preview is never review authority: execution rebuilds the packet from
+    accepted exact-candidate child evidence after all requested reviews finish.
+    """
+
+    nodes: dict[str, dict[str, str]]
+    preview_context: dict[str, Any]
+
+
 if TYPE_CHECKING:
     from core.delivery_verification import DeliveryVerificationSnapshot
 
@@ -60,7 +77,7 @@ def _git_bounded(root: Path, args: list[str], limit: int) -> str:
         try:
             content = process.stdout.read(limit + 1)
             if len(content) > limit:
-                raise ValueError("Composition delta exceeds the packet budget.")
+                raise CompositionDeltaLimit("Composition delta exceeds the packet budget.")
             if process.wait(timeout=20):
                 raise ValueError("Composition delta is unavailable.")
             return content.decode("utf-8")
@@ -79,7 +96,7 @@ def build_composition_context(
     *,
     review_kind: str = "semantic",
     record: DeliveryVerificationRecord | None = None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | CompositionRefresh | None:
     """Flat delivery adapter; common construction uses only captured node inputs."""
     composition_scope = snapshot.composition_scope
     if composition_scope is None:
@@ -97,7 +114,7 @@ def build_node_composition_context(
     project_config: dict[str, Any],
     *,
     review_kind: str = "semantic",
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | CompositionRefresh | None:
     """Build both roles' packets from exact authority and immediate children only."""
     composition_scope = attempt.scope
     attempt.assert_candidate(snapshot.identity)
@@ -114,6 +131,7 @@ def build_node_composition_context(
     covered_units: set[str] = set()
     inherited: set[str] = set()
     remaining_delta = MAX_COMPOSITION_DELTA_BYTES
+    refresh = {}
     for scope in composition_scope.children:
         if covered_units.intersection(scope.unit_ids) or inherited.intersection(scope.obligation_ids):
             return None
@@ -160,18 +178,33 @@ def build_node_composition_context(
                     # Gitlinks describe dependency pointers, not complete content deltas.
                     if "160000" in (fields[0][1:], fields[1]):
                         return None
-                if len(paths) > 32 or any(
+                if any(
                     delivery_verification_source_task_is_private(
                         root, root / path, path, project_config, allow_missing=True
                     )
                     for path in paths
                 ):
                     return None
-                delta = _git_bounded(
-                    root,
-                    [*diff_args, "--unified=3", *refs, "--", "."],
-                    remaining_delta,
-                )
+                # Inspect the complete bounded metadata before authorizing any
+                # refresh. A truncated patch must not hide a binary/private tail.
+                stats = _git_bounded(root, [*diff_args, "--numstat", "-z", *refs, "--", "."], 8192)
+                entries = stats.split("\0")
+                if entries[-1] or len(entries) - 1 != len(paths):
+                    return None
+                for entry, path in zip(entries[:-1], paths):
+                    counts = entry.split("\t", 2)
+                    if len(counts) != 3 or counts[2] != path or not all(n.isdecimal() for n in counts[:2]):
+                        return None
+                reason = "delta_paths" if len(paths) > 32 else None
+                if reason is None:
+                    try:
+                        delta = _git_bounded(root, [*diff_args, "--unified=3", *refs, "--", "."], remaining_delta)
+                    except CompositionDeltaLimit:
+                        reason = "delta_bytes"
+                if reason:
+                    if final_context is None:
+                        return None
+                    refresh[scope.node_id] = {"origin": origin.checkpoint_evidence_fingerprint, "reason": reason}
                 if "Binary files " in delta or "GIT binary patch" in delta:
                     return None
                 remaining_delta -= len(delta.encode())
@@ -198,6 +231,14 @@ def build_node_composition_context(
             children[-1].pop("obligations")
             children[-1].update(interface)
             children[-1]["security_outcome"] = origin.security_status
+        if scope.node_id in refresh:
+            # Preview only. The distinct return type prevents use as approval.
+            children[-1].update(
+                origin_commit=snapshot.identity.candidate_commit,
+                origin_tree=snapshot.identity.candidate_tree,
+                exact_tree=True,
+                delta="",
+            )
         covered_units.update(scope.unit_ids)
         inherited.update(item["id"] for item in obligations)
     if final_context is not None:
@@ -215,7 +256,7 @@ def build_node_composition_context(
         context["checkpoint_composition"].update(compact=True, review_kind=review_kind)
     if len(json.dumps(context).encode()) > MAX_COMPOSITION_PACKET_BYTES:
         return None
-    return context
+    return CompositionRefresh(refresh, context) if refresh else context
 
 
 def composition_example(context: dict[str, Any]) -> str:

@@ -922,6 +922,14 @@ python3 -m ruff format .
   rendered child and fallback packets before the first call. Security/read-only
   boundaries survive audit failure and candidate changes. Never refill repair
   budgets or discard a terminal boundary to obtain a reusable result.
+- **Always** distinguish a completely inspected oversized textual checkpoint delta
+  from unavailable evidence or unsupported/private change content. Only intact
+  independently checked authority can authorize deterministic child refresh before
+  parent composition. Persist candidate-bound refresh prerequisites and provider
+  reservations separately from accepted reviewer decisions, using existing budgets.
+  Rebuild parent packets from accepted child results; a sizing preview, truncated
+  diff or child pass cannot approve parent integration. Keep full-fallback readiness
+  and terminal boundary handling intact.
 - **Always** drive shared composition, accepted evidence selection and packet
   preflight from a captured parent scope and explicit immediate children. Keep
   plan hierarchy selection, final-only validation and finalization in the delivery

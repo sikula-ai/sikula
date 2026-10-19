@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-from typing import Any
+from typing import Any, Callable
 
 from agents.delivery_integration_review_agent import (
     DeliveryIntegrationReviewAgent,
@@ -1325,6 +1325,24 @@ def _composition_review(
                 security_reviewer=security_reviewer,
             ),
             semantic_fallback_covers=lambda running: semantic_fallback_covers_gaps(kwargs["status"], running),
+            refresh=lambda running: _reserve_composition_refresh(
+                kwargs["status"],
+                kwargs["snapshot"],
+                running,
+                kwargs["project_config"],
+                role,
+                kwargs["evidence_path"],
+                packet_fits=lambda context: _composition_packet_fits(
+                    context,
+                    kwargs["snapshot"],
+                    kwargs["reviewer"],
+                    kwargs["worktree"],
+                    kwargs["source_task"],
+                    kwargs["validation"],
+                    kwargs["project_config"],
+                    role,
+                ),
+            ),
         )
     except (OSError, ValueError, KeyError, DeliveryProgressLockError):
         # Validation and accepted-result loading also read private evidence
@@ -1332,6 +1350,56 @@ def _composition_review(
         raise DeliveryIntegrationReviewAgentError(
             "delivery_verification.evidence_unavailable", "Composition evidence is unavailable.", []
         ) from None
+
+
+def _reserve_composition_refresh(
+    status: DeliveryStatusResult,
+    snapshot: DeliveryVerificationSnapshot,
+    running: DeliveryVerificationRecord,
+    cfg: dict[str, Any],
+    role: str,
+    evidence_path: Path,
+    *,
+    packet_fits: Callable[[dict[str, Any]], bool],
+) -> tuple[DeliveryVerificationRecord, list[str]]:
+    """Reserve deterministic prerequisites without inventing a reviewer result."""
+    from copy import deepcopy
+    from core.delivery_composition import CompositionRefresh, build_composition_context
+    from core.delivery_reverification import new_reverification
+
+    control = deepcopy(running.reverification) if running.reverification is not None else new_reverification()
+    request = control.get("refreshes", {}).get(role)
+    if request is None:
+        prefix = "" if role == "semantic" else "security_"
+        if getattr(running, prefix + "composition_attempted") or role in control["fallbacks"]:
+            return running, []
+        context = build_composition_context(status, snapshot, cfg, review_kind=role, record=running)
+        if not isinstance(context, CompositionRefresh):
+            return running, []
+        if not packet_fits(context.preview_context):
+            return running, []
+        request = {"nodes": context.nodes, "review_reserved": False}
+        control.setdefault("refreshes", {})[role] = request
+        running = _persist_composition_control(
+            status, snapshot, running, cfg, attempted=True, review_kind=role, reverification=control
+        )
+    if request["review_reserved"] or role in control["fallbacks"]:
+        return running, []
+    if not _safe_append_audit(
+        evidence_path,
+        {
+            "event": "composition_refresh_required",
+            "gate_id": running.gate_id,
+            "attempt": running.attempt,
+            "review_kind": role,
+            "nodes": request["nodes"],
+        },
+        project_root=Path(status.project_root),
+    ):
+        raise DeliveryIntegrationReviewAgentError(
+            "delivery_verification.audit_unavailable", "Composition refresh audit is unavailable.", []
+        )
+    return running, list(request["nodes"])
 
 
 def _reverify_candidate_child(
@@ -1560,6 +1628,37 @@ def _bounded_full_review(
     return result, running
 
 
+def _composition_packet_fits(
+    context: dict[str, Any],
+    snapshot: DeliveryVerificationSnapshot,
+    reviewer: DeliveryIntegrationReviewAgent,
+    worktree: Path,
+    source_task: str,
+    validation: DeliveryVerificationValidationResult,
+    cfg: dict[str, Any],
+    role: str,
+) -> bool:
+    from core.delivery_verification import delivery_verification_prompt_is_bounded
+
+    prompt_args = dict(
+        cwd=worktree,
+        review_kind=role,
+        source_task=source_task,
+        validation_summary=validation.to_review_dict(cfg, project_root=worktree),
+        candidate_commit=snapshot.identity.candidate_commit,
+        candidate_tree=snapshot.identity.candidate_tree,
+        known_obligation_ids=set(snapshot.scope.obligation_ids) if role == "semantic" else set(),
+    )
+    full_prompt = reviewer._prompt(plan_context=snapshot.scope.plan_context(), **prompt_args)
+    composed_prompt = reviewer._prompt(plan_context=context, **prompt_args)
+    # Include the real control template, rules, escaping and correction headroom.
+    return (
+        delivery_verification_prompt_is_bounded(full_prompt + " " * 512)
+        and delivery_verification_prompt_is_bounded(composed_prompt + " " * 512)
+        and len(composed_prompt.encode()) < len(full_prompt.encode())
+    )
+
+
 def _composition_exchange(
     *,
     status: DeliveryStatusResult,
@@ -1575,8 +1674,12 @@ def _composition_exchange(
     review_kind: str = "semantic",
     reassessment: bool = False,
 ) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
-    from core.delivery_composition import build_composition_context, load_composition, store_composition
-    from core.delivery_verification import delivery_verification_prompt_is_bounded
+    from core.delivery_composition import (
+        CompositionRefresh,
+        build_composition_context,
+        load_composition,
+        store_composition,
+    )
 
     if snapshot.composition_scope is None:
         return None, running
@@ -1588,6 +1691,7 @@ def _composition_exchange(
         )
         attempted_field = "composition_attempted" if review_kind == "semantic" else "security_composition_attempted"
         round_state = (running.reverification or {}).get("reassessments", {}).get(review_kind)
+        refresh = (running.reverification or {}).get("refreshes", {}).get(review_kind)
         if reassessment and round_state and not round_state["accepted"]:
             return None, running
         if getattr(running, evidence_field) and (not reassessment or round_state):
@@ -1595,28 +1699,14 @@ def _composition_exchange(
             if accepted.fallback:
                 return None, running
             return DeliveryIntegrationReviewResult(accepted.assessment, [], accepted), running
-        if getattr(running, attempted_field) and not reassessment:
+        if getattr(running, attempted_field) and not reassessment and (refresh is None or refresh["review_reserved"]):
             return None, running
         context = build_composition_context(status, snapshot, project_config, review_kind=review_kind, record=running)
-        if context is None:
+        if context is None or isinstance(context, CompositionRefresh):
             return None, running
-        prompt_args = dict(
-            cwd=worktree,
-            review_kind=review_kind,
-            source_task=source_task,
-            validation_summary=validation.to_review_dict(project_config, project_root=worktree),
-            candidate_commit=snapshot.identity.candidate_commit,
-            candidate_tree=snapshot.identity.candidate_tree,
-            known_obligation_ids=set(snapshot.scope.obligation_ids) if review_kind == "semantic" else set(),
-        )
-        full_prompt = reviewer._prompt(plan_context=snapshot.scope.plan_context(), **prompt_args)
-        composed_prompt = reviewer._prompt(plan_context=context, **prompt_args)
-        if not delivery_verification_prompt_is_bounded(full_prompt + " " * 512):
-            return None, running
-        # Account for the actual control template, rules, JSON escaping and retry instruction.
-        if not delivery_verification_prompt_is_bounded(composed_prompt + " " * 512) or len(
-            composed_prompt.encode()
-        ) >= len(full_prompt.encode()):
+        if not _composition_packet_fits(
+            context, snapshot, reviewer, worktree, source_task, validation, project_config, review_kind
+        ):
             return None, running
         from copy import deepcopy
         from core.delivery_reverification import new_reverification
@@ -1630,6 +1720,8 @@ def _composition_exchange(
         )
         if reassessment:
             control["reassessments"][review_kind] = {"initial": getattr(running, evidence_field), "accepted": False}
+        if refresh is not None:
+            control["refreshes"][review_kind]["review_reserved"] = True
         running = _persist_composition_control(
             status,
             snapshot,
@@ -2100,12 +2192,12 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
         from core.delivery_checkpoint_model import checkpoint_children
         from core.delivery_handoff import load_delivery_dependency_handoffs
 
-        if (
-            status.verification_node == "root"
-            and status.verification
-            and delivery_verification_is_boundary_stop(status.verification)
-        ):
+        if status.verification and delivery_verification_is_boundary_stop(status.verification):
             boundary = status.verification
+            if status.verification_node != "root" and boundary.security_status == "rejected":
+                # A child security verdict is terminal, not parent semantic
+                # repair. Do not require repair inputs or descendant sidecars.
+                return _blocked_result(status, "delivery_verification.security_rejected")
             if boundary.reverification:
                 from core.delivery_verification_model import parse_delivery_verification_record
 

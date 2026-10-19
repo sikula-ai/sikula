@@ -1501,12 +1501,14 @@ internal accounting do not accumulate in the parent prompt. Both final reviewers
 this packet, with independent decisions and full fallback for each role.
 It includes complete project-relative changes since each child candidate within
 a shared 64 KiB delta budget (at most 32 changed paths per child), with a 128 KiB
-serialized context ceiling. Oversized, binary, private-path or unsupported deltas
-select full review; no truncated delta establishes independence. Git reads are
+serialized context ceiling. With independent parent/child authority, oversized
+textual deltas first require bounded child evidence refresh as described below.
+Binary, private-path or unsupported deltas select full review; no truncated delta
+establishes independence. Git reads are
 bounded and timed out. Path inspection and diff rendering both disable rename
 detection so the original side of a rename cannot hide a private path.
 Delta paths also obey configured private state/report roots and build-tool
-environment-file exclusions, including deleted historical paths. Both Git reads
+environment-file exclusions, including deleted historical paths. All diff reads
 explicitly disable submodule suppression; gitlink changes select full review
 before diff content is read because pointer changes are not complete dependency evidence.
 Individual review prompts retain the 512 KiB ceiling.
@@ -1621,6 +1623,37 @@ stops preempt further automatic review. After resolving an external prerequisite
 verification can spend the remaining full fallback without reopening the child
 exchange. Security/read-only child boundaries remain durable even
 if auditing fails or assembly advances; they also block after candidate/policy changes.
+
+**Bounded refresh for oversized checkpoint deltas:** for intermediate checkpoints
+and the final gate, a complete metadata inspection may establish that a public
+textual delta exceeds the shared byte allowance or the per-child path allowance.
+With intact independent parent/child authority and accepted historical evidence,
+this requires review of the affected immediate children before the first parent
+composition exchange. It does not manufacture an applicability decision. Raw and
+numstat metadata each retain an 8 KiB read limit; incomplete metadata, binary or
+gitlink changes, private paths, unavailable Git and unsupported authority retain
+the existing full-review/stop behavior. Missing or corrupt accepted evidence blocks
+before providers. Other packet limits do not authorize refresh.
+
+The node's private control optionally stores per-role `refreshes`, containing only
+selected child IDs, original evidence fingerprints, typed `delta_bytes` or
+`delta_paths` reasons and a `review_reserved` flag. The existing role-specific
+composition-attempt flag reserves this cycle before child work. `review_reserved`
+separately reserves its initial provider exchange after child success; interruption
+after that reservation cannot replay the exchange. Requests inherit the captured
+candidate, authority and initiating-attempt checks of ordinary descendant writes.
+They are not accepted reviewer evidence and never appear in parent prompts.
+
+Composing children use this same recursive cycle; leaves receive scoped verification.
+Accepted exact-candidate results are shared across roles and resume. All child work
+charges existing node/subtree reservations, with no additional refresh allowance.
+Both roles' full fallback and prospective composed packets are sized before calls.
+A sizing-only preview substitutes bounded exact-child references; execution rebuilds
+the real parent packet from accepted child evidence and independently reviews retained
+authority and integration. Child gaps use the existing scoped repair/fallback paths;
+security, read-only and external boundary stops preempt parent work. Unusable or
+still-oversized packets retain the preflighted fallback or technical/budget stop.
+Global plan limits and mandatory full-fallback readiness are unchanged in this slice.
 
 A semantic rejection from a descendant requested by security also supersedes earlier
 semantic composition passes along the affected ancestor path. Immediate references

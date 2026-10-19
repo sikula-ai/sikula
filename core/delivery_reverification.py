@@ -42,12 +42,41 @@ def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
         if not parent.get("composition_attempted") and not parent.get("security_composition_attempted"):
             raise ValueError("Candidate node reference requires a reserved exchange.")
         return dict(value)
-    if not isinstance(value, dict) or set(value) != {"children", "reassessments", "fallbacks"}:
+    if not isinstance(value, dict) or set(value) not in (
+        {"children", "reassessments", "fallbacks"},
+        {"children", "reassessments", "fallbacks", "refreshes"},
+    ):
         raise ValueError("Invalid candidate re-verification control.")
     if not parent.get("composition_attempted") and not parent.get("security_composition_attempted"):
         raise ValueError("Candidate review requires a reserved composition exchange.")
     from core.delivery_composition import MAX_COMPOSITION_CHILDREN
 
+    refreshes = value.get("refreshes", {})
+    if not isinstance(refreshes, dict) or set(refreshes) - _ROLES:
+        raise ValueError("Invalid candidate refresh roles.")
+    for role, request in refreshes.items():
+        prefix = "" if role == "semantic" else "security_"
+        if (
+            not isinstance(request, dict)
+            or set(request) != {"nodes", "review_reserved"}
+            or type(request["review_reserved"]) is not bool
+            or not isinstance(request["nodes"], dict)
+            or not 0 < len(request["nodes"]) <= MAX_COMPOSITION_CHILDREN
+            or not parent.get(prefix + "composition_attempted")
+            or (parent.get(prefix + "composition_evidence_fingerprint") and not request["review_reserved"])
+        ):
+            raise ValueError("Invalid candidate refresh reservation.")
+        for node, item in request["nodes"].items():
+            if (
+                not isinstance(node, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", node)
+                or not isinstance(item, dict)
+                or set(item) != {"origin", "reason"}
+                or not isinstance(item["origin"], str)
+                or not _DIGEST.fullmatch(item["origin"])
+                or item["reason"] not in ("delta_bytes", "delta_paths")
+            ):
+                raise ValueError("Invalid candidate refresh prerequisite.")
     children = value["children"]
     if not isinstance(children, dict) or len(children) > MAX_COMPOSITION_CHILDREN:
         raise ValueError("Invalid candidate re-verification fan-in.")
@@ -113,7 +142,9 @@ def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
         )
     ):
         raise ValueError("Invalid candidate re-verification fallback budget.")
-    if not parent.get("security_required", False) and ("security" in rounds or "security" in roles):
+    if not parent.get("security_required", False) and (
+        "security" in rounds or "security" in roles or "security" in refreshes
+    ):
         raise ValueError("Unexpected security review control.")
     return deepcopy(value)
 
@@ -201,6 +232,23 @@ def validate_reverification(
     directory = delivery_progress_path(root, status.plan.plan_id).parent
     from core.delivery_composition import load_composition
 
+    for request in record.reverification.get("refreshes", {}).values():
+        if not composition_scope.retained_authority_json:
+            raise ValueError("Candidate refresh requires independent parent authority.")
+        for node_id, item in request["nodes"].items():
+            child_scope = composition_scope.child(node_id)
+            historical = status.checkpoint_verifications.get(node_id)
+            if historical is None or historical.checkpoint_evidence_fingerprint != item["origin"]:
+                raise ValueError("Candidate refresh admission changed.")
+            evidence = load_checkpoint_evidence(
+                root, directory, historical, plan_id=status.plan.plan_id, node_id=node_id
+            )
+            if not evidence.covers(child_scope):
+                raise ValueError("Candidate refresh coverage changed.")
+            if request["review_reserved"]:
+                entry = record.reverification["children"].get(node_id)
+                if entry is None or not expanded_child(status, entry).passed:
+                    raise ValueError("Candidate refresh prerequisites are incomplete.")
     for role, digest in (
         ("semantic", record.composition_evidence_fingerprint),
         ("security", record.security_composition_evidence_fingerprint),
@@ -367,7 +415,7 @@ def preflight_candidate_tree(
 ) -> None:
     """Size possible node exchanges privately, never flatten them into a prompt."""
     from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
-    from core.delivery_composition import build_composition_context
+    from core.delivery_composition import CompositionRefresh, build_composition_context
     from core.delivery_verification import build_delivery_verification_snapshot, delivery_verification_prompt_is_bounded
     from core.delivery_verification_validation import preview_delivery_validation_summary
 
@@ -388,6 +436,8 @@ def preflight_candidate_tree(
             context = build_composition_context(status, current, cfg, review_kind=role)
             if context is None:
                 continue
+            if isinstance(context, CompositionRefresh):
+                context = context.preview_context
             prompt = reviewer._prompt(
                 cwd=cwd,
                 review_kind=role,
@@ -432,6 +482,7 @@ def run_node_composition_cycle(
     load: Callable[[DeliveryVerificationRecord], CompositionResult],
     review_child: Callable[[DeliveryVerificationRecord, str], tuple[DeliveryVerificationRecord, bool]],
     semantic_fallback_covers: Callable[[DeliveryVerificationRecord], bool],
+    refresh: Callable[[DeliveryVerificationRecord], tuple[DeliveryVerificationRecord, list[str]]] | None = None,
 ) -> tuple[DeliveryIntegrationReviewResult | None, DeliveryVerificationRecord]:
     """The finite node cycle; persistence and delivery policy belong to the caller.
 
@@ -440,6 +491,20 @@ def run_node_composition_cycle(
     """
     if role == "semantic" and semantic_gap_ids(running):
         return None, running
+    if refresh is not None and scope is not None:
+        running, nodes = refresh(running)
+        if nodes:
+            validate(running)
+        for node_id in nodes:
+            scope.child(node_id)
+        for node_id in nodes:
+            running, passed = review_child(running, node_id)
+            if semantic_gap_ids(running) and not semantic_fallback_covers(running):
+                if role == "security":
+                    raise SemanticRecheckRequired(running)
+                return None, running
+            if not passed:
+                return None, running
     result, running = exchange(running, False)
     if result is not None or scope is None or running.reverification is None:
         return result, running

@@ -245,7 +245,7 @@ def test_node_preflight_sizes_only_immediate_scopes_and_excludes_final_checks(no
     assert [call.kwargs["include_final_checks"] for call in preview.call_args_list] == [True, False]
 
 
-@pytest.mark.parametrize("limit", ["full_packet", "composition_packet", "hierarchy"])
+@pytest.mark.parametrize("limit", ["full_packet", "composition_packet", "refresh_packet", "hierarchy"])
 def test_recursive_preflight_identifies_bounds_failures(node_input: NodeInput, monkeypatch, limit: str) -> None:
     from core.delivery_progress import DeliveryStatusResult
     from core.delivery_reverification import CandidateReviewBoundsError, preflight_candidate_tree
@@ -254,7 +254,9 @@ def test_recursive_preflight_identifies_bounds_failures(node_input: NodeInput, m
     root, _, source, snapshot, _, _ = node_input
 
     def prompt(self, **kwargs):
-        if limit == "full_packet" or (limit == "composition_packet" and kwargs["plan_context"].get("oversized")):
+        if limit == "full_packet" or (
+            limit in {"composition_packet", "refresh_packet"} and kwargs["plan_context"].get("oversized")
+        ):
             return "x" * (512 * 1024 + 1)
         return "Bounded review packet."
 
@@ -262,7 +264,13 @@ def test_recursive_preflight_identifies_bounds_failures(node_input: NodeInput, m
     monkeypatch.setattr(
         delivery_composition,
         "build_composition_context",
-        lambda *args, **kwargs: None if limit == "hierarchy" else {"oversized": True},
+        lambda *args, **kwargs: (
+            None
+            if limit == "hierarchy"
+            else delivery_composition.CompositionRefresh({}, {"oversized": True})
+            if limit == "refresh_packet"
+            else {"oversized": True}
+        ),
     )
     monkeypatch.setattr(delivery_verification, "build_delivery_verification_snapshot", lambda *args, **kwargs: snapshot)
     status = DeliveryStatusResult("plan.yaml", str(root), None, False, "pending", [], [])

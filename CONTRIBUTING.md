@@ -162,8 +162,13 @@ def test_happy_path(git_project, fake_llm):
 - [ ] `ARCHITECTURE.md`, `README.md`, and relevant topic docs updated if the change affects documented behaviour
 - [ ] CI passes on the PR
 
-CI runs automatically on every PR. Linux runs the Python 3.10–3.13 matrix,
-compile check, tests, Ruff lint/format, and Codecov diff coverage. A Python 3.12
-Windows job runs the compile check and full test suite. All checks must pass
-before merge.
-The Windows suite uses two isolated pytest workers and reports its slowest tests.
+CI checks Linux and Windows; all required checks must pass before merge.
+The supported Python matrix and execution settings live in
+[the CI workflow](.github/workflows/ci.yml).
+
+To reproduce a Windows test shard locally, use its pytest command from the CI
+log, omitting `--junitxml` or changing its output path to a local destination.
+Ordinary local pytest runs execute the full selected suite without sharding.
+
+Test logs report the slowest cases. The `test-results-*` CI artifacts contain
+JUnit XML with individual test results and timings, including on test failure.

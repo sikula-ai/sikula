@@ -8,10 +8,33 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Superseded PR commits need no further validation; main runs stay independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: python -m ruff check .
+      - name: Format check
+        run: python -m ruff format --check .
+
   test:
+    needs: quality
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
@@ -26,7 +49,16 @@ jobs:
       - name: Compile check
         run: python3 -m compileall -q agents/ core/ sikula_cli/ tools/ sikula.py
       - name: Test
-        run: python3 -m pytest tests/ -v --cov=sikula --cov=agents --cov=core --cov=sikula_cli --cov=tools --cov-branch --cov-report=xml
+        if: matrix.python-version != '3.12'
+        run: >-
+          python -m pytest tests/ -v -n 2 --dist worksteal --durations=25
+          --junitxml="${{ runner.temp }}/test-results/linux-${{ matrix.python-version }}.xml"
+      - name: Test with coverage
+        if: matrix.python-version == '3.12'
+        run: >-
+          python -m pytest tests/ -v -n 2 --dist worksteal --durations=25
+          --cov=sikula --cov=agents --cov=core --cov=sikula_cli --cov=tools --cov-branch --cov-report=xml
+          --junitxml="${{ runner.temp }}/test-results/linux-${{ matrix.python-version }}.xml"
       - name: Upload coverage
         if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@v5
@@ -34,13 +66,20 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
           fail_ci_if_error: false
-      - name: Lint
-        run: python3 -m ruff check .
-      - name: Format check
-        run: python3 -m ruff format --check .
+      - name: Upload test timings and results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-linux-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/test-results/*.xml
 
-  windows-test:
+  windows-shard:
+    needs: quality
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,4 +92,24 @@ jobs:
       - name: Compile check
         run: python -m compileall -q agents/ core/ sikula_cli/ tools/ sikula.py
       - name: Test
-        run: python -m pytest tests/ -v -n 2 --dist worksteal --durations=25
+        run: >-
+          python -m pytest tests/ -v -n 2 --dist worksteal --durations=25
+          -p tests.ci_shard --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }}
+          --junitxml="${{ runner.temp }}/test-results/windows-${{ matrix.shard }}.xml"
+      - name: Upload test timings and results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-windows-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-results/*.xml
+
+  # Preserve the required check name, and fail if any shard failed or was skipped.
+  windows-test:
+    if: ${{ always() }}
+    needs: windows-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all Windows shards to pass
+        env:
+          SHARD_RESULT: ${{ needs.windows-shard.result }}
+        run: test "$SHARD_RESULT" = success
