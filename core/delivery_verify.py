@@ -690,7 +690,7 @@ def _execute_gate(
                 from core.delivery_reverification import CandidateReviewBoundsError, preflight_candidate_tree
 
                 try:
-                    preflight_candidate_tree(status, project_config, snapshot, worktree, source_task)
+                    preflight_candidate_tree(status, project_config, snapshot, worktree, source_task, record=running)
                 except CandidateReviewBoundsError:
                     return _review_blocked(running, validation, "delivery_verification.hierarchy_required")
                 except (OSError, ValueError):
@@ -1570,6 +1570,38 @@ def _bounded_full_review(
         semantic_fallback_covers_gaps,
     )
     from core.delivery_repair_storage import write_repair_state
+    from core.delivery_review_route import review_route
+
+    role = kwargs["kind"]
+    fallbacks = (running.reverification or {}).get("fallbacks", {})
+    if role in fallbacks:
+        if fallbacks[role] is None or (role == "semantic" and not semantic_fallback_covers_gaps(status, running)):
+            raise DeliveryIntegrationReviewAgentError(
+                "delivery_verification.reverification_budget_exhausted",
+                "The reserved fallback has no accepted result covering current child assessments.",
+                [],
+            )
+        return DeliveryIntegrationReviewResult(
+            load_full_result(status, running, role, scope=snapshot.scope), []
+        ), running
+    if not review_route(
+        snapshot.scope,
+        project_config,
+        kwargs["worktree"],
+        kwargs["source_task"],
+        role,
+        validation=kwargs["validation"].to_review_dict(
+            project_config,
+            project_root=kwargs["worktree"],
+            include_final_checks=snapshot.scope.node_id == "root",
+        ),
+        reviewer=reviewer,
+    ).full_available:
+        raise DeliveryIntegrationReviewAgentError(
+            "delivery_verification.hierarchy_required",
+            "This unresolved assessment requires full review, but its rendered packet exceeds supported bounds.",
+            [],
+        )
 
     if running.reverification is None and snapshot.candidate_route and snapshot.composition_scope is not None:
         from core.delivery_reverification import new_reverification
@@ -1584,20 +1616,7 @@ def _bounded_full_review(
     if running.reverification is None:
         return _run_review(reviewer, **kwargs), running
     kwargs["guard_attempts"] = True
-    role = kwargs["kind"]
     control = deepcopy(running.reverification)
-    if role in control["fallbacks"]:
-        if control["fallbacks"][role] is None or (
-            role == "semantic" and not semantic_fallback_covers_gaps(status, running)
-        ):
-            raise DeliveryIntegrationReviewAgentError(
-                "delivery_verification.reverification_budget_exhausted",
-                "The reserved fallback has no accepted result covering current child assessments.",
-                [],
-            )
-        return DeliveryIntegrationReviewResult(
-            load_full_result(status, running, role, scope=snapshot.scope), []
-        ), running
     control["fallbacks"][role] = None
     running = _save_reverification(status, snapshot, running, project_config, control)
     before = _review_snapshot(kwargs["worktree"], project_config)
@@ -1638,25 +1657,20 @@ def _composition_packet_fits(
     cfg: dict[str, Any],
     role: str,
 ) -> bool:
-    from core.delivery_verification import delivery_verification_prompt_is_bounded
+    from core.delivery_review_route import review_route
 
-    prompt_args = dict(
-        cwd=worktree,
-        review_kind=role,
-        source_task=source_task,
-        validation_summary=validation.to_review_dict(cfg, project_root=worktree),
-        candidate_commit=snapshot.identity.candidate_commit,
-        candidate_tree=snapshot.identity.candidate_tree,
-        known_obligation_ids=set(snapshot.scope.obligation_ids) if role == "semantic" else set(),
-    )
-    full_prompt = reviewer._prompt(plan_context=snapshot.scope.plan_context(), **prompt_args)
-    composed_prompt = reviewer._prompt(plan_context=context, **prompt_args)
-    # Include the real control template, rules, escaping and correction headroom.
-    return (
-        delivery_verification_prompt_is_bounded(full_prompt + " " * 512)
-        and delivery_verification_prompt_is_bounded(composed_prompt + " " * 512)
-        and len(composed_prompt.encode()) < len(full_prompt.encode())
-    )
+    return review_route(
+        snapshot.scope,
+        cfg,
+        worktree,
+        source_task,
+        role,
+        context=context,
+        validation=validation.to_review_dict(
+            cfg, project_root=worktree, include_final_checks=snapshot.scope.node_id == "root"
+        ),
+        reviewer=reviewer,
+    ).composition_available
 
 
 def _composition_exchange(

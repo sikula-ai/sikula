@@ -1408,8 +1408,8 @@ prompts and provider output remain private evidence.
 
 The final gate is mandatory after all work, including repairs. It covers
 cross-group and future obligations and approves only the exact final candidate.
-Adaptive insertion/regrouping, bounded subtree recovery without full fallback,
-rolling windows and plans beyond the bounded root packet remain later work.
+Adaptive insertion/regrouping, recovery after local budgets are exhausted, rolling
+windows and lifting global plan-capacity guards remain later work.
 
 **Shared node composition:** `core/delivery_composition_scope.py` captures one
 parent verification scope, its explicitly selected immediate children, exact
@@ -1438,8 +1438,9 @@ rejects children outside that scope. Typed closure construction checks each chil
 scope and execution inputs before resolving complete parent coverage privately.
 Only direct results and immediate child references enter the closure artifact;
 child-local descriptions, outcome lists and history do not enter compact parent
-prompts or response templates. Rendered preflight sizes the parent fallback and
-explicit immediate children, with final-only checks applied solely by adapter policy.
+prompts or response templates. Rendered preflight selects a bounded review route
+for the parent and explicit immediate children, with final-only checks applied solely
+by adapter policy.
 
 `core/delivery_reverification.py` owns the common finite composition/child-review/
 reassessment cycle. The delivery coordinator supplies the existing durable exchange,
@@ -1498,7 +1499,7 @@ constraints and immediate child references with checked integration context, cov
 hash/count, origin candidate and accepted evidence hash. Dependencies on child internals
 are represented by checkpoint IDs. Child contracts, internal obligation lists and
 internal accounting do not accumulate in the parent prompt. Both final reviewers use
-this packet, with independent decisions and full fallback for each role.
+this packet, with independent decisions and a conditional bounded fallback for each role.
 It includes complete project-relative changes since each child candidate within
 a shared 64 KiB delta budget (at most 32 changed paths per child), with a 128 KiB
 serialized context ceiling. With independent parent/child authority, oversized
@@ -1513,8 +1514,10 @@ explicitly disable submodule suppression; gitlink changes select full review
 before diff content is read because pointer changes are not complete dependency evidence.
 Individual review prompts retain the 512 KiB ceiling.
 Rendered prompts include rules, JSON escaping, response templates and correction
-headroom. Composition is chosen only when it is smaller than full review and the
-full fallback fits. These are supported-path bounds, not new plan-size limits.
+headroom. Composition is chosen when its packet fits and is smaller than full review.
+With independently checked retained/delegated authority it may also proceed when
+the expanded full review does not fit, provided every required child has a bounded
+route. These are supported-path bounds, not new plan-size limits.
 
 The same read-only semantic reviewer assesses direct obligations, retained authority
 completeness, cross-group integration and explicit `checkpoint_results`. Each
@@ -1549,7 +1552,8 @@ Before the first composition call, the captured running final-gate record durabl
 sets `composition_attempted` for semantic review or `security_composition_attempted`
 for security review. One initial exchange per role (at most two calls for format correction) is permitted
 for that unchanged gate across resume; an interrupted initial exchange without
-accepted evidence proceeds directly to the single reserved full fallback. A supported
+accepted evidence can use its single remaining full fallback if that packet fits;
+otherwise it stops with `hierarchy_required`. A supported
 uncertain result can additionally authorize one parent reassessment, as below. The read-only workspace boundary
 is checked before each composition call, including a format correction. After private
 audit succeeds and the candidate remains read-only, a content-addressed `composition-evidence-<sha>.json`
@@ -1604,7 +1608,7 @@ not satisfy the final gate's retained/global authority or cross-group integratio
 Required security establishes applicability independently.
 
 For each unchanged composing node the maximum is one initial composition, one parent
-reassessment and one full fallback per role. Each exchange permits at most two calls
+reassessment and at most one fitting full fallback per role. Each exchange permits at most two calls
 for format correction. Before entering a candidate node, its durable reservation
 charges the worst case of 12 calls, including both roles, even if less work is needed.
 The initiating gate and all recursively requested nodes share a maximum of 32 node
@@ -1647,20 +1651,49 @@ They are not accepted reviewer evidence and never appear in parent prompts.
 Composing children use this same recursive cycle; leaves receive scoped verification.
 Accepted exact-candidate results are shared across roles and resume. All child work
 charges existing node/subtree reservations, with no additional refresh allowance.
-Both roles' full fallback and prospective composed packets are sized before calls.
+Both roles' available full and prospective composed routes are sized before calls.
 A sizing-only preview substitutes bounded exact-child references; execution rebuilds
 the real parent packet from accepted child evidence and independently reviews retained
 authority and integration. Child gaps use the existing scoped repair/fallback paths;
 security, read-only and external boundary stops preempt parent work. Unusable or
 still-oversized packets retain the preflighted fallback or technical/budget stop.
-Global plan limits and mandatory full-fallback readiness are unchanged in this slice.
+Global plan limits remain unchanged; full review is conditional on packet capacity.
+
+**Conditional full fallback:** `core/delivery_review_route.py` measures full and
+compact routes separately for each role. Preparation uses a sizing-only exact-child
+preview restored from independently checked authority; it cannot predict later code
+changes or reviewer outcomes. Leaves and nodes without checked delegation must fit
+full scoped review. Every immediate child and required role must have a bounded
+route; the full source (128 KiB), serialized plan (256 KiB) and active-unit (256)
+guards remain in force.
+
+For completed candidates that need composition, readiness/dry-run inspects actual
+child evidence and deltas in a temporary preview checkout. Execution repeats this
+preflight in the candidate workspace before any provider call. Unsupported/private,
+binary or gitlink deltas require full review; missing immutable evidence remains an
+evidence stop. If the required packet cannot fit, `hierarchy_required` blocks work.
+No preview is approval and no evidence is truncated to make a route available.
+
+Eligible child and retained-parent gaps still use scoped repair and independent
+authority renewal. Repair preflight sizes the proposed renewed local packets before
+authoring or independent-review reservations; this private capacity preview cannot
+authorize publication. Global limits and other readiness errors are never deferred,
+and publication still requires every exact independent approval.
+Malformed or interrupted composition, incomplete findings and
+remaining uncertainty can use only an available, unspent full fallback. Its complete
+prompt is checked again before any durable fallback reservation. If it cannot fit,
+the unresolved assessment stops with `hierarchy_required`; consumed fallback budgets
+retain `reverification_budget_exhausted`. Neither route grants approval or resets
+reservations. Accepted results survive resume, and terminal security/read-only stops
+continue to preempt ordinary freshness and audit/control failures.
 
 A semantic rejection from a descendant requested by security also supersedes earlier
 semantic composition passes along the affected ancestor path. Immediate references
 retain a monotonic `semantic_gap` flag even when a descendant's local fallback later
 approves; no descendant history or finding list is copied into ancestors. Before continuing security or accepting the final gate,
 the coordinator routes an eligible leaf or retained parent finding to scoped candidate repair, or
-uses the remaining full semantic fallback and its normal repair outcome. Fallback
+uses an available full semantic fallback and its normal repair outcome. Without
+either route it stops; earlier semantic approval cannot close the detected gap. Fallback
 evidence binds the child rejections known at that review; an earlier fallback cannot
 cover a later rejection or receive a new budget. This
 requirement survives interruption and is checked by readiness and final evidence
@@ -1784,8 +1817,8 @@ Partial publication resume reconstructs those inputs against the original candid
 without reauthoring or repeating accepted review. Terminal security/read-only verdicts
 persist before audit failure can replace them. Authority renewal approves attribution
 only: affected consumer barriers, fresh semantic/security evidence, validation and
-the exact-candidate final gate remain mandatory. Full-fallback readiness and global
-capacity limits are unchanged.
+the exact-candidate final gate remain mandatory. Publication uses the same conditional
+review-route readiness; global capacity limits remain unchanged.
 
 Reservations precede calls and private prompt/output audit precedes acceptance.
 Child and fallback exchanges check the read-only boundary before format retries.
@@ -1799,8 +1832,8 @@ or advertise a successful resumable pause. This requires operator investigation 
 follow-up work, not an automatic budget reset. Candidate changes invalidate ordinary
 applicability; they do not reset logical-node repair budgets or terminal boundaries.
 
-Shared readiness sizes every declared node's semantic/security packet and full
-fallback, including actual templates, rules, JSON escaping and correction headroom.
+Shared readiness sizes every declared node's semantic/security routes, including
+actual templates, rules, JSON escaping and correction headroom.
 Sizing includes the possible executed and reused validation phase metadata, so reused
 root validation cannot underestimate a child that must execute its named checks.
 Execution traverses eligible descendants privately and checks their actual composed
@@ -1810,9 +1843,8 @@ Public status exposes only existing bounded candidate-evidence states: fresh chi
 evidence can show `reverified` while final integration remains pending. Neither
 control records, child internals, typed outcomes nor history enter parent prompts.
 Dry-run and finalization validate accepted references and exhausted reservations.
-Selective child re-review retains the current full-fallback and plan limits;
-bounded corrective work without full-subtree fallback and large-plan scaling remain
-subsequent work.
+Selective child re-review retains local packet and global plan limits. Broader
+unsupported-delta handling and lifting global capacity guards remain subsequent work.
 
 **Delivery final integration gate:** newly prepared root-only plans use schema version 2;
 plans with checkpoints use schema version 3. Both require `verification.mode: final_gate`.
@@ -1885,11 +1917,11 @@ feeds readiness, semantic review and required security review. Packet context en
 the checkpoint policy fingerprint and therefore typed evidence, handoff reuse and
 resume identity. Readiness includes escaped source/context, rules, security context,
 response templates and protocol/correction allowance. Terminal security/read-only
-stops and all retry/repair budgets are unchanged. The full-source fallback and current
-whole-plan limits still apply; recursive node review does not yet provide unbounded
-plan support. Failed composed semantic assessments outside eligible local candidate
-or retained parent recovery use full review before repair to retain complete
-obligation provenance. Changed repair ownership invalidates old attribution;
+stops and all retry/repair budgets are unchanged. Full-source fallback remains
+conditional on its packet fitting; current whole-plan limits still apply, so recursive
+node review does not yet provide unbounded plan support. Failed composed semantic
+assessments outside eligible local candidate or retained parent recovery require a
+fitting full review before repair to retain complete obligation provenance. Changed repair ownership invalidates old attribution;
 supported independent renewal restores compact authority, otherwise full authority
 remains required.
 

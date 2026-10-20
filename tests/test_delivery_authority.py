@@ -460,15 +460,22 @@ def test_actual_reviewer_calls_and_format_retry_share_the_scoped_packet(tmp_path
     assert all(len(prompt.encode()) <= readiness.packet_bytes for prompt in llm.calls)
 
 
-def test_escaped_authority_and_rules_are_bounded_before_calls(tmp_path):
+@pytest.mark.parametrize(("rule_repetitions", "expected_ready"), [(30000, True), (31000, False)])
+def test_escaped_authority_and_rules_are_bounded_before_calls(tmp_path, rule_repetitions, expected_ready):
+    from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+
     source = SOURCE.replace("Use the exact `CACHE_KEY` literal.", "Use `CACHE_KEY`. " + "\U0001f512" * 25000)
     _, cfg, checked, _, _, _ = _prepare(tmp_path, source)
-    (tmp_path / "review-rules.md").write_text("review " * 30000)
+    (tmp_path / "review-rules.md").write_text("review " * rule_repetitions)
     cfg["reviewer"] = {"extra_rules": "review-rules.md"}
     cfg["security_reviewer"] = {"extra_rules": "review-rules.md"}
     readiness = check_delivery_verification_readiness(checked, cfg, node_id="storage")
-    assert not readiness.ready
-    assert any(issue.code == "delivery_verification.hierarchy_required" for issue in readiness.errors)
+    # Bound each rendered role separately; the same rules are not sent twice in
+    # one prompt. Both sides include JSON escaping and format-correction room.
+    assert readiness.ready is expected_ready
+    assert (readiness.packet_bytes <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES) is expected_ready
+    if not expected_ready:
+        assert any(issue.code == "delivery_verification.hierarchy_required" for issue in readiness.errors)
 
 
 def test_missing_receipt_cannot_authorize_an_oversized_full_fallback(tmp_path):

@@ -23,6 +23,7 @@ from tests.delivery_fixtures import assemble_delivery_fixture
 from tests import test_delivery_nested_checkpoints as nested
 from tests.test_delivery_authority_flow import _run, _assessment
 from tests.test_delivery_checkpoints import _complete
+from tests.test_delivery_conditional_fallback import oversized_parent_fallback as oversized_parent_fallback
 from tests.test_delivery_repair import _LLM, _git
 
 
@@ -65,7 +66,7 @@ def _outputs(path, cfg, node):
 
 
 @pytest.mark.parametrize("node", ["integration", "root"])
-def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path, node):
+def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path, node, oversized_parent_fallback):
     path, cfg = _candidate(tmp_path, node)
     before = get_delivery_status(path)
     outputs = _outputs(path, cfg, node)
@@ -108,7 +109,7 @@ def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path
     assert finalized.finalized, finalized
 
 
-def test_refresh_resume_reuses_accepted_descendants(tmp_path):
+def test_refresh_resume_reuses_accepted_descendants(tmp_path, oversized_parent_fallback):
     from core import delivery_verify
 
     path, cfg = _candidate(tmp_path, "root")
@@ -134,7 +135,7 @@ def test_refresh_resume_reuses_accepted_descendants(tmp_path):
 
 
 @pytest.mark.parametrize("outcome", ["gap", "security", "readonly"])
-def test_refresh_preserves_child_repair_and_terminal_stops(tmp_path, outcome):
+def test_refresh_preserves_child_repair_and_terminal_stops(tmp_path, outcome, oversized_parent_fallback):
     from core.llm_client import LLMReadOnlyViolation
 
     path, cfg = _candidate(tmp_path, "integration")
@@ -173,3 +174,29 @@ def test_refresh_preserves_child_repair_and_terminal_stops(tmp_path, outcome):
         if outcome == "security":
             assert record.security_status == "rejected"
         assert "Private provider diagnostic" not in json.dumps(result.to_dict())
+
+
+def test_unsupported_candidate_is_blocked_before_verification_reservation(
+    tmp_path, monkeypatch, oversized_parent_fallback
+):
+    from tests import test_delivery_delta_refresh_flow as fixtures
+    from core.delivery_verification import check_delivery_verification_readiness
+
+    git = fixtures._git
+
+    def add_binary(root, *args):
+        if args == ("add", "agents/code.py"):
+            (root / "agents/data.bin").write_bytes(b"\0opaque dependency")
+            git(root, "add", "agents/data.bin")
+        return git(root, *args)
+
+    monkeypatch.setattr(fixtures, "_git", add_binary)
+    path, cfg = _candidate(tmp_path, "integration")
+    status = replace(get_delivery_status(path), verification_node="integration")
+    readiness = check_delivery_verification_readiness(status, cfg)
+    assert not readiness.ready
+    assert [issue.code for issue in readiness.errors] == ["delivery_verification.hierarchy_required"]
+    unused = _LLM()
+    result, _ = _run(path, cfg, unused, unused, node_id="integration")
+    assert not result.ready and not unused.calls
+    assert "integration" not in get_delivery_status(path).checkpoint_verifications

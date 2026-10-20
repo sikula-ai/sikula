@@ -494,19 +494,6 @@ def _coordinate(
         source_plan = Path(status.plan_path).read_bytes().decode("utf-8")
         if "sha256:" + sha256(source_plan.encode("utf-8")).hexdigest() != status.verification.plan_fingerprint:
             _stop("stale", "The delivery plan changed before repair preflight.")
-        appended = _appended_plan(
-            yaml.safe_load(source_plan),
-            unit,
-            [item.id for item in assessment.obligation_results if item.outcome != "satisfied"],
-            root,
-            cfg,
-            status.plan_path,
-            node_id=node_id,
-            accepted_checkpoints=frozenset(state["accepted_checkpoints"]),
-            completed_unit_ids=frozenset(item.id for item in status.units if item.status == "done")
-            if binding
-            else frozenset(),
-        )
         nodes = renewal_nodes(status.plan, node_id)
         if binding is None:
             from core.delivery_checkpoint_model import checkpoint_children
@@ -517,6 +504,20 @@ def _coordinate(
                 nodes = []
         if len(nodes) > 32:
             _stop("hierarchy_required", "Repair authority renewal exceeds the bounded node allowance.")
+        appended = _appended_plan(
+            yaml.safe_load(source_plan),
+            unit,
+            [item.id for item in assessment.obligation_results if item.outcome != "satisfied"],
+            root,
+            cfg,
+            status.plan_path,
+            node_id=node_id,
+            defer_packet_readiness=bool(nodes),
+            accepted_checkpoints=frozenset(state["accepted_checkpoints"]),
+            completed_unit_ids=frozenset(item.id for item in status.units if item.status == "done")
+            if binding
+            else frozenset(),
+        )
         if nodes:
             build_renewal(
                 {
@@ -1149,6 +1150,7 @@ def _prepared_plan(
         cfg,
         plan_path,
         node_id=state.get("node_id", "root"),
+        defer_packet_readiness=bool(state.get("authority_renewal")),
         accepted_checkpoints=frozenset(accepted_checkpoints),
         completed_unit_ids=frozenset(
             item["unit_id"] for item in state["completed_progress"]["units"] if item["status"] == "done"
@@ -1157,6 +1159,11 @@ def _prepared_plan(
         else frozenset(),
     )
 
+    renewal = state.get("authority_renewal")
+    if renewal and renewal["status"] != "accepted":
+        # These proposed packets prove capacity only; publication still requires
+        # the exact independent approvals checked by apply_accepted_renewal.
+        build_renewal(state, prepared, root, asset_root, cfg, plan_path)
     prepared = apply_accepted_renewal(state, prepared, root, asset_root, cfg, plan_path)
     if state.get("candidate_recovery") and state.get("reconciled_plan_fingerprint") not in {
         None,
@@ -1175,6 +1182,7 @@ def _appended_plan(
     plan_path: str,
     *,
     node_id: str = "root",
+    defer_packet_readiness: bool = False,
     accepted_checkpoints: frozenset[str] = frozenset(),
     completed_unit_ids: frozenset[str] = frozenset(),
 ) -> bytes:
@@ -1256,7 +1264,15 @@ def _appended_plan(
         _stop("plan_invalid", "The appended repair does not form a valid delivery plan.")
     plan_bytes = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode("utf-8")
     future = replace(check, plan_bytes=len(plan_bytes), plan_fingerprint="sha256:" + sha256(plan_bytes).hexdigest())
-    if not check_delivery_verification_readiness(future, cfg).ready:
+    readiness = check_delivery_verification_readiness(future, cfg)
+    if any(
+        not (
+            defer_packet_readiness
+            and issue.code == "delivery_verification.hierarchy_required"
+            and issue.path == "verification_packet"
+        )
+        for issue in readiness.errors
+    ):
         _stop("hierarchy_required", "The repaired plan cannot fit its final verification gate.")
     return plan_bytes
 
