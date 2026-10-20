@@ -110,7 +110,10 @@ Delivery-plan constraints:
   ordinary depends_on edges, not duplicate ownership. Place cross-child outcomes at their common
   parent and include them in every ancestor. Parent barriers must not block their descendants.
   Give each child a bounded integration_context describing its interface for its parent.
-  Keep each packet bounded (256 units, 512 KiB rendered prompt); the full root review must still fit.
+  Keep the plan within 256 active units and every rendered review packet within 512 KiB.
+  Independently checked retained authority and immediate-child interfaces may support bounded
+  composition without an expanded full-subtree fallback. Leaves still need a fitting full scoped
+  review. Keep each local packet complete for both roles; never omit authority just to fit a limit.
   Checkpoint validation never relaxes external prerequisite, security, ownership, or read-only stops.
 - constraints must explicitly list every hard source-task constraint that affects delivery, or be
   an empty list when the source task contains none. Do not omit the field.

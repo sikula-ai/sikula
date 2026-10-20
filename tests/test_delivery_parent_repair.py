@@ -15,6 +15,7 @@ from tests import test_delivery_nested_checkpoints as nested
 from tests.test_delivery_authority import _prepare
 from tests.test_delivery_authority_flow import _run
 from tests.test_delivery_checkpoints import _complete
+from tests.test_delivery_conditional_fallback import oversized_parent_fallback as oversized_parent_fallback
 from tests.test_delivery_repair import _LLM, _draft, _repair
 
 
@@ -58,7 +59,7 @@ def _context(path, cfg, node):
 
 
 @pytest.mark.parametrize("node", ["integration", "root"])
-def test_parent_composition_gap_publishes_bounded_repair_without_full_review(tmp_path, node):
+def test_parent_composition_gap_publishes_bounded_repair_without_full_review(tmp_path, node, oversized_parent_fallback):
     from core.delivery_repair import _read_state
     from core.delivery_finalize import finalize_delivery_plan
     from tests.test_delivery_candidate_repair import _verify_repaired_node
@@ -326,7 +327,7 @@ def test_parent_authoring_and_renewal_prompts_do_not_expand_descendant_contracts
     assert all(abs(a - b) < 128 for a, b in zip(*sizes)), sizes
 
 
-def test_security_requested_parent_gap_routes_to_its_own_repair_budget(tmp_path):
+def test_security_requested_parent_gap_routes_to_its_own_repair_budget(tmp_path, oversized_parent_fallback):
     from core.delivery_candidate_repair import CANDIDATE_REPAIR_REQUIRED
     from core.delivery_repair import _read_state
     from tests.test_delivery_repair import _git

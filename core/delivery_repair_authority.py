@@ -7,6 +7,7 @@ only matching durable independent approvals may install their receipts.
 from __future__ import annotations
 
 from dataclasses import replace
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,7 @@ def build_renewal(
             raise ValueError("Repair authority cannot inline private artifacts")
     relative = Path(plan_path).relative_to(root)
     plans = []
+    checks = []
     for data in (old_data, new_data):
         result = check_delivery_plan_data(
             data,
@@ -107,6 +109,7 @@ def build_renewal(
         )
         if not result.valid or result.plan is None:
             raise ValueError("Repair authority plan unavailable")
+        checks.append(result)
         plans.append(
             replace(
                 result.plan,
@@ -173,6 +176,13 @@ def build_renewal(
             if before["authority_packet"] != after["authority_packet"]:
                 raise ValueError("Repair changes retained source responsibility")
             receipts[key] = checkpoint_authority_receipt(after, new_hashes)
+            if node_id == "root":
+                new = replace(new, verified_final_gate_authority=json.dumps(after))
+            else:
+                new = replace(
+                    new,
+                    verified_composition_authority={**new.verified_composition_authority, node_id: json.dumps(after)},
+                )
         else:
             before, after = before_raw, after_raw
         direct = {unit["id"] for unit in after["units"]}
@@ -198,7 +208,41 @@ def build_renewal(
                 new_data[key] = receipt
             else:
                 new_data.setdefault(key, {})[node_id] = receipt
-    return packets, yaml.safe_dump(new_data, sort_keys=False, allow_unicode=True).encode("utf-8")
+    content = yaml.safe_dump(new_data, sort_keys=False, allow_unicode=True).encode("utf-8")
+    from core.delivery_verification import check_delivery_verification_readiness
+
+    # Prospective authority is used ONLY for sizing, never as an accepted plan.
+    # Unchanged nodes retain receipts validated from the candidate contracts;
+    # changed nodes still require the independent approvals below before publication.
+    checked = checks[-1]
+    sizing_plan = replace(
+        new,
+        verified_checkpoint_authority={
+            **checked.plan.verified_checkpoint_authority,
+            **new.verified_checkpoint_authority,
+        },
+        verified_composition_authority={
+            **checked.plan.verified_composition_authority,
+            **new.verified_composition_authority,
+        },
+        verified_final_gate_authority=new.verified_final_gate_authority or checked.plan.verified_final_gate_authority,
+    )
+    readiness = check_delivery_verification_readiness(
+        replace(
+            checked,
+            plan=sizing_plan,
+            plan_bytes=len(content),
+            plan_fingerprint="sha256:" + sha256(content).hexdigest(),
+        ),
+        cfg,
+    )
+    if not readiness.ready:
+        raise DeliveryRepairAuthoringError(
+            "delivery_repair.hierarchy_required"
+            if any(issue.code == "delivery_verification.hierarchy_required" for issue in readiness.errors)
+            else "delivery_repair.evidence_unavailable"
+        )
+    return packets, content
 
 
 def apply_accepted_renewal(

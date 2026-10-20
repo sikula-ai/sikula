@@ -322,7 +322,8 @@ including at the final gate, when all immediate-child evidence is applicable.
 Repair authoring uses retained requirements and child interfaces instead of expanding
 all descendant contracts. Changed parent authority is independently reviewed before
 publication; implementation still needs fresh verification. Unsupported findings and
-repeated uncertainty retain the bounded full-review fallback.
+repeated uncertainty use full review when it fits; otherwise verification stops
+without sending an oversized prompt or granting approval.
 Preparation can nest checkpoints using `parent_id`: a parent checks its own
 integration requirements and the evidence of its immediate children. `unit_ids`
 and `obligation_ids` describe the whole subtree; `depends_on` still orders unit
@@ -330,8 +331,9 @@ execution. Children pass before the parent releases its downstream consumers.
 Both reviewers use independently checked authority at each level, and accepted
 intermediate evidence survives interruption. Text and JSON identify a checkpoint's
 parent. Each checkpoint retains its own persistent repair budget.
-Large-plan scaling remains later work: candidate re-review and repair still
-require the conservative full-scope fallback to fit existing limits. When a composing
+A hierarchy with independently checked authority can proceed using bounded local
+packets even when its expanded full review is too large. Leaves still require full
+scoped review; global source, plan and unit limits remain. When a composing
 checkpoint needs fresh candidate evidence, verification can descend into the affected
 children and then reassess their parents. Semantic and security review share accepted
 child work while deciding applicability independently. Durable node reservations bound

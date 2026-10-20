@@ -912,14 +912,17 @@ python3 -m ruff format .
   evidence or delegated child gaps as parent-owned authority. Keep repair prompts
   bounded by retained authority and immediate-child interfaces, with full dependency,
   scope, asset and contract checks outside the prompt. Unsupported inputs and repeated
-  uncertainty retain preflighted full review. Keep new child evidence separate from historical admission. Candidate
+  uncertainty use full review only if its complete packet fits the remaining budget;
+  otherwise retain an unresolved typed stop. Keep new child evidence separate from historical admission. Candidate
   repair cannot refill logical-node budgets or rewrite completed consumers' execution
   dependencies; only the exact published repair can reconcile their history for
   fresh checkpoint verification, never authorize new consumer work or finalization.
   Reserve the entire finite cycle's work durably before calls, including child reviews, parent reassessment, format
   correction and fallback. Resume accepted results; never reconstruct missing
   evidence or repeat consumed exchanges to obtain approval. Preflight both roles'
-  rendered child and fallback packets before the first call. Security/read-only
+  complete local/child routes before the first call. Require full fallback only for
+  routes that need it, and size it before reserving an exchange. Leaves and nodes
+  without independently checked delegation still require full scoped review. Security/read-only
   boundaries survive audit failure and candidate changes. Never refill repair
   budgets or discard a terminal boundary to obtain a reusable result.
 - **Always** distinguish a completely inspected oversized textual checkpoint delta
@@ -928,8 +931,8 @@ python3 -m ruff format .
   parent composition. Persist candidate-bound refresh prerequisites and provider
   reservations separately from accepted reviewer decisions, using existing budgets.
   Rebuild parent packets from accepted child results; a sizing preview, truncated
-  diff or child pass cannot approve parent integration. Keep full-fallback readiness
-  and terminal boundary handling intact.
+  diff or child pass cannot approve parent integration. Require a supported bounded route for both roles and all required children;
+  keep terminal boundary handling intact.
 - **Always** drive shared composition, accepted evidence selection and packet
   preflight from a captured parent scope and explicit immediate children. Keep
   plan hierarchy selection, final-only validation and finalization in the delivery

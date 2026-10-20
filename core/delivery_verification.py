@@ -361,14 +361,8 @@ def check_delivery_verification_readiness(
         + control_object_bytes
         + _DELIVERY_VERIFICATION_PROMPT_OVERHEAD_BYTES
     )
-    if packet_bytes > MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
-        errors.append(
-            DeliveryPlanIssue(
-                "error",
-                "delivery_verification.hierarchy_required",
-                "The verification packet exceeds the bounded final-gate limit; hierarchical verification is required.",
-            )
-        )
+    composition_scope = delivery_composition_scope(plan, scope) if scope is not None else None
+    scoped_composition = composition_scope is not None and composition_scope.retained_authority_json is not None
 
     build_tool = str(project_config.get("project", {}).get("build_tool") or "gradle-android")
     if build_tool not in _SUPPORTED_BUILD_TOOLS:
@@ -415,18 +409,49 @@ def check_delivery_verification_readiness(
             checkpoint_readiness = check_delivery_verification_readiness(status, project_config, node_id=checkpoint.id)
             errors.extend(issue for issue in checkpoint_readiness.errors if issue not in errors)
 
-    composition_scope = delivery_composition_scope(plan, scope) if scope is not None and not errors else None
-    if composition_scope is not None and composition_scope.retained_authority_json:
-        from core.delivery_reverification import preflight_node_review_packets
+    if scope is not None and not errors:
+        from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgentError
+        from core.delivery_reverification import CandidateReviewBoundsError, preflight_node_review_packets
+        from core.delivery_review_route import review_route
 
         try:
-            preflight_node_review_packets(composition_scope, project_config, root, source_text)
-        except (OSError, ValueError):
+            if scoped_composition:
+                packet_bytes, conditional = preflight_node_review_packets(
+                    composition_scope, project_config, root, source_text, plan=plan
+                )
+                if (
+                    conditional
+                    and isinstance(status, DeliveryStatusResult)
+                    and scope.node_id == status.verification_node
+                ):
+                    issue = _conditional_candidate_route_issue(status, project_config, source_text)
+                    if issue:
+                        errors.append(issue)
+            else:
+                routes = [
+                    review_route(scope, project_config, root, source_text, role)
+                    for role in (("semantic", "security") if security_required else ("semantic",))
+                ]
+                packet_bytes = max(route.full_bytes for route in routes)
+                if not all(route.full_available for route in routes):
+                    raise CandidateReviewBoundsError("The rendered verification packet exceeds supported bounds.")
+        except DeliveryIntegrationReviewAgentError as exc:
+            errors.append(DeliveryPlanIssue("error", exc.code, exc.message))
+        except CandidateReviewBoundsError:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
                     "delivery_verification.hierarchy_required",
-                    "The rendered candidate review or fallback exceeds supported packet bounds.",
+                    "No complete bounded verification route is available for this node or its immediate children.",
+                    "verification_packet",
+                )
+            )
+        except (OSError, ValueError):
+            errors.append(
+                DeliveryPlanIssue(
+                    "error",
+                    "delivery_verification.evidence_unavailable",
+                    "Required review authority is unavailable.",
                 )
             )
 
@@ -441,6 +466,57 @@ def check_delivery_verification_readiness(
         errors=errors,
         warnings=warnings,
     )
+
+
+def _conditional_candidate_route_issue(status, cfg, source: str) -> DeliveryPlanIssue | None:
+    """Inspect available candidate routes for dry-run without modifying its repository."""
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgentError
+    from core.delivery_checkpoints import verification_scope_complete
+    from core.delivery_reverification import CandidateReviewBoundsError, preflight_candidate_tree
+    from core.delivery_verification_model import delivery_verification_is_boundary_stop
+    from core.worktree import detached_delivery_verification_worktree
+
+    if status.assembly_status != "ready" or not status.assembled_commit or not verification_scope_complete(status):
+        return None
+    scope = delivery_composition_scope(
+        status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
+    )
+    if scope is None or any(
+        not (
+            status.checkpoint_verifications.get(child.node_id) and status.checkpoint_verifications[child.node_id].passed
+        )
+        for child in scope.children
+    ):
+        # The ordinary checkpoint barrier reports missing admission first.
+        return None
+    record = status.verification
+    if record is not None and delivery_verification_is_boundary_stop(record):
+        return None
+    try:
+        snapshot = build_delivery_verification_snapshot(status, cfg, candidate_commit=status.assembled_commit)
+        if record is not None and record.gate_id == snapshot.identity.gate_id and (record.passed or record.stop_code):
+            # Current accepted evidence and recovery have their own validation.
+            # A stale ordinary record cannot bypass checks on the new candidate.
+            return None
+        with detached_delivery_verification_worktree(
+            Path(status.project_root), status.assembled_commit, preview=True
+        ) as cwd:
+            preflight_candidate_tree(status, cfg, snapshot, cwd, source)
+    except CandidateReviewBoundsError:
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.hierarchy_required",
+            "The current candidate requires a review packet outside supported bounds.",
+        )
+    except DeliveryIntegrationReviewAgentError as exc:
+        return DeliveryPlanIssue("error", exc.code, exc.message)
+    except (OSError, RuntimeError, ValueError):
+        return DeliveryPlanIssue(
+            "error",
+            "delivery_verification.evidence_unavailable",
+            "Required candidate review evidence is unavailable.",
+        )
+    return None
 
 
 def with_delivery_verification_readiness(

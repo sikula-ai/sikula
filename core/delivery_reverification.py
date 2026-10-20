@@ -381,86 +381,94 @@ def load_full_result(
 
 
 def preflight_node_review_packets(
-    composition_scope: DeliveryCompositionScope, cfg: dict[str, Any], cwd: Path, source: str
-) -> None:
-    """A parent's fallback and immediate children only; never discover descendants."""
-    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
-    from core.delivery_verification import delivery_verification_prompt_is_bounded
+    composition_scope: DeliveryCompositionScope, cfg: dict[str, Any], cwd: Path, source: str, *, plan=None
+) -> tuple[int, bool]:
+    """Size local routes, not mandatory expanded fallback for composing children."""
+    from core.delivery_review_route import preview_composition_context, review_route
     from core.delivery_verification_validation import preview_delivery_validation_summary
 
-    reviewer = DeliveryIntegrationReviewAgent(None, cfg)
+    parent_bytes = 0
+    conditional = False
     for scope in (composition_scope.parent, *composition_scope.children):
+        local = (
+            composition_scope
+            if scope is composition_scope.parent
+            else delivery_composition_scope(plan, scope)
+            if plan is not None
+            else None
+        )
         validation = preview_delivery_validation_summary(
             cfg,
             project_root=cwd,
             include_final_checks=composition_scope.include_final_checks and scope is composition_scope.parent,
         )
         for role in ("semantic", "security") if scope.security_required else ("semantic",):
-            prompt = reviewer._prompt(
-                cwd=cwd,
-                review_kind=role,
-                source_task=source,
-                plan_context=scope.plan_context(),
-                validation_summary=validation,
-                candidate_commit="0" * 64,
-                candidate_tree="0" * 64,
-                known_obligation_ids=set(scope.obligation_ids) if role == "semantic" else set(),
+            route = review_route(
+                scope,
+                cfg,
+                cwd,
+                source,
+                role,
+                context=preview_composition_context(local, role),
+                validation=validation,
             )
-            if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
-                raise CandidateReviewBoundsError("Candidate re-verification packet exceeds the prompt limit.")
+            if not route.ready:
+                raise CandidateReviewBoundsError("No bounded candidate review route is available.")
+            conditional = conditional or not route.full_available
+            if scope is composition_scope.parent:
+                parent_bytes = max(parent_bytes, route.packet_bytes)
+    return parent_bytes, conditional
 
 
 def preflight_candidate_tree(
-    status: DeliveryStatusResult, cfg: dict[str, Any], snapshot: DeliveryVerificationSnapshot, cwd: Path, source: str
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any],
+    snapshot: DeliveryVerificationSnapshot,
+    cwd: Path,
+    source: str,
+    *,
+    record: DeliveryVerificationRecord | None = None,
 ) -> None:
-    """Size possible node exchanges privately, never flatten them into a prompt."""
-    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
+    """Check both roles and all possible child routes before reserving any calls."""
     from core.delivery_composition import CompositionRefresh, build_composition_context
-    from core.delivery_verification import build_delivery_verification_snapshot, delivery_verification_prompt_is_bounded
-    from core.delivery_verification_validation import preview_delivery_validation_summary
+    from core.delivery_review_route import review_route
+    from core.delivery_verification import build_delivery_verification_snapshot
 
-    pending = [snapshot]
+    from core.delivery_candidate_control import expanded_child
+
+    record = record or status.verification
+    if record is not None and record.gate_id != snapshot.identity.gate_id:
+        record = None
+    pending = [(snapshot, record)]
     seen = set()
-    reviewer = DeliveryIntegrationReviewAgent(None, cfg)
     while pending:
-        current = pending.pop()
+        current, record = pending.pop()
         node = current.scope.node_id
         if node in seen or len(seen) >= 257:
             raise CandidateReviewBoundsError("Invalid candidate preflight hierarchy.")
         seen.add(node)
         scope = current.composition_scope
-        if scope is None:
-            continue
-        preflight_node_review_packets(scope, cfg, cwd, source)
         for role in ("semantic", "security") if current.scope.security_required else ("semantic",):
-            context = build_composition_context(status, current, cfg, review_kind=role)
-            if context is None:
-                continue
+            context = (
+                build_composition_context(status, current, cfg, review_kind=role, record=record) if scope else None
+            )
             if isinstance(context, CompositionRefresh):
                 context = context.preview_context
-            prompt = reviewer._prompt(
-                cwd=cwd,
-                review_kind=role,
-                source_task=source,
-                plan_context=context,
-                validation_summary=preview_delivery_validation_summary(
-                    cfg, project_root=cwd, include_final_checks=node == "root"
-                ),
-                candidate_commit=current.identity.candidate_commit,
-                candidate_tree=current.identity.candidate_tree,
-                known_obligation_ids=set(current.scope.obligation_ids) if role == "semantic" else set(),
-            )
-            if not delivery_verification_prompt_is_bounded(prompt + " " * 4096):
-                raise CandidateReviewBoundsError("Candidate composition packet exceeds the prompt limit.")
-        if scope.retained_authority_json:
-            pending.extend(
-                build_delivery_verification_snapshot(
+            route = review_route(current.scope, cfg, cwd, source, role, context=context)
+            if not route.ready:
+                raise CandidateReviewBoundsError("No bounded candidate review route is available.")
+        if scope and scope.retained_authority_json:
+            for child in scope.children:
+                child_snapshot = build_delivery_verification_snapshot(
                     replace(status, verification_node=child.node_id),
                     cfg,
                     candidate_commit=snapshot.identity.candidate_commit,
                 )
-                for child in scope.children
-            )
+                entry = (record.reverification or {}).get("children", {}).get(child.node_id) if record else None
+                child_record = expanded_child(status, entry) if entry else None
+                if child_record is not None:
+                    child_snapshot = candidate_snapshot(status, cfg, record, child.node_id)
+                pending.append((child_snapshot, child_record))
 
 
 class SemanticRecheckRequired(RuntimeError):

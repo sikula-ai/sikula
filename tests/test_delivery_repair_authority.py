@@ -14,6 +14,7 @@ from agents.delivery_repair_authority_agent import (
 )
 from agents.delivery_repair_agent import DeliveryRepairAuthoringError
 from core.delivery_repair_authority import build_renewal, apply_accepted_renewal, renewal_nodes
+from tests.test_delivery_conditional_fallback import oversized_parent_fallback as oversized_parent_fallback
 from tests.test_delivery_nested_checkpoints import _prepared
 
 
@@ -85,7 +86,7 @@ def proposal(tmp_path, request):
     return path, cfg, state, data
 
 
-def test_renewal_requires_independent_exact_approvals_and_restores_all_receipts(proposal):
+def test_renewal_requires_independent_exact_approvals_and_restores_all_receipts(proposal, oversized_parent_fallback):
     from core.delivery_plan import check_delivery_plan_file
 
     path, cfg, state, data = proposal
@@ -115,6 +116,17 @@ def test_renewal_requires_independent_exact_approvals_and_restores_all_receipts(
     assert set(checked.plan.verified_checkpoint_authority) == {"storage", "integration"}
     assert set(checked.plan.verified_composition_authority) == {"integration"}
     assert checked.plan.verified_final_gate_authority
+
+
+def test_renewal_capacity_preview_cannot_approve_an_oversized_leaf(proposal, monkeypatch):
+    path, cfg, state, data = proposal
+    root = Path(cfg["project"]["root_path"])
+    original = deepcopy(state)
+    monkeypatch.setattr("core.delivery_verification.MAX_DELIVERY_VERIFICATION_PACKET_BYTES", 1)
+    with pytest.raises(DeliveryRepairAuthoringError) as error:
+        build_renewal(state, data, root, root, cfg, str(path))
+    assert error.value.code == "delivery_repair.hierarchy_required"
+    assert state == original and not state["authority_renewal"]["reviews"]
 
 
 @pytest.mark.parametrize("change", ["fingerprint", "fields", "duplicate", "surrogate", "oversized"])

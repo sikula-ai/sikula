@@ -691,21 +691,23 @@ boundaries remain stops. Full-review findings also feed bounded repair.
 Historical admission records and already completed units remain unchanged.
 
 The composed path supports up to eight nonoverlapping checkpoints and 32 direct
-units, within fixed context and change budgets. Other shapes use full review;
-these bounds do not reject otherwise supported plans. Required security review
+units, within fixed context and change budgets. Other shapes use full review when its rendered packet fits;
+otherwise verification reports `delivery_verification.hierarchy_required`. Required security review
 and final validation still cover the current candidate. With separately approved
 final responsibility and accepted child security evidence, the security reviewer
 makes its own compact applicability assessment. It can request targeted checkpoint
-review too; remaining uncertainty uses full security review. Confirmed security
+review too; remaining uncertainty uses full security review only within its packet
+limit. Without a supported bounded route, verification stops without approval. Confirmed security
 rejection remains a stop. Semantic approval cannot replace security.
 A later repair owner outside a checkpoint makes its obligation direct again and
 invalidates compact final attribution.
 For unchanged candidate/policy, each reviewer gets one initial composition exchange,
-one parent reassessment after targeted checks, and one full fallback. Each requested
+one parent reassessment after targeted checks, and at most one fitting full fallback. Each requested
 checkpoint is reviewed at most once, with both required roles. Every exchange allows
 at most two calls for format correction; reservations survive interruption.
 Resume reuses accepted decisions, child evidence and fallback results. A consumed
-exchange without a result uses the remaining fallback; an interrupted fallback with
+exchange without a result uses the remaining fitting fallback, or stops with
+`delivery_verification.hierarchy_required` if full review is too large; an interrupted fallback with
 no accepted result stops with `delivery_verification.reverification_budget_exhausted`.
 Further automatic calls require investigation or follow-up work, not a budget reset.
 All referenced evidence remains private and must be intact, including original
@@ -752,9 +754,12 @@ consuming another attempt. Resolving that topology requires a follow-up plan.
 Plans without checkpoints retain their prior one-repair behavior.
 
 Nested composition and selective candidate review use bounded per-node contexts.
-The full-review fallback must still fit its existing limits (including 256 active
-units). Broader corrective decomposition, adaptive regrouping and large-plan scaling
-remain subsequent work.
+Independently checked local authority can support verification without a fitting
+expanded fallback. Leaves still require a bounded full scoped review. Known
+unsupported candidate representations block before review if full review cannot fit;
+missing evidence and terminal stops cannot be bypassed. Whole-source, plan-file and
+256-active-unit guards remain. Broader corrective decomposition, adaptive regrouping
+and lifting these global capacity guards remain subsequent work.
 
 
 ## Current MVP Commands
