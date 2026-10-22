@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 import json
 from json import JSONDecodeError
@@ -8,6 +9,7 @@ import re
 from typing import Any
 import unicodedata
 
+from core.delivery_authoring_diagnostics import PUBLIC_AUTHORING_ERROR_CODES
 from core.delivery_checkpoint_model import DeliveryCheckpoint, DeliveryCheckpointError, parse_delivery_checkpoints
 from core.delivery_unit_metadata import (
     DEFAULT_DELIVERY_UNIT_MAX_PLANNER_STEPS,
@@ -31,7 +33,12 @@ from core.delivery_obligations import (
     MAX_DELIVERY_OBLIGATION_UNIT_IDS,
     delivery_authority_fragment_map,
 )
-from core.delivery_source_accounting import DeliverySourceAccounting, SourceAccountingError, parse_source_accounting
+from core.delivery_source_accounting import (
+    DeliverySourceAccounting,
+    SourceAccountingError,
+    SourceAccountingProtocolError,
+    parse_source_accounting,
+)
 from core.delivery_public_metadata import contains_delivery_source_excerpt, is_safe_delivery_public_metadata
 from core.markdown_headings import MarkdownHeading, MarkdownHeadingScanner, normalize_heading
 from core.structured_output import load_schema_json_object
@@ -397,11 +404,132 @@ class DeliveryAssessmentDraft:
 class DeliveryAuthoringParseError(ValueError):
     code: str
     message: str
+    phase: str | None = None
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class DeliveryAuthoringProtocolError(DeliveryAuthoringParseError):
+    """Malformed JSON/envelope or unsupported fields, rather than changed authority."""
+
+
+def public_delivery_preparation_failure(error: BaseException) -> tuple[str, str] | None:
+    """Expose only a known phase, fixed code, and fixed description."""
+    phase = getattr(error, "phase", None)
+    if not isinstance(phase, str) or phase not in {
+        "delivery_prepare_authoring",
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_draft_recovery",
+        "delivery_prepare_constraint_repair",
+        "delivery_prepare_obligation_repair",
+    }:
+        return None
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or code not in PUBLIC_AUTHORING_ERROR_CODES:
+        code = "delivery_prepare.output_invalid"
+    reasons = {
+        "delivery_authoring.unknown_field": "Response contains an unsupported JSON field.",
+        "source_accounting.invalid": "Source accounting has an invalid structure.",
+        "delivery_obligation_repair.existing_changed": "An existing obligation is missing, duplicated, or changed.",
+        "delivery_constraint_repair.existing_constraint_changed": "An existing constraint is missing, duplicated, or changed.",
+        "delivery_obligation_repair.assignment_invalid": "Unauthorized obligation ownership change.",
+        "delivery_constraint_repair.assignment_invalid": "Unauthorized constraint ownership change.",
+        "delivery_prepare.recovery_scope_changed": "Draft correction changed unrelated metadata or authority.",
+    }
+    reason = reasons.get(code, "Preparation failed the required contract.")
+    return code, f"Phase: {phase}. {reason} See local audit artifacts for details."
+
+
+def delivery_verification_gap_contract() -> dict[str, Any]:
+    """Prompt-facing closed gap shapes use the parser's own field vocabulary."""
+    result = {}
+    for name, fields, identity in (
+        ("constraint_gaps", _CONSTRAINT_GAP_FIELDS, "constraint_id"),
+        ("obligation_gaps", _OBLIGATION_GAP_FIELDS, "obligation_id"),
+    ):
+        values = {
+            "reason": "omitted",
+            "kind": "repository_ownership",
+            "summary": "Bounded paraphrase of the missing requirement",
+            "source_fragment_ids": ["exact-supplied-fragment-id"],
+            "affected_unit_ids": ["exact-supplied-unit-id"],
+        }
+        omitted = {key: values[key] for key in sorted(fields - {identity})}
+        result[name] = {
+            "allowed_fields": sorted(fields),
+            "omitted_example": omitted,
+            "incompletely_assigned_example": {
+                **omitted,
+                "reason": "incompletely_assigned",
+                identity: "exact-supplied-id",
+                "summary": "Exact supplied summary",
+            },
+        }
+    return result
+
+
+def _is_prerequisite_stop_kind(value: Any) -> bool:
+    """Match kind values with the same whitespace normalization as _require_string."""
+    return isinstance(value, str) and value.strip() == "stop_and_follow_up"
+
+
+def delivery_output_has_prerequisite_stop(output: str) -> bool:
+    """A recognizable prerequisite stop must preempt even a protocol retry.
+
+    Scan the entire response independently of schema extraction, which may select
+    one object and ignore a separate partial object containing a stop finding.
+    Scan strings as whole tokens so a quoted example inside a summary is not a
+    finding. A complete kind/value pair in an object is enough to suppress retry,
+    even if the object is truncated, has trailing commas, or shares an envelope.
+    This never approves output or relaxes parsing; it can only suppress another call.
+    """
+    if not isinstance(output, str):
+        return False
+    previous: list[str] = []
+    for match in re.finditer(r'"(?:\\.|[^"\\])*"|[^\s]', output):
+        token = match.group()
+        if (
+            len(previous) == 3
+            and previous[0] in {"{", ","}
+            and previous[1].startswith('"')
+            and previous[2] == ":"
+            and token.startswith('"')
+        ):
+            try:
+                if json.loads(previous[1]) == "kind" and _is_prerequisite_stop_kind(json.loads(token)):
+                    return True
+            except ValueError:
+                pass
+        previous = [*previous[-2:], token]
+    return False
+
+
+def _assert_verification_authority(
+    verification: DeliveryConstraintVerification,
+    *,
+    constraints: Sequence[DeliveryAuthoringConstraintDraft] | None,
+    obligations: Sequence[DeliveryAuthoringObligationDraft] | None,
+) -> None:
+    """Check normalized authority before any deferred protocol error can permit retry."""
+    if constraints is not None:
+        expected = [(item.id, item.kind, item.summary, item.unit_ids) for item in constraints]
+        actual = [(item.id, item.kind, item.summary, item.unit_ids) for item in verification.constraints]
+        if actual != expected:
+            raise DeliveryAuthoringParseError(
+                "delivery_constraint_verification.constraints_mismatch",
+                "Constraint verification must echo every supplied constraint exactly and in order.",
+            )
+    if obligations is not None:
+        expected = [(item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in obligations]
+        actual = [(item.id, item.summary, item.source_fragment_ids, item.unit_ids) for item in verification.obligations]
+        if actual != expected:
+            raise DeliveryAuthoringParseError(
+                "delivery_obligation_verification.obligations_mismatch",
+                "Obligation verification must echo every supplied obligation exactly and in order.",
+            )
 
 
 def parse_delivery_assessment_output(output: str) -> DeliveryAssessmentDraft:
@@ -528,21 +656,30 @@ def parse_delivery_constraint_verification_output(
     require_obligations: bool = False,
     known_obligation_source_fragment_ids: set[str] | None = None,
     hierarchical: bool = False,
+    expected_constraints: Sequence[DeliveryAuthoringConstraintDraft] | None = None,
+    expected_obligations: Sequence[DeliveryAuthoringObligationDraft] | None = None,
+    expected_source_accounting: Sequence[DeliverySourceAccounting] | None = None,
 ) -> DeliveryConstraintVerification:
     data = _parse_output_object(output, schema_keys=_CONSTRAINT_VERIFICATION_SCHEMA_KEYS)
-    _reject_unknown_fields(data, _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS, "constraint verification")
+    # Unsupported fields are remembered, never discarded or accepted. Validate all
+    # readable semantics and supplied authority before raising a retryable error.
+    protocol_errors: list[DeliveryAuthoringProtocolError] = []
+    _reject_unknown_fields(
+        data, _CONSTRAINT_VERIFICATION_TOP_LEVEL_FIELDS, "constraint verification", protocol_errors=protocol_errors
+    )
     constraints_complete = data.get("constraints_complete")
     if type(constraints_complete) is not bool:
         raise DeliveryAuthoringParseError(
             "delivery_constraint_verification.complete_invalid",
             "constraints_complete must be a boolean.",
         )
-    constraints = _parse_constraints(data, unit_ids=unit_ids)
+    constraints = _parse_constraints(data, unit_ids=unit_ids, protocol_errors=protocol_errors)
     constraint_gaps = _parse_constraint_gaps(
         data.get("constraint_gaps", []),
         constraints=constraints,
         unit_ids=unit_ids,
         source_task_description=source_task_description,
+        protocol_errors=protocol_errors,
     )
     if constraints_complete and constraint_gaps:
         raise DeliveryAuthoringParseError(
@@ -567,6 +704,7 @@ def parse_delivery_constraint_verification_output(
         unit_ids=unit_ids,
         source_task_description=source_task_description,
         unit_task_markdown_by_id=unit_task_markdown_by_id,
+        protocol_errors=protocol_errors,
     )
     if unit_context_complete and unit_context_gaps:
         raise DeliveryAuthoringParseError(
@@ -592,6 +730,7 @@ def parse_delivery_constraint_verification_output(
         source_task_description=(None if known_obligation_source_fragment_ids is not None else source_task_description),
         required=require_obligations,
         known_source_fragment_ids=known_obligation_source_fragment_ids,
+        protocol_errors=protocol_errors,
     )
     obligation_gaps = _parse_obligation_gaps(
         data.get("obligation_gaps", []),
@@ -599,6 +738,7 @@ def parse_delivery_constraint_verification_output(
         unit_ids=unit_ids,
         source_task_description=(None if known_obligation_source_fragment_ids is not None else source_task_description),
         known_source_fragment_ids=known_obligation_source_fragment_ids,
+        protocol_errors=protocol_errors,
     )
     if obligations_complete and obligation_gaps:
         raise DeliveryAuthoringParseError(
@@ -620,7 +760,7 @@ def parse_delivery_constraint_verification_output(
         raise DeliveryAuthoringParseError(
             "source_accounting.checkpoint_invalid", "Checkpoint authority completeness must be a boolean."
         )
-    return DeliveryConstraintVerification(
+    verification = DeliveryConstraintVerification(
         final_gate_authority_complete=final_gate_authority_complete,
         checkpoint_authority_complete=checkpoint_authority_complete,
         constraints_complete=constraints_complete,
@@ -631,24 +771,41 @@ def parse_delivery_constraint_verification_output(
         obligations_complete=obligations_complete,
         obligations=obligations,
         obligation_gaps=obligation_gaps,
-        source_accounting=_parse_source_accounting(
-            data,
-            source_task_description,
-            obligations,
-            constraints,
-            required=require_source_accounting,
-            hierarchical=hierarchical,
-        )
-        if require_source_accounting or data.get("source_accounting")
-        else None,
         source_accounting_gaps=_parse_authority_gaps(
             data.get("source_accounting_gaps", []),
             "source_fragment_id",
             set(delivery_authority_fragment_map(source_task_description or "")),
+            protocol_errors=protocol_errors,
         ),
-        unit_contract_gaps=_parse_authority_gaps(data.get("unit_contract_gaps", []), "unit_id", unit_ids),
+        unit_contract_gaps=_parse_authority_gaps(
+            data.get("unit_contract_gaps", []), "unit_id", unit_ids, protocol_errors=protocol_errors
+        ),
         context_paths=_parse_context_paths(data.get("context_paths", [])),
     )
+    _assert_verification_authority(
+        verification,
+        constraints=expected_constraints,
+        obligations=expected_obligations,
+    )
+    # Accounting can have an unreadable envelope. Its format errors must not
+    # preempt checks of independently readable gap records and authority echoes.
+    if require_source_accounting or expected_source_accounting is not None or data.get("source_accounting"):
+        verification = replace(
+            verification,
+            source_accounting=_parse_source_accounting(
+                data,
+                source_task_description,
+                obligations,
+                constraints,
+                required=require_source_accounting or expected_source_accounting is not None,
+                hierarchical=hierarchical,
+                protocol_errors=protocol_errors,
+                expected_records=expected_source_accounting,
+            ),
+        )
+    if protocol_errors:
+        raise protocol_errors[0]
+    return verification
 
 
 def _parse_source_accounting(
@@ -659,17 +816,20 @@ def _parse_source_accounting(
     *,
     required: bool,
     hierarchical: bool = False,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
+    expected_records: Sequence[DeliverySourceAccounting] | None = None,
 ) -> list[DeliverySourceAccounting] | None:
     gaps = data.get("constraint_gaps", [])
     if any(item.kind == "stop_and_follow_up" for item in constraints) or (
         isinstance(gaps, list)
-        and any(isinstance(gap, dict) and gap.get("kind") == "stop_and_follow_up" for gap in gaps)
+        and any(isinstance(gap, dict) and _is_prerequisite_stop_kind(gap.get("kind")) for gap in gaps)
     ):
         return None  # A known prerequisite stop preempts further authoring work.
     if "source_accounting" not in data and not required:
         return None
+    accounting_protocol_errors: list[SourceAccountingProtocolError] = []
     try:
-        return parse_source_accounting(
+        records = parse_source_accounting(
             data.get("source_accounting"),
             fragment_ids=set(delivery_authority_fragment_map(source or "")),
             obligation_sources={item.id: set(item.source_fragment_ids) for item in obligations},
@@ -677,18 +837,34 @@ def _parse_source_accounting(
             private_rationales=True,
             hierarchical=hierarchical,
             allow_unresolved=True,
+            protocol_errors=accounting_protocol_errors if protocol_errors is not None else None,
+            expected_records=expected_records,
         )
     except SourceAccountingError as exc:
-        raise DeliveryAuthoringParseError(exc.code, str(exc)) from None
+        error_type = (
+            DeliveryAuthoringProtocolError
+            if isinstance(exc, SourceAccountingProtocolError)
+            else DeliveryAuthoringParseError
+        )
+        raise error_type(exc.code, str(exc)) from None
+    if protocol_errors is not None:
+        protocol_errors.extend(DeliveryAuthoringProtocolError(exc.code, str(exc)) for exc in accounting_protocol_errors)
+    return records
 
 
-def _parse_authority_gaps(value: Any, identity_key: str, allowed: set[str]) -> list[dict[str, str]]:
+def _parse_authority_gaps(
+    value: Any,
+    identity_key: str,
+    allowed: set[str],
+    *,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
+) -> list[dict[str, str]]:
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
         raise DeliveryAuthoringParseError("delivery_authority.gaps_invalid", "Authority gaps must be a bounded list.")
     gaps = []
     seen = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {identity_key, "summary"}:
+        if not isinstance(item, dict) or not {identity_key, "summary"}.issubset(item):
             raise DeliveryAuthoringParseError("delivery_authority.gaps_invalid", "Authority gap fields are invalid.")
         identity = item[identity_key]
         summary = item["summary"]
@@ -704,6 +880,7 @@ def _parse_authority_gaps(value: Any, identity_key: str, allowed: set[str]) -> l
                 "delivery_authority.gaps_invalid",
                 "Authority gaps require known unique identities and bounded explanations.",
             )
+        _reject_unknown_fields(item, {identity_key, "summary"}, "authority gap", protocol_errors=protocol_errors)
         seen.add(identity)
         gaps.append(dict(item))
     return gaps
@@ -953,7 +1130,7 @@ def derive_delivery_authoring_paths(
 
 def _parse_output_object(output: str, *, schema_keys: frozenset[str]) -> dict[str, Any]:
     if not isinstance(output, str) or not output.strip():
-        raise DeliveryAuthoringParseError(
+        raise DeliveryAuthoringProtocolError(
             "delivery_authoring.empty_output",
             "Delivery authoring output must be a non-empty JSON object.",
         )
@@ -985,10 +1162,10 @@ def _parse_output_object(output: str, *, schema_keys: frozenset[str]) -> dict[st
             message = (
                 "Delivery authoring output must contain one unambiguous JSON object, optionally surrounded by prose."
             )
-            raise DeliveryAuthoringParseError(code, message) from exc
+            raise DeliveryAuthoringProtocolError(code, message) from exc
 
     if not isinstance(value, dict):
-        raise DeliveryAuthoringParseError(
+        raise DeliveryAuthoringProtocolError(
             "delivery_authoring.root_not_object",
             "Delivery authoring output must be a JSON object.",
         )
@@ -1103,6 +1280,7 @@ def _parse_constraints(
     *,
     unit_ids: set[str],
     source_task_description: str | None = None,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryAuthoringConstraintDraft]:
     if "constraints" not in data:
         raise DeliveryAuthoringParseError(
@@ -1121,7 +1299,7 @@ def _parse_constraints(
             "constraints contains too many inherited hard constraints.",
         )
 
-    advertised_stop = any(isinstance(item, dict) and item.get("kind") == "stop_and_follow_up" for item in value)
+    advertised_stop = any(isinstance(item, dict) and _is_prerequisite_stop_kind(item.get("kind")) for item in value)
     constraints: list[DeliveryAuthoringConstraintDraft] = []
     seen_ids: set[str] = set()
     for index, item in enumerate(value):
@@ -1131,7 +1309,7 @@ def _parse_constraints(
                 "delivery_authoring.constraint_not_object",
                 "Constraint entries must be JSON objects.",
             )
-        _reject_unknown_fields(item, _CONSTRAINT_FIELDS, constraint_path)
+        _reject_unknown_fields(item, _CONSTRAINT_FIELDS, constraint_path, protocol_errors=protocol_errors)
         constraint_id = _require_string(item, "id", f"{constraint_path}.id")
         if len(constraint_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_AUTHORING_ID_RE.fullmatch(constraint_id):
             raise DeliveryAuthoringParseError(
@@ -1206,6 +1384,7 @@ def _parse_obligations(
     source_task_description: str | None,
     required: bool,
     known_source_fragment_ids: set[str] | None = None,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryAuthoringObligationDraft]:
     if value is None and not required:
         return []
@@ -1240,7 +1419,7 @@ def _parse_obligations(
                 "delivery_authoring.obligation_not_object",
                 "Obligation entries must be JSON objects.",
             )
-        _reject_unknown_fields(item, _OBLIGATION_FIELDS, path)
+        _reject_unknown_fields(item, _OBLIGATION_FIELDS, path, protocol_errors=protocol_errors)
         obligation_id = _require_string(item, "id", f"{path}.id")
         if len(obligation_id) > MAX_DELIVERY_UNIT_ID_LENGTH or not _DELIVERY_AUTHORING_ID_RE.fullmatch(obligation_id):
             raise DeliveryAuthoringParseError(
@@ -1308,6 +1487,7 @@ def _parse_constraint_gaps(
     constraints: list[DeliveryAuthoringConstraintDraft],
     unit_ids: set[str],
     source_task_description: str | None,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryConstraintGap]:
     if not isinstance(value, list):
         raise DeliveryAuthoringParseError(
@@ -1330,7 +1510,7 @@ def _parse_constraint_gaps(
                 "delivery_constraint_verification.gap_not_object",
                 "Constraint gap entries must be JSON objects.",
             )
-        _reject_unknown_fields(item, _CONSTRAINT_GAP_FIELDS, gap_path)
+        _reject_unknown_fields(item, _CONSTRAINT_GAP_FIELDS, gap_path, protocol_errors=protocol_errors)
         reason = _require_string(item, "reason", f"{gap_path}.reason")
         if reason not in DELIVERY_CONSTRAINT_GAP_REASONS:
             raise DeliveryAuthoringParseError(
@@ -1433,6 +1613,7 @@ def _parse_obligation_gaps(
     unit_ids: set[str],
     source_task_description: str | None,
     known_source_fragment_ids: set[str] | None = None,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryObligationGap]:
     if not isinstance(value, list) or len(value) > MAX_DELIVERY_OBLIGATIONS:
         raise DeliveryAuthoringParseError(
@@ -1454,7 +1635,7 @@ def _parse_obligation_gaps(
                 "delivery_obligation_verification.gap_not_object",
                 "Obligation gap entries must be JSON objects.",
             )
-        _reject_unknown_fields(item, _OBLIGATION_GAP_FIELDS, path)
+        _reject_unknown_fields(item, _OBLIGATION_GAP_FIELDS, path, protocol_errors=protocol_errors)
         reason = _require_string(item, "reason", f"{path}.reason")
         if reason not in DELIVERY_CONSTRAINT_GAP_REASONS:
             raise DeliveryAuthoringParseError(
@@ -1545,6 +1726,7 @@ def _parse_unit_context_gaps(
     unit_ids: set[str],
     source_task_description: str | None,
     unit_task_markdown_by_id: dict[str, str] | None,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryUnitContextGap]:
     if not isinstance(value, list):
         raise DeliveryAuthoringParseError(
@@ -1573,7 +1755,7 @@ def _parse_unit_context_gaps(
                 "delivery_unit_context_verification.gap_not_object",
                 "Unit-context gap entries must be JSON objects.",
             )
-        _reject_unknown_fields(item, _UNIT_CONTEXT_GAP_FIELDS, gap_path)
+        _reject_unknown_fields(item, _UNIT_CONTEXT_GAP_FIELDS, gap_path, protocol_errors=protocol_errors)
         unit_id = _require_string(item, "unit_id", f"{gap_path}.unit_id")
         if unit_id not in unit_ids:
             raise DeliveryAuthoringParseError(
@@ -1795,13 +1977,22 @@ def _validate_assessment_dependencies(units: list[DeliveryAssessmentUnitDraft]) 
         )
 
 
-def _reject_unknown_fields(data: dict[str, Any], allowed_fields: set[str], location: str) -> None:
+def _reject_unknown_fields(
+    data: dict[str, Any],
+    allowed_fields: set[str],
+    location: str,
+    *,
+    protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
+) -> None:
     unknown_fields = set(data) - allowed_fields
     if unknown_fields:
-        raise DeliveryAuthoringParseError(
+        error = DeliveryAuthoringProtocolError(
             "delivery_authoring.unknown_field",
             f"Delivery authoring draft contains an unsupported {location} field.",
         )
+        if protocol_errors is None:
+            raise error
+        protocol_errors.append(error)
 
 
 def _reject_unit_unknown_fields(data: dict[str, Any], unit_path: str, *, allow_asset_paths: bool) -> None:

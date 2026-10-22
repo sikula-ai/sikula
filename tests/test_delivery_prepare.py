@@ -1981,3 +1981,81 @@ def test_render_delivery_prepare_includes_errors_and_warnings() -> None:
     assert "- delivery_prepare.task_outside_project: Task path must be inside." in output
     assert "Warnings:" in output
     assert "- delivery_prepare.preview_only [.sikula/delivery/demo]: No artifacts will be written." in output
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "phase,code,expected",
+    [
+        (
+            "delivery_prepare_draft_recovery",
+            "delivery_obligation_repair.existing_changed",
+            "delivery_obligation_repair.existing_changed",
+        ),
+        (
+            "delivery_prepare_constraint_repair",
+            "delivery_constraint_repair.assignment_invalid",
+            "delivery_constraint_repair.assignment_invalid",
+        ),
+        ("delivery_prepare_obligation_repair", "PRIVATE_ERROR_CODE", "delivery_prepare.output_invalid"),
+        ("PRIVATE_PHASE", "delivery_obligation_repair.existing_changed", None),
+        ("delivery_prepare_authoring", "source_accounting.invalid", "source_accounting.invalid"),
+        (
+            "delivery_prepare_constraint_verification",
+            "delivery_authoring.unknown_field",
+            "delivery_authoring.unknown_field",
+        ),
+        ("delivery_prepare_authoring", "delivery_authoring.private_secret", "delivery_prepare.output_invalid"),
+    ],
+)
+def test_prepare_projects_only_allowlisted_repair_diagnostics(
+    tmp_path, monkeypatch, capsys, json_output, phase, code, expected
+):
+    _write_task(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    failure = DeliveryAuthoringParseError(code, "PRIVATE_MESSAGE secret source and provider output")
+    failure.phase = phase
+    with pytest.raises(SystemExit) as error:
+        cmd_delivery_prepare(
+            _args("tasks/team-invites.md", json_output=json_output),
+            _cfg(tmp_path),
+            context=_authoring_context(failure=failure),
+        )
+    assert error.value.code == 1
+    output = capsys.readouterr().out
+    assert "delivery_prepare.authoring_invalid" in output
+    assert "PRIVATE" not in output
+    if expected:
+        assert expected in output and phase in output
+        if json_output:
+            issue = json.loads(output)["errors"][1]
+            assert issue["code"] == expected
+            assert issue["message"].startswith("Phase: " + phase)
+    else:
+        assert code not in output
+    assert not (tmp_path / ".sikula/delivery/team-invites").exists()
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_prepare_reports_safe_provider_failure_phase(tmp_path, monkeypatch, capsys, json_output):
+    from agents.delivery_preparation_agent import DeliveryPreparationAgentError
+
+    _write_task(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    failure = DeliveryPreparationAgentError(
+        "PRIVATE provider details",
+        phase="delivery_prepare_constraint_verification",
+        code="delivery_constraint_verification.authoring_failed",
+    )
+    with pytest.raises(SystemExit) as error:
+        cmd_delivery_prepare(
+            _args("tasks/team-invites.md", json_output=json_output),
+            _cfg(tmp_path),
+            context=_authoring_context(failure=failure),
+        )
+    assert error.value.code == 1
+    output = capsys.readouterr().out
+    assert "delivery_prepare.authoring_failed" in output
+    assert "delivery_constraint_verification.authoring_failed" in output
+    assert "delivery_prepare_constraint_verification" in output
+    assert "PRIVATE" not in output

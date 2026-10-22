@@ -24,6 +24,7 @@ from core.delivery_authoring import (
     DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
     DeliveryAuthoringParseError,
+    public_delivery_preparation_failure,
 )
 from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION, load_delivery_dependency_handoffs
 from core.delivery_plan import (
@@ -1484,21 +1485,31 @@ def _run_delivery_prepare_authoring(
             task_description=source_task_description,
         )
     except DeliveryAuthoringParseError as exc:
-        return _delivery_prepare_blocked_result(
+        result = _delivery_prepare_blocked_result(
             preflight,
             code="delivery_prepare.authoring_invalid",
             issue_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
             result_message=_DELIVERY_PREPARE_AUTHORING_INVALID_MESSAGE,
             audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
         )
+        diagnostic = public_delivery_preparation_failure(exc)
+        if diagnostic is not None:
+            code, message = diagnostic
+            result = replace(result, errors=[*result.errors, DeliveryPrepareIssue("error", code, message)])
+        return result
     except Exception as exc:
-        return _delivery_prepare_blocked_result(
+        result = _delivery_prepare_blocked_result(
             preflight,
             code="delivery_prepare.authoring_failed",
             issue_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
             result_message=_DELIVERY_PREPARE_AUTHORING_FAILED_MESSAGE,
             audit_path=_delivery_prepare_exception_audit_path(exc, project_root),
         )
+        diagnostic = public_delivery_preparation_failure(exc)
+        if diagnostic is not None:
+            code, message = diagnostic
+            result = replace(result, errors=[*result.errors, DeliveryPrepareIssue("error", code, message)])
+        return result
     if not isinstance(draft, DeliveryAuthoringDraft):
         return _delivery_prepare_blocked_result(
             preflight,

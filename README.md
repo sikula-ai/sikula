@@ -206,6 +206,11 @@ units before anything is published, so an authored empty list cannot silently
 drop a governing rule. When that pass identifies a concrete omitted or incompletely
 assigned constraint, Sikula makes one bounded constraints-only repair and verifies
 the result again without changing generated units or their asset assignments.
+Repairs preserve obligations and constraints by ID, so inserting an omitted item
+between existing items does not block preparation. Authoring, verification and
+repair failures report their phase and a safe error code; detailed model output
+remains in the local audit. Authority verification can correct malformed JSON or
+unsupported fields once, with unchanged inputs and all authority checks retained.
 Persistent gaps stop preparation with their bounded kind, summary, and affected
 unit IDs rather than being reported as an artifact-write failure. Published plans
 contain only bounded `preserved`

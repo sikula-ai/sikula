@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 import re
@@ -51,6 +52,10 @@ class SourceAccountingError(ValueError):
         super().__init__(message)
 
 
+class SourceAccountingProtocolError(SourceAccountingError):
+    """Invalid record envelope or field vocabulary; ownership validation remains strict."""
+
+
 def parse_source_accounting(
     value: Any,
     *,
@@ -60,9 +65,18 @@ def parse_source_accounting(
     private_rationales: bool,
     allow_unresolved: bool = False,
     hierarchical: bool = False,
+    protocol_errors: list[SourceAccountingProtocolError] | None = None,
+    expected_records: Sequence[DeliverySourceAccounting] | None = None,
 ) -> list[DeliverySourceAccounting]:
-    """Validate exhaustive source and constraint coverage and obligation provenance."""
-    if not isinstance(value, list) or len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
+    """Validate coverage, provenance and optional immutable verification echoes.
+
+    A caller supplying protocol_errors must reject any result when that list is
+    nonempty. Deferral only allows readable records to expose semantic failures;
+    it never makes malformed entries or partial coverage acceptable.
+    """
+    if not isinstance(value, list):
+        raise SourceAccountingProtocolError("invalid", "Source accounting must be a list.")
+    if len(value) > MAX_DELIVERY_AUTHORITY_FRAGMENTS:
         raise SourceAccountingError("invalid", "Source accounting must be a bounded list.")
     fields = {
         "source_fragment_id",
@@ -77,9 +91,23 @@ def parse_source_accounting(
         fields.add("rationale")
     records: list[DeliverySourceAccounting] = []
     seen: set[str] = set()
+    expected_by_id = {record.source_fragment_id: record for record in expected_records or ()}
+    expected_positions = {record.source_fragment_id: index for index, record in enumerate(expected_records or ())}
+    last_expected_position = -1
+    unreadable_record = False
     for item in value:
-        if not isinstance(item, dict) or set(item) - fields:
-            raise SourceAccountingError("invalid", "Source accounting contains unsupported fields.")
+        if not isinstance(item, dict):
+            error = SourceAccountingProtocolError("invalid", "Source accounting entries must be objects.")
+            if protocol_errors is None:
+                raise error
+            protocol_errors.append(error)
+            unreadable_record = True
+            continue
+        if set(item) - fields:
+            error = SourceAccountingProtocolError("invalid", "Source accounting contains unsupported fields.")
+            if protocol_errors is None:
+                raise error
+            protocol_errors.append(error)
         fragment = item.get("source_fragment_id")
         if not isinstance(fragment, str) or fragment not in fragment_ids or fragment in seen:
             raise SourceAccountingError("fragment_invalid", "Source fragments must be known and unique.")
@@ -141,18 +169,35 @@ def parse_source_accounting(
             raise SourceAccountingError(
                 "checkpoint_invalid", "Delegated final authority requires one owning checkpoint."
             )
-        records.append(
-            DeliverySourceAccounting(
-                fragment, disposition, obligations, constraints, digest, rationale, checkpoint_ids, final_gate
-            )
+        record = DeliverySourceAccounting(
+            fragment, disposition, obligations, constraints, digest, rationale, checkpoint_ids, final_gate
         )
-    if seen != fragment_ids:
+        if expected_records is not None:
+            position = expected_positions.get(fragment, -1)
+            if record != expected_by_id.get(fragment) or position <= last_expected_position:
+                raise SourceAccountingError(
+                    "verification_mismatch",
+                    "Independent verification must echo the supplied accounting exactly and in order.",
+                )
+            last_expected_position = position
+        records.append(record)
+    # Missing coverage cannot be attributed to omissions while entries are
+    # unreadable. Their recorded protocol errors still prohibit acceptance; all
+    # readable records above have undergone semantic and authority validation.
+    if not unreadable_record and seen != fragment_ids:
         raise SourceAccountingError(
             "incomplete", "Every authoritative source fragment needs an explicit accounting record."
         )
-    if {constraint_id for record in records for constraint_id in record.constraint_ids} != constraint_ids:
+    if (
+        not unreadable_record
+        and {constraint_id for record in records for constraint_id in record.constraint_ids} != constraint_ids
+    ):
         raise SourceAccountingError(
             "constraints_incomplete", "Every declared constraint must reference at least one source fragment."
+        )
+    if not unreadable_record and expected_records is not None and records != list(expected_records):
+        raise SourceAccountingError(
+            "verification_mismatch", "Independent verification must echo the supplied accounting exactly and in order."
         )
     return records
 

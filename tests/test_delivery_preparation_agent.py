@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from itertools import permutations
 from hashlib import sha256
 from pathlib import Path
 
@@ -15,8 +17,11 @@ from core.delivery_authoring import (
     DeliveryAmendmentAuthoringDraft,
     DeliveryAssessmentDraft,
     DeliveryAuthoringDraft,
+    DeliveryAuthoringConstraintDraft,
+    DeliveryConstraintGap,
     DeliveryAuthoringObligationDraft,
     DeliveryAuthoringParseError,
+    public_delivery_preparation_failure,
     DeliveryAuthoringUnitDraft,
     DeliveryObligationGap,
 )
@@ -860,6 +865,9 @@ def test_author_delivery_plan_rejects_repair_that_rewrites_existing_constraint(t
         )
 
     assert exc_info.value.code == "delivery_constraint_repair.existing_constraint_changed"
+    assert exc_info.value.phase == "delivery_prepare_draft_recovery"
+    assert "summary" in str(exc_info.value) and "protocol-authority" in str(exc_info.value)
+    assert "protocol-authority" not in str(public_delivery_preparation_failure(exc_info.value))
     assert len(llm.prompts) == 3
     assert audit_records[-1]["phase"] == "delivery_prepare_draft_recovery"
     assert audit_records[-1]["parsed"]["status"] == "failed"
@@ -1534,7 +1542,7 @@ def test_author_delivery_amendment_records_parse_failure(tmp_path: Path) -> None
     assert record["prompt"] == llm.prompts[0]
     assert record["raw_output"] == llm.output
     assert record["parsed"]["status"] == "failed"
-    assert record["parsed"]["error_type"] == "DeliveryAuthoringParseError"
+    assert record["parsed"]["error_type"] == "DeliveryAuthoringProtocolError"
     assert record["parsed"]["error_code"] == "delivery_authoring.json_invalid"
     assert "SECRET_PROVIDER_OUTPUT" not in record["parsed"]["error"]
 
@@ -1636,6 +1644,7 @@ def test_author_delivery_plan_redacts_outside_project_task_path_in_prompt(tmp_pa
 
 def test_author_delivery_plan_records_parse_failure_and_raises_safe_error(tmp_path: Path) -> None:
     llm = CapturingLLM("Assistant draft:\nSECRET_PROVIDER_OUTPUT")
+    llm.outputs = [llm.output, llm.output]
     agent = DeliveryPreparationAgent(llm=llm)
     audit_records: list[dict] = []
 
@@ -1645,12 +1654,13 @@ def test_author_delivery_plan_records_parse_failure_and_raises_safe_error(tmp_pa
     assert exc_info.value.code == "delivery_authoring.json_invalid"
     assert "SECRET_PROVIDER_OUTPUT" not in str(exc_info.value)
     assert "Add team invite authoring" not in str(exc_info.value)
-    assert len(audit_records) == 1
+    assert len(audit_records) == len(llm.prompts) == 2
+    assert [item["round_index"] for item in audit_records] == [1, 2]
     record = audit_records[0]
     assert record["phase"] == "delivery_prepare_authoring"
     assert record["raw_output"] == llm.output
     assert record["parsed"]["status"] == "failed"
-    assert record["parsed"]["error_type"] == "DeliveryAuthoringParseError"
+    assert record["parsed"]["error_type"] == "DeliveryAuthoringProtocolError"
     assert record["parsed"]["error_code"] == "delivery_authoring.json_invalid"
     assert "SECRET_PROVIDER_OUTPUT" not in record["parsed"]["error"]
 
@@ -2405,3 +2415,198 @@ def test_obligation_owner_correction_moves_affected_checkpoint_autonomously(tmp_
     assert result.obligations[0].unit_ids == ["foundation", "consumer"]
     assert result.constraint_verification.obligations_complete
     assert len(llm.prompts) == 4
+
+
+@pytest.mark.parametrize("kind", ["obligation", "constraint"])
+def test_repair_order_does_not_change_authority(kind):
+    def make(id, summary):
+        if kind == "obligation":
+            return DeliveryAuthoringObligationDraft(id, summary, ["source"], ["unit"], "preserved")
+        return DeliveryAuthoringConstraintDraft(id, "repository_ownership", summary, ["unit"], "preserved")
+
+    def gap(summary):
+        if kind == "obligation":
+            return DeliveryObligationGap("omitted", summary, ["source"], ["unit"])
+        return DeliveryConstraintGap("omitted", "repository_ownership", summary, ["unit"])
+
+    validate = getattr(DeliveryPreparationAgent, f"_assert_{kind}_repair")
+    original = [make("first", "Original first"), make("second", "Original second")]
+    additions = [make("new-first", "Omitted first"), make("new-second", "Omitted second")]
+    expected = original + additions
+    for response in permutations(expected):
+        assert validate(original, response, [gap(item.summary) for item in additions]) == expected
+
+
+@pytest.mark.parametrize("kind", ["obligation", "constraint"])
+@pytest.mark.parametrize(
+    "change",
+    ["missing", "duplicate", "duplicate_case", "summary", "provenance", "disposition", "owners", "omitted", "count"],
+)
+def test_reordered_repair_still_rejects_authority_changes(kind, change):
+    if kind == "obligation":
+        original = [DeliveryAuthoringObligationDraft("original", "Existing", ["source"], ["unit"], "preserved")]
+        new = replace(original[0], id="new", summary="Missing")
+        gaps = [DeliveryObligationGap("omitted", "Missing", ["source"], ["unit"])]
+        validate = DeliveryPreparationAgent._assert_obligation_repair
+    else:
+        original = [
+            DeliveryAuthoringConstraintDraft("original", "repository_ownership", "Existing", ["unit"], "preserved")
+        ]
+        new = replace(original[0], id="new", summary="Missing")
+        gaps = [DeliveryConstraintGap("omitted", "repository_ownership", "Missing", ["unit"])]
+        validate = DeliveryPreparationAgent._assert_constraint_repair
+    changed = original[0]
+    if change == "missing":
+        changed = replace(changed, id="replacement")
+    elif change.startswith("duplicate"):
+        new = replace(new, id="ORIGINAL" if change == "duplicate_case" else "original")
+    elif change == "summary":
+        changed = replace(changed, summary="Weakened")
+    elif change == "provenance":
+        changed = replace(
+            changed, **({"source_fragment_ids": ["other"]} if kind == "obligation" else {"kind": "stop_and_follow_up"})
+        )
+    elif change == "disposition":
+        changed = replace(changed, disposition="conflict")
+    elif change == "owners":
+        changed = replace(changed, unit_ids=["other"])
+    elif change == "omitted":
+        new = replace(new, summary="Invented")
+    response = [new, changed] if change != "count" else [new]
+    with pytest.raises(DeliveryAuthoringParseError):
+        validate(original, response, gaps)
+
+
+@pytest.mark.parametrize("kind", ["obligations", "constraints"])
+@pytest.mark.parametrize("protocol_retry", [False, True])
+def test_draft_recovery_accepts_inserted_omission_and_publishes_after_reverification(tmp_path, kind, protocol_retry):
+    from core.delivery_prepare_writer import write_delivery_prepare_artifacts
+
+    source = tmp_path / ".sikula/tasks/team-invites.md"
+    source.parent.mkdir(parents=True)
+    source.write_text(_DEFAULT_TASK_DESCRIPTION, encoding="utf-8")
+    authored = json.loads(_authoring_output())
+    authored["units"][0]["asset_paths"] = []
+    authored["units"][0]["scope_paths"] = []
+    if kind == "constraints":
+        authored[kind] = [
+            {
+                "id": "existing-rule",
+                "kind": "repository_ownership",
+                "summary": "Existing repository boundary remains intact.",
+                "unit_ids": ["foundation"],
+                "disposition": "preserved",
+            }
+        ]
+        _account_constraints(authored)
+    existing = authored[kind][0]
+    new = dict(
+        existing, id="missing-requirement", summary="Invitation storage remains consistent across successful updates."
+    )
+    gap = {"reason": "omitted", "summary": new["summary"], "affected_unit_ids": new["unit_ids"]}
+    gap.update({key: new[key] for key in (("source_fragment_ids",) if kind == "obligations" else ("kind",))})
+    review = {
+        "constraints_complete": True,
+        "constraints": authored["constraints"],
+        "obligations_complete": True,
+        "obligations": authored["obligations"],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    review[kind + "_complete"] = False
+    review[("obligation" if kind == "obligations" else "constraint") + "_gaps"] = [gap]
+    # A contract gap selects the complete draft recovery route for both kinds.
+    review["unit_contract_gaps"] = [{"unit_id": "foundation", "summary": "The missing behavior must be stated."}]
+    corrected = json.loads(json.dumps(authored))
+    corrected[kind] = [new, *corrected[kind]]
+    corrected["source_accounting"][0]["obligation_ids" if kind == "obligations" else "constraint_ids"].append(new["id"])
+    final = {
+        "constraints_complete": True,
+        "constraints": corrected["constraints"],
+        "obligations_complete": True,
+        "obligations": corrected["obligations"],
+        "unit_context_complete": True,
+        "unit_context_gaps": [],
+    }
+    final[kind] = [existing, new]
+    llm = CapturingLLM(json.dumps(authored))
+    llm.outputs = [json.dumps(authored), json.dumps(review), json.dumps(corrected), json.dumps(final)]
+    if protocol_retry:
+        malformed_review = json.loads(json.dumps(review))
+        malformed_review[("obligation" if kind == "obligations" else "constraint") + "_gaps"][0]["detail"] = (
+            "Unexpected explanation."
+        )
+        llm.outputs.insert(1, json.dumps(malformed_review))
+    audit = []
+    draft = _author_delivery_plan(DeliveryPreparationAgent(llm), tmp_path=tmp_path, audit_records=audit)
+    assert [item.id for item in getattr(draft, kind)] == [existing["id"], new["id"]]
+    assert len(llm.prompts) == 4 + int(protocol_retry)
+    assert [item["phase"] for item in audit] == [
+        "delivery_prepare_authoring",
+        *(["delivery_prepare_constraint_verification"] if protocol_retry else []),
+        "delivery_prepare_constraint_verification",
+        "delivery_prepare_draft_recovery",
+        "delivery_prepare_constraint_verification",
+    ]
+    assert json.loads(audit[2 + int(protocol_retry)]["raw_output"])[kind][0]["id"] == new["id"]
+    result = write_delivery_prepare_artifacts(
+        draft,
+        output_dir=".sikula/delivery/team-invites",
+        project_root=tmp_path,
+        project_config={
+            "project": {"root_path": str(tmp_path), "build_tool": "python"},
+            "build": {"test_command": "python3 -m pytest tests/test_delivery_preparation_agent.py"},
+        },
+    )
+    assert result.prepared, result.errors
+    assert (tmp_path / ".sikula/delivery/team-invites/plan.yaml").is_file()
+
+
+@pytest.mark.parametrize("kind", ["obligation", "constraint"])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_list_only_repair_normalizes_before_return_and_audits_failures(tmp_path, kind, invalid):
+    if kind == "obligation":
+        original = DeliveryAuthoringObligationDraft(
+            "original",
+            "Existing outcome",
+            [delivery_authority_fragments("A separate governing source.")[0].id],
+            ["unit"],
+            "preserved",
+        )
+        new = replace(original, id="new", summary="Omitted outcome")
+        gaps = [DeliveryObligationGap("omitted", new.summary, new.source_fragment_ids, new.unit_ids)]
+        serialize = DeliveryAuthoringObligationDraft.to_verification_dict
+    else:
+        original = DeliveryAuthoringConstraintDraft(
+            "original", "repository_ownership", "Existing boundary", ["unit"], "preserved"
+        )
+        new = replace(original, id="new", summary="Omitted boundary")
+        gaps = [DeliveryConstraintGap("omitted", new.kind, new.summary, new.unit_ids)]
+        serialize = DeliveryAuthoringConstraintDraft.to_plan_dict
+    response = [new, replace(original, summary="Changed private rule") if invalid else original]
+    llm = CapturingLLM(json.dumps({kind + "s": [serialize(item) for item in response]}))
+    agent = DeliveryPreparationAgent(llm)
+    audit = []
+    arguments = {
+        "authority_description": "A separate governing source.",
+        kind + "s": [original],
+        "units": [DeliveryAuthoringUnitDraft("unit", "Unit", [], _unit_markdown())],
+        "gaps": gaps,
+        "audit_recorder": audit.append,
+    }
+    if invalid:
+        with pytest.raises(DeliveryAuthoringParseError) as caught:
+            getattr(agent, f"_repair_{kind}_gaps")(**arguments)
+        assert caught.value.phase == f"delivery_prepare_{kind}_repair"
+        assert caught.value.code == audit[0]["parsed"]["error_code"]
+        assert caught.value.code == (
+            "delivery_obligation_repair.existing_changed"
+            if kind == "obligation"
+            else "delivery_constraint_repair.existing_constraint_changed"
+        )
+        assert audit[0]["parsed"]["status"] == "failed"
+    else:
+        assert getattr(agent, f"_repair_{kind}_gaps")(**arguments) == [original, new]
+        assert audit[0]["parsed"][kind + "_ids"] == ["original", "new"]
+    assert len(llm.prompts) == len(audit) == 1
+    assert json.loads(audit[0]["raw_output"])[kind + "s"][0]["id"] == "new"

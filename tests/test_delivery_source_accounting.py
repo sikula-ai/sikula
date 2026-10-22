@@ -77,6 +77,34 @@ def test_source_accounting_hashes_valid_unicode_rationale() -> None:
     assert parsed[0].rationale_sha256 == "sha256:" + sha256(rationale.encode("utf-8")).hexdigest()
 
 
+@pytest.mark.parametrize("malformed_first", [False, True])
+@pytest.mark.parametrize("failure", ["reordered", "changed_later", "duplicate"])
+def test_accounting_echo_checks_all_readable_records_despite_malformed_siblings(malformed_first, failure):
+    fragments, obligations, records = _case()
+    expected = _parse(records)
+    if failure == "reordered":
+        records.reverse()
+    elif failure == "changed_later":
+        records[-1]["checkpoint_ids"] = []
+    else:
+        records.append(deepcopy(records[-1]))
+    records.insert(0 if malformed_first else len(records), None)
+    errors = []
+    with pytest.raises(SourceAccountingError) as caught:
+        parse_source_accounting(
+            records,
+            fragment_ids={fragment.id for fragment in fragments},
+            obligation_sources=obligations,
+            constraint_ids=set(),
+            private_rationales=True,
+            protocol_errors=errors,
+            expected_records=expected,
+        )
+    assert caught.value.code == (
+        "source_accounting.fragment_invalid" if failure == "duplicate" else "source_accounting.verification_mismatch"
+    )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

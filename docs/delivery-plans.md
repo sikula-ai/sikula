@@ -220,6 +220,28 @@ unresolved uncertainty, or conflict after supported bounded correction blocks be
 bounded gaps. Every authoring, verification, and repair invocation remains in the local
 preparation audit with its actual round index and Sikula runtime version.
 
+Constraint and obligation repairs are checked by ID rather than list position.
+Existing items keep their protected fields; new items must correspond exactly to
+reported omissions. Sikula restores the original item order and places additions
+in gap order before independent verification. Reordering does not grant permission
+to change ownership, source references, or unresolved dispositions.
+If authoring, verification or repair fails, text and JSON errors include its phase
+and an allowlisted error code alongside the overall `delivery_prepare.authoring_invalid`
+or `delivery_prepare.authoring_failed` error. Unknown codes use
+`delivery_prepare.output_invalid`. Consult the local audit for exact exception
+details and affected identifiers; raw model output is never included in diagnostics.
+
+Verification receives explicit closed schemas for omitted and incompletely assigned
+constraint/obligation gaps. Extra fields such as `detail` are rejected. A malformed
+JSON/envelope or unsupported-field result can receive one protocol correction using
+the same inputs, including during post-repair verification. Initial authoring uses
+its existing two-attempt budget for these errors. The correction must still pass all
+identity, provenance and ownership checks; it does not add a semantic repair round.
+Known prerequisite stops, authority mismatches and provider/read-only failures do
+not receive this retry. Both verifier calls are retained in the audit with the same
+`round_index` and distinct `protocol_attempt` values. A second invalid response
+blocks preparation and reports the failing phase and code.
+
 Fresh authoring also requires `obligations`. Sikula deterministically splits
 the complete source task at Markdown headings and top-level list items and gives
 the author stable source-fragment IDs. Each obligation describes one observable

@@ -463,6 +463,19 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   most one constraints-only repair may run, it must preserve the complete unit
   draft and every existing constraint identity, and its result must pass a
   second independent verification before deterministic publication.
+  Authoring and verification prompts must state closed gap fields from the parser's
+  definitions. Malformed JSON/envelopes and unsupported fields are protocol errors,
+  classified at the parser boundary; never silently discard them. Initial authoring
+  can use its existing bounded retry, and each independent authority verification
+  can make at most one protocol correction with unchanged inputs. Audit each call
+  with the semantic round and protocol attempt. Do not retry authority/provenance
+  mismatches, provider or read-only failures, or recognizable prerequisite stops;
+  unsupported fields must not mask semantic failures in other fields, records, or
+  gap groups. Verification must finish its semantic checks before reporting a
+  deferred unsupported-field error; never return a result with deferred errors.
+  A format correction grants no additional semantic repair round. Public preparation
+  diagnostics expose only allowlisted phase/code metadata and fixed descriptions,
+  never raw exceptions, model output, source excerpts, or private identifiers.
 - **Stop-and-follow-up constraints are execution blockers.** A preserved
   `stop_and_follow_up` constraint means the required external decision or input
   remains unresolved; it must make generated unit readiness blocking. Delivery
