@@ -380,6 +380,58 @@ The independent authority verifier must echo the list exactly and report concret
 add only those omissions or assignments before a second verification. Only
 `preserved` obligations are published. Published plans retain the obligation ID,
 summary, provenance references, and active owners without copying source text.
+Repair validation matches existing obligations and constraints by ID, not list
+position. It requires unique identities and exact preservation of protected fields;
+new items must match the verifier's omissions one for one. Before re-verification,
+Sikula orders existing items as supplied in the original draft, followed by additions
+in verifier-gap order (stable ID order breaks ties between identical omissions).
+This applies to list-only repair and complete draft correction; normalization
+never resolves dispositions or changes ownership, provenance, or source accounting.
+Invalid repair results remain blocked without an additional repair call. Public
+prepare errors retain the overall `delivery_prepare.authoring_invalid` or
+`delivery_prepare.authoring_failed` classification and add the failing authoring,
+verification, or repair phase and its allowlisted error code. Codes come from the
+explicit vocabulary in `core/delivery_authoring_diagnostics.py`; unknown codes use
+`delivery_prepare.output_invalid`. Exception details, identifiers, prompts and
+model output remain in the private audit.
+The verification prompt includes both gap variants and their exact allowed fields
+from the parser's field definitions. Unknown fields are rejected, not discarded.
+Structural JSON/envelope and unsupported-field errors are classified at their
+parser origin as `DeliveryAuthoringProtocolError`, including unsupported source
+accounting fields and extra fields in source-accounting or unit-contract gaps.
+Gap identity and semantic validation remain non-retryable. Initial authoring may
+correct protocol errors within its existing two attempts. Each authority
+verification, including post-repair and amendment checks,
+may make one additional command-free protocol correction using the same immutable
+inputs and parser feedback. It cannot retry an identity, provenance, or accounting
+echo mismatch, a provider/read-only failure, or a recognizable prerequisite stop.
+Verification parsing defers unsupported-field errors until the same parser has
+validated all readable constraints, obligations, gap records, source accounting,
+and normalized authority echoes. Semantic failures take precedence even when an
+unsupported field occurs in an earlier record or another part of the response.
+The parser never returns a verification with deferred errors: if semantic checks
+pass, it raises the first protocol error for bounded correction. It does not strip
+fields or maintain a separate, partial copy of semantic validation rules.
+Independent dispositions and normal parser normalization remain supported.
+Constraint and obligation echoes and all gap groups are checked before parsing
+the accounting envelope, so unreadable accounting cannot hide their failures.
+Within an accounting list, malformed entries are recorded as deferred protocol
+errors while every readable record is validated and compared to its immutable
+source-fragment record. Changed content, duplicate identities, and reordered
+readable records block without retry regardless of malformed siblings. Partial
+results cannot be accepted; unresolved protocol errors still reject verification.
+Recognizable structured stop fields anywhere in the response suppress retries,
+including in separate partial objects ignored by schema extraction and in malformed
+JSON with trailing commas or truncation. This conservative detection never makes
+malformed output valid and ignores examples quoted inside JSON strings.
+Stop-kind values use the same whitespace normalization as parsed constraints and
+gaps, including JSON-escaped whitespace.
+Successful parsing still requires all authority checks; uncertain or incomplete
+semantic findings follow normal bounded recovery. This adds no semantic repair
+round. Every verifier exchange retains its semantic `round_index` and a separate
+`protocol_attempt` (1 or 2), with its actual prompt, output and failure or result.
+Correction prompts do not accumulate previous output. A repeated protocol error
+blocks publication and exposes its phase and code without replaying the audit.
 Fresh authoring requires exhaustive `source_accounting`, including explicit
 context-only decisions and private rationales.
 Plan checking also requires source accounting whenever obligations are non-empty,
