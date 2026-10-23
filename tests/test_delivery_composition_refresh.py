@@ -117,6 +117,72 @@ def test_overflow_does_not_authorize_refresh_for_unsupported_or_missing_inputs(n
         assert build_node_composition_context(root, snapshot, attempt, cfg) is None
 
 
+@pytest.mark.parametrize("role", ["semantic", "security"])
+def test_metadata_growth_keeps_the_refresh_prompt_bounded(node_input, role):
+    root, _, _, snapshot, parent, historical = _changed_node(node_input, "paths", crlf=True)
+    lengths = []
+    for count in (128, 512):
+        for index in range(count):
+            (root / f"extra-{index:04}.py").write_bytes(b"value = 2\r\n")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "more public changes")
+        identity = replace(
+            snapshot.identity,
+            candidate_commit=_git(root, "rev-parse", "HEAD"),
+            candidate_tree=_git(root, "rev-parse", "HEAD^{tree}"),
+        )
+        current = replace(snapshot, identity=identity)
+        attempt = DeliveryCompositionAttempt.capture(
+            current.composition_scope, historical, replace(parent, **vars(identity))
+        )
+        result = build_node_composition_context(root, current, attempt, {}, review_kind=role)
+        assert isinstance(result, CompositionRefresh)
+        assert result.nodes["storage"]["reason"] == "delta_paths"
+        packet = json.dumps(result.preview_context)
+        assert "extra-" not in packet
+        lengths.append(len(packet))
+    assert lengths[0] == lengths[1]
+
+
+@pytest.mark.parametrize("tail", ["private", "binary", "gitlink", "renamed_private"])
+def test_large_metadata_does_not_hide_unsupported_tail(node_input, tail):
+    from unittest.mock import patch
+
+    root, _, _, snapshot, parent, historical = _changed_node(node_input, "paths")
+    for index in range(256):
+        (root / f"extra-{index:04}.py").write_bytes(b"value = 2\n")
+    cfg = {"tasks": {"state_dir": "z-private"}}
+    (root / "z-private").mkdir()
+    private = root / "z-private/evidence.txt"
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "large metadata prefix")
+    if tail == "renamed_private":
+        _git(root, "mv", "extra-0255.py", "z-private/moved.py")
+    elif tail == "private":
+        private.write_bytes(b"PRIVATE_TEST_FIXTURE=hidden\n")
+    elif tail == "binary":
+        (root / "z-binary.bin").write_bytes(b"\0opaque")
+    else:
+        _git(root, "config", "diff.ignoreSubmodules", "all")
+        _git(
+            root, "update-index", "--add", "--cacheinfo", "160000," + _git(root, "rev-parse", "HEAD") + ",z-dependency"
+        )
+    if tail != "gitlink":
+        _git(root, "add", ".")
+    _git(root, "commit", "-m", "unsupported tail")
+    identity = replace(
+        snapshot.identity,
+        candidate_commit=_git(root, "rev-parse", "HEAD"),
+        candidate_tree=_git(root, "rev-parse", "HEAD^{tree}"),
+    )
+    current = replace(snapshot, identity=identity)
+    attempt = DeliveryCompositionAttempt.capture(
+        current.composition_scope, historical, replace(parent, **vars(identity))
+    )
+    with patch("core.delivery_composition._git_bounded", side_effect=AssertionError("Do not read the patch")):
+        assert build_node_composition_context(root, current, attempt, cfg) is None
+
+
 def _refresh_control(parent):
     control = new_reverification()
     control["refreshes"] = {

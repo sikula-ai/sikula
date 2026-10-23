@@ -389,16 +389,8 @@ def test_unsupported_composition_selects_full_review_before_calls(
         candidate_commit="a" * 40, candidate_tree="a" * 40, checkpoint_evidence_fingerprint="sha256:" + "a" * 64
     )
     status = replace(status, checkpoint_verifications={"storage": origin})
-    metadata = ":100644 100644 " + "a" * 40 + " " + "b" * 40 + " M\0"
-    names = metadata + "src/cache.py\0"
-    diff = "Changed storage dependency."
-    if reason == "many_paths":
-        names = "".join(metadata + f"src/file-{i}.py\0" for i in range(33))
-    elif reason == "private":
-        names = metadata + ".env\0"
-    elif reason == "binary":
-        diff = "Binary files a/cache and b/cache differ"
-    elif reason == "large_packet":
+    diff = "Binary files a/cache and b/cache differ" if reason == "binary" else "Changed storage dependency."
+    if reason == "large_packet":
         status = replace(status, plan=replace(status.plan, title="x" * (128 * 1024)))
     elif reason in {"fan_in", "overlap"}:
         status = replace(
@@ -413,16 +405,17 @@ def test_unsupported_composition_selects_full_review_before_calls(
             checkpoint_verifications={f"storage-{i}": origin for i in range(9 if reason == "fan_in" else 2)},
         )
     snapshot = _packet_snapshot(status, candidate_commit="b" * 40, candidate_tree="b" * 40)
-    stats = "".join("1\t1\t" + name + "\0" for name in names.split("\0")[1:-1:2])
     from core.delivery_composition import CompositionDeltaLimit
 
-    outputs = [names, stats, CompositionDeltaLimit("delta budget")] if reason == "large_delta" else [names, stats, diff]
+    delta_result = CompositionDeltaLimit("delta budget") if reason == "large_delta" else diff
+    metadata_result = ValueError("Private metadata") if reason == "private" else 33 if reason == "many_paths" else 1
     with (
         patch(
             "core.delivery_composition.load_checkpoint_evidence",
             return_value=SimpleNamespace(covers=lambda scope: True),
         ),
-        patch("core.delivery_composition._git_bounded", side_effect=outputs),
+        patch("core.delivery_composition.inspect_delta_metadata", side_effect=[metadata_result]),
+        patch("core.delivery_composition._git_bounded", side_effect=[delta_result]),
     ):
         assert build_composition_context(status, snapshot, cfg) is None
 
@@ -538,8 +531,7 @@ def test_composition_excludes_configured_private_deltas_before_reading_content(
     with patch("core.delivery_composition._git_bounded", wraps=_git_bounded) as read_git:
         assert _changed_context(path, cfg, origin) is None
     # Only metadata may be read; no historical or current private content enters the packet.
-    assert len(read_git.call_args_list) == 1
-    assert "--raw" in read_git.call_args.args[1]
+    read_git.assert_not_called()
 
 
 @pytest.mark.parametrize("change", ["added", "modified", "deleted"])
@@ -571,8 +563,7 @@ def test_composition_rejects_gitlinks_even_when_git_ignores_them(
     _git(root, "commit", "-m", "changed dependency fixture")
     with patch("core.delivery_composition._git_bounded", wraps=_git_bounded) as read_git:
         assert _changed_context(path, cfg, origin) is None
-    assert len(read_git.call_args_list) == 1
-    assert "--raw" in read_git.call_args.args[1]
+    read_git.assert_not_called()
 
 
 def test_composition_includes_deleted_public_content(checkpoint_plan: tuple[Path, dict]) -> None:

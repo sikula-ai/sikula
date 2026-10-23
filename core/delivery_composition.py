@@ -11,6 +11,7 @@ from threading import Timer
 from typing import Any, TYPE_CHECKING
 
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+from core.delivery_delta import inspect_delta_metadata
 from core.delivery_composition_scope import (
     DeliveryCompositionAttempt,
     DeliveryCompositionScope,
@@ -163,39 +164,15 @@ def build_node_composition_context(
                     "--ignore-submodules=none",
                     "--relative",
                 ]
-                entries = _git_bounded(
+                path_count = inspect_delta_metadata(
                     root,
-                    [*diff_args, "--raw", "--no-abbrev", "-z", *refs, "--", "."],
-                    8192,
-                ).split("\0")
-                if entries[-1] or (len(entries) - 1) % 2:
-                    return None
-                paths = entries[1:-1:2]
-                for metadata in entries[:-1:2]:
-                    fields = metadata.split()
-                    if len(fields) != 5 or not fields[0].startswith(":"):
-                        return None
-                    # Gitlinks describe dependency pointers, not complete content deltas.
-                    if "160000" in (fields[0][1:], fields[1]):
-                        return None
-                if any(
-                    delivery_verification_source_task_is_private(
+                    diff_args,
+                    refs,
+                    is_private=lambda path: delivery_verification_source_task_is_private(
                         root, root / path, path, project_config, allow_missing=True
-                    )
-                    for path in paths
-                ):
-                    return None
-                # Inspect the complete bounded metadata before authorizing any
-                # refresh. A truncated patch must not hide a binary/private tail.
-                stats = _git_bounded(root, [*diff_args, "--numstat", "-z", *refs, "--", "."], 8192)
-                entries = stats.split("\0")
-                if entries[-1] or len(entries) - 1 != len(paths):
-                    return None
-                for entry, path in zip(entries[:-1], paths):
-                    counts = entry.split("\t", 2)
-                    if len(counts) != 3 or counts[2] != path or not all(n.isdecimal() for n in counts[:2]):
-                        return None
-                reason = "delta_paths" if len(paths) > 32 else None
+                    ),
+                )
+                reason = "delta_paths" if path_count > 32 else None
                 if reason is None:
                     try:
                         delta = _git_bounded(root, [*diff_args, "--unified=3", *refs, "--", "."], remaining_delta)

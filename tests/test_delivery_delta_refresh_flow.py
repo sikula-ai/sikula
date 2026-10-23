@@ -27,7 +27,7 @@ from tests.test_delivery_conditional_fallback import oversized_parent_fallback a
 from tests.test_delivery_repair import _LLM, _git
 
 
-def _candidate(root, node):
+def _candidate(root, node, *, path_count=0):
     path, cfg = nested.nested_plan.__wrapped__(root)
     result, _ = _run(path, cfg, _LLM(_assessment()))
     assert result.succeeded, result
@@ -36,6 +36,10 @@ def _candidate(root, node):
         nested._compose(path, cfg, "integration")
     status = get_delivery_status(path)
     (root / "agents/code.py").write_bytes(b"value = 'large downstream change'\r\n" * 3000)
+    for index in range(path_count):
+        (root / f"agents/part-{index:04}.py").write_bytes(b"value = 1\r\n")
+    if path_count:
+        _git(root, "add", "agents")
     _git(root, "add", "agents/code.py")
     tree = _git(root, "write-tree")
     commit = _git(root, "commit-tree", tree, "-p", status.assembled_commit, "-m", "downstream change")
@@ -65,9 +69,11 @@ def _outputs(path, cfg, node):
     return outputs
 
 
-@pytest.mark.parametrize("node", ["integration", "root"])
-def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path, node, oversized_parent_fallback):
-    path, cfg = _candidate(tmp_path, node)
+@pytest.mark.parametrize("node,path_count", [("integration", 0), ("root", 0), ("integration", 256), ("root", 256)])
+def test_large_delta_refreshes_children_then_reviews_parent_integration(
+    tmp_path, node, path_count, oversized_parent_fallback
+):
+    path, cfg = _candidate(tmp_path, node, path_count=path_count)
     before = get_delivery_status(path)
     outputs = _outputs(path, cfg, node)
     parents = ["integration", "root"] if node == "root" else ["integration"]
@@ -91,7 +97,9 @@ def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path
     for key in reversed(parents):
         request = parent.reverification["refreshes"]["semantic"]
         assert request["review_reserved"]
-        assert {item["reason"] for item in request["nodes"].values()} == {"delta_bytes"}
+        assert {item["reason"] for item in request["nodes"].values()} == {
+            "delta_paths" if path_count else "delta_bytes"
+        }
         child_id = "integration" if key == "root" else "storage"
         parent = expanded_child(after, parent.reverification["children"][child_id])
         assert parent.passed and parent.candidate_commit == after.assembled_commit
@@ -112,7 +120,7 @@ def test_large_delta_refreshes_children_then_reviews_parent_integration(tmp_path
 def test_refresh_resume_reuses_accepted_descendants(tmp_path, oversized_parent_fallback):
     from core import delivery_verify
 
-    path, cfg = _candidate(tmp_path, "root")
+    path, cfg = _candidate(tmp_path, "root", path_count=256)
     outputs = _outputs(path, cfg, "root")
     original = delivery_verify._composition_exchange
 
@@ -138,7 +146,7 @@ def test_refresh_resume_reuses_accepted_descendants(tmp_path, oversized_parent_f
 def test_refresh_preserves_child_repair_and_terminal_stops(tmp_path, outcome, oversized_parent_fallback):
     from core.llm_client import LLMReadOnlyViolation
 
-    path, cfg = _candidate(tmp_path, "integration")
+    path, cfg = _candidate(tmp_path, "integration", path_count=256)
     semantic = _LLM(_assessment(approved=outcome != "gap"))
     security = _LLM(
         LLMReadOnlyViolation("Private provider diagnostic")
@@ -191,7 +199,7 @@ def test_unsupported_candidate_is_blocked_before_verification_reservation(
         return git(root, *args)
 
     monkeypatch.setattr(fixtures, "_git", add_binary)
-    path, cfg = _candidate(tmp_path, "integration")
+    path, cfg = _candidate(tmp_path, "integration", path_count=256)
     status = replace(get_delivery_status(path), verification_node="integration")
     readiness = check_delivery_verification_readiness(status, cfg)
     assert not readiness.ready
