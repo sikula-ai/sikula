@@ -776,6 +776,12 @@ consuming another attempt. Resolving that topology requires a follow-up plan.
 Plans without checkpoints retain their prior one-repair behavior.
 
 Nested composition and selective candidate review use bounded per-node contexts.
+Git change metadata is inspected incrementally before a large public-text delta
+can select fresh child review. Both complete path sequences must agree; configured
+private paths, binary content and submodule pointers remain outside that refresh
+route even when they occur after many ordinary changes. Inspection has finite
+memory, work and time budgets. A failed or interrupted scan does not authorize
+review from a partial file list, and scan history never grows the parent prompt.
 Independently checked local authority can support verification without a fitting
 expanded fallback. Leaves still require a bounded full scoped review. Known
 unsupported candidate representations block before review if full review cannot fit;

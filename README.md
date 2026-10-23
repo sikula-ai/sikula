@@ -344,6 +344,10 @@ children and then reassess their parents. Semantic and security review share acc
 child work while deciding applicability independently. Durable node reservations bound
 this recovery across interruption and resume; descendant history does not accumulate
 in parent prompts. The final gate remains mandatory.
+Large textual change sets can trigger fresh checkpoint review after complete Git
+metadata inspection with bounded memory and work. A long file list does not need
+to fit into a reviewer prompt; incomplete inspection and unsupported changes still
+require fitting full review or stop verification.
 Successful checkpoints retain private structured obligation results bound to the
 reviewed candidate and gate attempt. Handoff checks verify their integrity without
 replaying review logs or adding history to prompts. Missing or damaged evidence

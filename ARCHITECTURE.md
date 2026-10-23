@@ -1685,8 +1685,16 @@ and the final gate, a complete metadata inspection may establish that a public
 textual delta exceeds the shared byte allowance or the per-child path allowance.
 With intact independent parent/child authority and accepted historical evidence,
 this requires review of the affected immediate children before the first parent
-composition exchange. It does not manufacture an applicability decision. Raw and
-numstat metadata each retain an 8 KiB read limit; incomplete metadata, binary or
+composition exchange. It does not manufacture an applicability decision.
+`core/delivery_delta.py` reads complete raw and numstat metadata incrementally,
+using 4 KiB chunks and at most 16 KiB per NUL-delimited record. Counts and
+length-delimited SHA-256 path-sequence digests bind the two views without retaining
+all paths. Each origin/candidate inspection shares a 16 MiB total metadata budget,
+a 100,000-path allowance and a 20-second deadline across both Git processes.
+Successful EOF and process exit are required; timeout, interruption and parser
+failure close/reap the subprocess and cannot authorize refresh. These are host-work
+bounds, not prompt budgets or maximum plan sizes. No scan history or path inventory
+enters parent prompts. Incomplete metadata, binary or
 gitlink changes, private paths, unavailable Git and unsupported authority retain
 the existing full-review/stop behavior. Missing or corrupt accepted evidence blocks
 before providers. Other packet limits do not authorize refresh.
