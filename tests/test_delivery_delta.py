@@ -123,6 +123,16 @@ def test_record_reader_handles_boundaries_without_buffering_the_stream(monkeypat
     ]
 
 
+def _scanner_allocated_bytes():
+    # Coverage and other test instrumentation allocate in the same process.
+    # Include the simulated stream's buffers as well as the scanner's allocations.
+    # Sample while records are live, before the scanner releases retained paths.
+    snapshot = tracemalloc.take_snapshot().filter_traces(
+        [tracemalloc.Filter(True, delta.__file__), tracemalloc.Filter(True, __file__)]
+    )
+    return sum(trace.size for trace in snapshot.traces)
+
+
 def test_many_records_have_bounded_memory():
     class Stream:
         left = 10000
@@ -135,14 +145,16 @@ def test_many_records_have_bounded_memory():
             return b"x" * (size - 1) + b"\0"
 
     budget = delta._ScanBudget(remaining=64 * 1024 * 1024)
+    samples = []
     tracemalloc.start()
     try:
-        count = sum(1 for _ in delta._nul_records(Stream(), budget))
-        _, peak = tracemalloc.get_traced_memory()
+        for count, _ in enumerate(delta._nul_records(Stream(), budget), 1):
+            if count % 1000 == 0:
+                samples.append(_scanner_allocated_bytes())
     finally:
         tracemalloc.stop()
     assert count == 10000
-    assert peak < 256 * 1024
+    assert max(samples) < 256 * 1024
 
 
 def test_inspection_does_not_retain_the_path_inventory(tmp_path, monkeypatch):
@@ -163,9 +175,17 @@ def test_inspection_does_not_retain_the_path_inventory(tmp_path, monkeypatch):
             chunk, self.pending = self.pending[:size], self.pending[size:]
             return chunk
 
+    samples = []
+
+    def sampled_records(raw, budget):
+        for index, record in enumerate(delta._nul_records(Stream(raw), budget), 1):
+            yield record
+            if index % 1000 == 0:
+                samples.append(_scanner_allocated_bytes())
+
     @contextmanager
     def records(root, args, budget):
-        yield delta._nul_records(Stream("--raw" in args), budget)
+        yield sampled_records("--raw" in args, budget)
 
     monkeypatch.setattr(delta, "_git_records", records)
     # Memory tracing can be slower than ordinary inspection on CI workers.
@@ -173,11 +193,10 @@ def test_inspection_does_not_retain_the_path_inventory(tmp_path, monkeypatch):
     tracemalloc.start()
     try:
         count = delta.inspect_delta_metadata(tmp_path, DIFF, [], is_private=lambda p: False)
-        _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
     assert count == 10000
-    assert peak < 256 * 1024
+    assert max(samples) < 256 * 1024
 
 
 @pytest.mark.parametrize("failure", [None, "exit", "parse", "interrupt", "timeout", "unconsumed"])
