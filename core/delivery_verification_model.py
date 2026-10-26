@@ -30,6 +30,7 @@ _DELIVERY_VERIFICATION_RECOVERY_ACTIONS = {
     "readonly_mutation": "resolve_readonly_boundary",
     "validation_workspace_mutated": "resolve_readonly_boundary",
     "workspace_boundary_invalid": "resolve_workspace_boundary",
+    "evidence_budget_exhausted": "resolve_delivery_evidence_budget",
     "reverification_budget_exhausted": "resolve_delivery_verification_budget",
 }
 

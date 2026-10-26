@@ -11,6 +11,13 @@ import posixpath
 import subprocess
 from typing import Any
 
+from core.delivery_evidence_resolution import (
+    evidence_failure_code,
+    evidence_failure_message,
+    EvidenceResolver,
+    EvidenceResolutionLimit,
+    evidence_operation,
+)
 from core.delivery_checkpoint_model import (
     DeliveryCheckpoint,
     checkpoint_children,
@@ -18,7 +25,7 @@ from core.delivery_checkpoint_model import (
     checkpoint_input_units,
 )
 from core.delivery_plan import DeliveryPlan, DeliveryPlanIssue, DeliveryPlanUnit
-from core.delivery_progress import DeliveryStatusResult
+from core.delivery_progress import DeliveryStatusResult, DeliveryStatusUnit
 from core.delivery_verification_scope import DeliveryVerificationScope
 from core.state import StateStore
 from core.worktree import delivery_verification_git_env
@@ -171,7 +178,29 @@ def checkpoint_policy_payload(status: DeliveryStatusResult, scope: DeliveryVerif
 
 
 def checkpoint_pass_is_usable(
-    status: DeliveryStatusResult, checkpoint: DeliveryCheckpoint, cfg: dict[str, Any] | None = None
+    status: DeliveryStatusResult,
+    checkpoint: DeliveryCheckpoint,
+    cfg: dict[str, Any] | None = None,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> bool:
+    try:
+        return _checkpoint_pass_is_usable(status, checkpoint, cfg, resolver=resolver)
+    except EvidenceResolutionLimit:
+        if resolver is not None:
+            raise
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+@evidence_operation
+def _checkpoint_pass_is_usable(
+    status: DeliveryStatusResult,
+    checkpoint: DeliveryCheckpoint,
+    cfg: dict[str, Any] | None = None,
+    *,
+    resolver: EvidenceResolver | None = None,
 ) -> bool:
     from core.delivery_verification import build_delivery_verification_identity
     from core.delivery_verification_model import delivery_verification_covers_obligations
@@ -191,89 +220,87 @@ def checkpoint_pass_is_usable(
         record, len(checkpoint.obligation_ids)
     ):
         return False
-    try:
-        if record.review_rule_fingerprints is None or record.plan_content_fingerprint is None:
-            return False
-        root = Path(status.project_root)
-        from core.delivery_checkpoint_evidence import load_checkpoint_evidence
-        from core.delivery_progress import delivery_progress_path
-
-        evidence = load_checkpoint_evidence(
-            root,
-            delivery_progress_path(root, status.plan.plan_id).parent,
-            record,
-            plan_id=status.plan.plan_id,
-            node_id=checkpoint.id,
-        )
-        if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)):
-            return False
-        if checkpoint_children(status.plan.checkpoints, checkpoint.id):
-            from core.delivery_checkpoint_applicability import validate_node_evidence
-
-            validate_node_evidence(node, record, node_id=checkpoint.id)
-            if any(
-                not checkpoint_pass_is_usable(status, child, cfg)
-                for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
-            ):
-                return False
-        plan_path = Path(status.plan_path).relative_to(root).as_posix()
-        if (
-            _checkpoint_file_fingerprints(
-                root, record.candidate_commit, [plan_path], follow_links=False, normalize_newlines=True
-            )[plan_path]
-            != record.plan_content_fingerprint
-        ):
-            return False
-        checkpoint_plan_fingerprint(status, status.assembled_commit)
-        contract_paths = [
-            unit.task_path
-            for unit in status.plan.units
-            if unit.id in checkpoint_input_units(checkpoint.unit_ids, status.plan.units)
-        ]
-        # Checkout contracts bind the policy identity, but cannot attest to
-        # downstream changes that exist only in the assembled candidate.
-        reviewed_contracts = _checkpoint_file_fingerprints(
-            root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False
-        )
-        if record.candidate_commit != status.assembled_commit and reviewed_contracts != _checkpoint_file_fingerprints(
-            root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
-        ):
-            return False
-        source = status.plan.source_task
-        if source is None:
-            return False
-        for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
-            if _checkpoint_source_fingerprint(root, commit, source.path) != source.sha256:
-                return False
-            if (
-                checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
-                != record.review_rule_fingerprints
-            ):
-                return False
-        identity = build_delivery_verification_identity(node, cfg or {}, candidate_commit=record.candidate_commit)
-        keys = ("candidate_tree", "source_fingerprint", "completed_scope_fingerprint", "policy_fingerprint")
-        if any(getattr(record, key) != getattr(identity, key) for key in keys):
-            return False
-        if cfg is not None and record.config_fingerprint != identity.config_fingerprint:
-            return False
-        if (
-            status.assembly_status != "ready"
-            or delivery_branch_commit(root, status.plan.final_branch) != status.assembled_commit
-        ):
-            return False
-        # A receipt is a historical group handoff, not approval of later commits.
-        return (
-            subprocess.run(
-                ["git", "merge-base", "--is-ancestor", record.candidate_commit, status.assembled_commit],
-                cwd=root,
-                env=delivery_verification_git_env(),
-                capture_output=True,
-                check=False,
-            ).returncode
-            == 0
-        )
-    except (OSError, RuntimeError, ValueError):
+    if record.review_rule_fingerprints is None or record.plan_content_fingerprint is None:
         return False
+    root = Path(status.project_root)
+    from core.delivery_checkpoint_evidence import load_checkpoint_evidence
+    from core.delivery_progress import delivery_progress_path
+
+    evidence = load_checkpoint_evidence(
+        root,
+        delivery_progress_path(root, status.plan.plan_id).parent,
+        record,
+        plan_id=status.plan.plan_id,
+        node_id=checkpoint.id,
+        resolver=resolver,
+    )
+    if not evidence.covers(DeliveryVerificationScope.from_plan(status.plan, checkpoint.id)):
+        return False
+    if checkpoint_children(status.plan.checkpoints, checkpoint.id):
+        from core.delivery_checkpoint_applicability import validate_node_evidence
+
+        validate_node_evidence(node, record, node_id=checkpoint.id, resolver=resolver)
+        if any(
+            not checkpoint_pass_is_usable(status, child, cfg, resolver=resolver)
+            for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+        ):
+            return False
+    plan_path = Path(status.plan_path).relative_to(root).as_posix()
+    if (
+        _checkpoint_file_fingerprints(
+            root, record.candidate_commit, [plan_path], follow_links=False, normalize_newlines=True
+        )[plan_path]
+        != record.plan_content_fingerprint
+    ):
+        return False
+    checkpoint_plan_fingerprint(status, status.assembled_commit)
+    contract_paths = [
+        unit.task_path
+        for unit in status.plan.units
+        if unit.id in checkpoint_input_units(checkpoint.unit_ids, status.plan.units)
+    ]
+    # Checkout contracts bind the policy identity, but cannot attest to
+    # downstream changes that exist only in the assembled candidate.
+    reviewed_contracts = _checkpoint_file_fingerprints(
+        root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False
+    )
+    if record.candidate_commit != status.assembled_commit and reviewed_contracts != _checkpoint_file_fingerprints(
+        root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
+    ):
+        return False
+    source = status.plan.source_task
+    if source is None:
+        return False
+    for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
+        if _checkpoint_source_fingerprint(root, commit, source.path) != source.sha256:
+            return False
+        if (
+            checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
+            != record.review_rule_fingerprints
+        ):
+            return False
+    identity = build_delivery_verification_identity(node, cfg or {}, candidate_commit=record.candidate_commit)
+    keys = ("candidate_tree", "source_fingerprint", "completed_scope_fingerprint", "policy_fingerprint")
+    if any(getattr(record, key) != getattr(identity, key) for key in keys):
+        return False
+    if cfg is not None and record.config_fingerprint != identity.config_fingerprint:
+        return False
+    if (
+        status.assembly_status != "ready"
+        or delivery_branch_commit(root, status.plan.final_branch) != status.assembled_commit
+    ):
+        return False
+    # A receipt is a historical group handoff, not approval of later commits.
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", record.candidate_commit, status.assembled_commit],
+            cwd=root,
+            env=delivery_verification_git_env(),
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collection[str]) -> dict[str, str]:
@@ -498,10 +525,31 @@ def _checkpoint_runtime_consumers(checkpoint: DeliveryCheckpoint, units: list[De
 def checkpoint_barrier_issue(
     status: DeliveryStatusResult, cfg: dict[str, Any] | None = None, *, unit_id: str | None = None
 ) -> DeliveryPlanIssue | None:
+    boundary = checkpoint_boundary_issue(status)
+    if boundary is not None:
+        return boundary
+    try:
+        return _checkpoint_barrier_issue(status, cfg, unit_id=unit_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return DeliveryPlanIssue(
+            "error",
+            evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+            evidence_failure_message(exc, "Checkpoint evidence resolution could not complete safely."),
+        )
+
+
+@evidence_operation
+def _checkpoint_barrier_issue(
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any] | None = None,
+    *,
+    unit_id: str | None = None,
+    resolver: EvidenceResolver | None = None,
+) -> DeliveryPlanIssue | None:
     if not status.valid or status.plan is None:
         return None
     for checkpoint in getattr(status.plan, "checkpoints", ()):
-        if checkpoint_pass_is_usable(status, checkpoint, cfg):
+        if checkpoint_pass_is_usable(status, checkpoint, cfg, resolver=resolver):
             continue
         guarded = _checkpoint_runtime_consumers(checkpoint, status.plan.units)
         from core.delivery_repair import candidate_repair_reconciles_checkpoint
@@ -611,11 +659,13 @@ def checkpoint_preflight_issue(
                 plan_id=status.plan.plan_id,
                 node_id=status.verification_node,
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             return DeliveryPlanIssue(
                 "error",
-                "delivery_checkpoint.evidence_unavailable",
-                "Accepted checkpoint evidence is missing or invalid; restore its captured evidence.",
+                evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+                evidence_failure_message(
+                    exc, "Accepted checkpoint evidence is missing or invalid; restore its captured evidence."
+                ),
             )
     if record is not None and record.status in {"blocked", "failed"}:
         if record.security_status == "rejected":
@@ -735,40 +785,94 @@ def checkpoint_authority_evidence_issue(
                     # may remain absent from the assembled candidate.
                     if assembled != expected and not (actual == assembled == "absent"):
                         raise ValueError("Executed contract changed in candidate")
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         return DeliveryPlanIssue(
             "error",
-            "delivery_checkpoint.evidence_unavailable",
-            "Checkpoint source and contracts must match immutable authority evidence.",
+            evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+            evidence_failure_message(exc, "Checkpoint source and contracts must match immutable authority evidence."),
         )
     return None
 
 
+def checkpoint_boundary_issue(status: DeliveryStatusResult) -> DeliveryPlanIssue | None:
+    """Known terminal classifications never depend on resolving private sidecars."""
+    from core.delivery_verification_model import delivery_verification_is_boundary_stop
+
+    for record in [status.verification, *status.checkpoint_verifications.values()]:
+        if record is not None and delivery_verification_is_boundary_stop(record):
+            return DeliveryPlanIssue(
+                "error",
+                "delivery_verification.security_rejected"
+                if record.security_status == "rejected"
+                else record.stop_code or "delivery_verification.security_rejected",
+                "Verification retains a terminal security or workspace boundary.",
+            )
+    return None
+
+
 def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] | None = None) -> DeliveryStatusResult:
+    if status.plan and checkpoint_boundary_issue(status) is not None:
+        return replace(
+            status,
+            units=_checkpoint_barrier_units(status, frozenset()),
+            checkpoint_handoffs=frozenset(),
+            checkpoint_candidate_evidence={node.id: "unavailable" for node in status.plan.checkpoints},
+        )
+    try:
+        return _with_checkpoint_barriers(status, cfg)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return replace(
+            status,
+            status="invalid",
+            checkpoint_handoffs=frozenset(),
+            checkpoint_candidate_evidence={node.id: "unavailable" for node in status.plan.checkpoints},
+            errors=[
+                *status.errors,
+                DeliveryPlanIssue(
+                    "error",
+                    evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+                    evidence_failure_message(exc, "Checkpoint evidence resolution could not complete safely."),
+                ),
+            ],
+            next_action="resolve checkpoint evidence availability or resource limits",
+        )
+
+
+@evidence_operation
+def _with_checkpoint_barriers(
+    status: DeliveryStatusResult, cfg: dict[str, Any] | None = None, *, resolver: EvidenceResolver | None = None
+) -> DeliveryStatusResult:
     if status.plan is None or not status.plan.checkpoints:
         return status
-    usable = frozenset(item.id for item in status.plan.checkpoints if checkpoint_pass_is_usable(status, item, cfg))
+    usable = frozenset(
+        item.id for item in status.plan.checkpoints if checkpoint_pass_is_usable(status, item, cfg, resolver=resolver)
+    )
     from core.delivery_checkpoint_applicability import checkpoint_applicability
 
-    applicability = checkpoint_applicability(status, cfg, usable)
-    guarded = {
-        item.id: _checkpoint_runtime_consumers(item, status.plan.units)
-        for item in status.plan.checkpoints
-        if item.id not in usable
-    }
-    units = [
-        replace(unit, blocked_by_checkpoints=[key for key, members in guarded.items() if unit.id in members])
-        for unit in status.units
-    ]
+    applicability = checkpoint_applicability(status, cfg, usable, resolver=resolver)
+    guarded = [item.id for item in status.plan.checkpoints if item.id not in usable]
     return replace(
         status,
-        units=units,
+        units=_checkpoint_barrier_units(status, usable),
         checkpoint_handoffs=usable,
         checkpoint_candidate_evidence={key: item.status for key, item in applicability.items()},
         next_action="continue checkpoint verification or recovery with delivery run"
         if any(verification_scope_complete(verification_node_status(status, key)) for key in guarded)
         else status.next_action,
     )
+
+
+def _checkpoint_barrier_units(status: DeliveryStatusResult, usable: frozenset[str]) -> list[DeliveryStatusUnit]:
+    """Project dependency barriers from the plan without resolving private evidence."""
+    guarded = {
+        item.id: _checkpoint_runtime_consumers(item, status.plan.units)
+        for item in status.plan.checkpoints
+        if item.id not in usable
+    }
+    return [
+        replace(unit, blocked_by_checkpoints=[key for key, members in guarded.items() if unit.id in members])
+        for unit in status.units
+    ]
 
 
 def checkpoint_repair_control_issues(plan: DeliveryPlan, root: Path) -> list[DeliveryPlanIssue]:

@@ -1275,6 +1275,7 @@ def test_checkpoint_status_projects_changed_review_policy_as_stale(checkpoint_pl
 def test_checkpoint_terminal_verdict_preempts_further_providers(
     checkpoint_plan, code: str, security: str, stale: bool
 ) -> None:
+    from core.delivery_progress import select_next_delivery_unit
     from sikula_cli.delivery import _run_delivery_plan
 
     path, cfg = checkpoint_plan
@@ -1293,6 +1294,13 @@ def test_checkpoint_terminal_verdict_preempts_further_providers(
     write_delivery_progress(progress_path, replace(progress, checkpoint_verifications={"storage": record}))
     if stale:
         path.write_text(path.read_text() + "\n# metadata edit\n")
+
+    status = get_delivery_status(path)
+    consumer = next(unit for unit in status.units if unit.id == "consumer")
+    assert consumer.dependency_ready
+    assert consumer.to_dict()["eligible"] is False
+    assert consumer.blocked_by_checkpoints == ["storage"]
+    assert select_next_delivery_unit(status) is None
 
     def forbidden(*args):
         pytest.fail("Terminal checkpoint must preempt providers")

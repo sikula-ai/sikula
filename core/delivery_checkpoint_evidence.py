@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING
 
+from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_repair_storage import read_repair_state, write_repair_state
 from core.delivery_verification_model import DeliveryVerificationRecord, parse_delivery_verification_record
 from core.delivery_verification_review import DeliveryIntegrationAssessment, DeliveryObligationAssessment
@@ -258,6 +259,7 @@ def _store_evidence(
     return fingerprint
 
 
+@evidence_operation
 def load_checkpoint_evidence(
     root: Path,
     directory: Path,
@@ -266,40 +268,45 @@ def load_checkpoint_evidence(
     plan_id: str,
     node_id: str,
     _ancestors: frozenset[str] = frozenset(),
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryVerificationEvidence:
     """Load explicit results, never infer them from counts or replay review audit."""
-    from core.delivery_candidate_control import expand_record
+    resolver = resolver or EvidenceResolver()
+    with resolver.visit(str(root), plan_id, node_id, record.gate_id, str(record.attempt)):
+        from core.delivery_candidate_control import expand_record
 
-    record = expand_record(root, directory, record)
+        record = expand_record(root, directory, record, resolver=resolver)
 
-    if node_id == "root" or not record.passed or record.checkpoint_evidence_fingerprint is None:
-        raise ValueError("Accepted checkpoint evidence is unavailable.")
-    try:
-        payload = read_repair_state(root, checkpoint_evidence_path(directory, record))
-        intact = payload is not None and _fingerprint(payload) == record.checkpoint_evidence_fingerprint
-    except (RecursionError, TypeError):
-        raise ValueError("Accepted checkpoint evidence is invalid.") from None
-    if not intact:
-        raise ValueError("Accepted checkpoint evidence is unavailable.")
-    if payload.get("child_evidence") is not None:
-        if node_id in _ancestors or len(_ancestors) >= 256:
-            raise ValueError("Invalid recursive checkpoint evidence.")
+        if node_id == "root" or not record.passed or record.checkpoint_evidence_fingerprint is None:
+            raise ValueError("Accepted checkpoint evidence is unavailable.")
         try:
-            return _parse_node_closure(
-                root,
-                directory,
-                payload,
-                record,
-                plan_id=plan_id,
-                node_id=node_id,
-                unit_order=None,
-                _ancestors=_ancestors | {node_id},
-            )
-        except (KeyError, TypeError, AttributeError, RecursionError):
-            raise ValueError("Accepted checkpoint closure is invalid.") from None
-    return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id)
+            payload = resolver.read(root, checkpoint_evidence_path(directory, record), reader=read_repair_state)
+            intact = payload is not None and _fingerprint(payload) == record.checkpoint_evidence_fingerprint
+        except (RecursionError, TypeError):
+            raise ValueError("Accepted checkpoint evidence is invalid.") from None
+        if not intact:
+            raise ValueError("Accepted checkpoint evidence is unavailable.")
+        if payload.get("child_evidence") is not None:
+            if node_id in _ancestors or len(_ancestors) >= 256:
+                raise ValueError("Invalid recursive checkpoint evidence.")
+            try:
+                return _parse_node_closure(
+                    root,
+                    directory,
+                    payload,
+                    record,
+                    plan_id=plan_id,
+                    node_id=node_id,
+                    unit_order=None,
+                    _ancestors=_ancestors | {node_id},
+                    resolver=resolver,
+                )
+            except (KeyError, TypeError, AttributeError, RecursionError):
+                raise ValueError("Accepted checkpoint closure is invalid.") from None
+        return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id)
 
 
+@evidence_operation
 def load_root_evidence(
     root: Path,
     directory: Path,
@@ -307,27 +314,40 @@ def load_root_evidence(
     *,
     plan_id: str,
     unit_order: tuple[str, ...] | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryVerificationEvidence:
     """Load the accepted root's typed results, not its aggregate success counts."""
-    if not record.passed or record.root_evidence_fingerprint is None:
-        raise ValueError("Accepted root evidence is unavailable.")
-    try:
-        payload = read_repair_state(root, root_evidence_path(directory, record.root_evidence_fingerprint))
-        intact = payload is not None and _fingerprint(payload) == record.root_evidence_fingerprint
-    except (RecursionError, TypeError):
-        raise ValueError("Accepted root evidence is invalid.") from None
-    if not intact:
-        raise ValueError("Accepted root evidence is unavailable.")
-    if payload.get("child_evidence") is not None:
+    resolver = resolver or EvidenceResolver()
+    with resolver.visit(str(root), plan_id, "root", record.gate_id, str(record.attempt)):
+        if not record.passed or record.root_evidence_fingerprint is None:
+            raise ValueError("Accepted root evidence is unavailable.")
         try:
-            return _parse_node_closure(
-                root, directory, payload, record, plan_id=plan_id, node_id="root", unit_order=unit_order
+            payload = resolver.read(
+                root, root_evidence_path(directory, record.root_evidence_fingerprint), reader=read_repair_state
             )
-        except (KeyError, TypeError, AttributeError, RecursionError):
-            raise ValueError("Accepted root closure is invalid.") from None
-    return _parse_evidence(payload, record, plan_id=plan_id, node_id="root")
+            intact = payload is not None and _fingerprint(payload) == record.root_evidence_fingerprint
+        except (RecursionError, TypeError):
+            raise ValueError("Accepted root evidence is invalid.") from None
+        if not intact:
+            raise ValueError("Accepted root evidence is unavailable.")
+        if payload.get("child_evidence") is not None:
+            try:
+                return _parse_node_closure(
+                    root,
+                    directory,
+                    payload,
+                    record,
+                    plan_id=plan_id,
+                    node_id="root",
+                    unit_order=unit_order,
+                    resolver=resolver,
+                )
+            except (KeyError, TypeError, AttributeError, RecursionError):
+                raise ValueError("Accepted root closure is invalid.") from None
+        return _parse_evidence(payload, record, plan_id=plan_id, node_id="root")
 
 
+@evidence_operation
 def _parse_node_closure(
     root: Path,
     directory: Path,
@@ -338,9 +358,12 @@ def _parse_node_closure(
     node_id: str,
     unit_order: tuple[str, ...] | None,
     _ancestors: frozenset[str] = frozenset(),
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryVerificationEvidence:
     """Resolve bounded immediate children for deterministic coverage, never into prompts."""
     from core.delivery_composition import MAX_COMPOSITION_CHILDREN, composition_evidence_path, fingerprint
+
+    resolver = resolver or EvidenceResolver()
 
     if set(payload) != {
         "schema_version",
@@ -356,7 +379,9 @@ def _parse_node_closure(
     children = payload["child_evidence"]
     if not isinstance(children, list) or not 0 < len(children) <= MAX_COMPOSITION_CHILDREN:
         raise ValueError("Invalid root closure fan-in.")
-    composed = read_repair_state(root, composition_evidence_path(directory, record.composition_evidence_fingerprint))
+    composed = resolver.read(
+        root, composition_evidence_path(directory, record.composition_evidence_fingerprint), reader=read_repair_state
+    )
     if (
         not composed
         or fingerprint(composed) != record.composition_evidence_fingerprint
@@ -377,6 +402,9 @@ def _parse_node_closure(
     if len(set(ids)) != len(ids) or any(item["outcome"] != "applicable" for item in decisions):
         raise ValueError("Root closure requires every child to be applicable.")
     origins = {}
+    resolver.expand(
+        len(payload["completed_units"]) + len(payload["constraint_ids"]) + len(payload["obligation_results"])
+    )
     units = list(payload["completed_units"])
     constraints = set(payload["constraint_ids"])
     results = list(payload["obligation_results"])
@@ -385,9 +413,11 @@ def _parse_node_closure(
             raise ValueError("Invalid child closure reference.")
         origin = parse_delivery_verification_record(child["verification"])
         evidence = load_checkpoint_evidence(
-            root, directory, origin, plan_id=plan_id, node_id=child["node_id"], _ancestors=_ancestors
+            root, directory, origin, plan_id=plan_id, node_id=child["node_id"], _ancestors=_ancestors, resolver=resolver
         )
         origins[child["node_id"]] = origin.checkpoint_evidence_fingerprint
+        resolver.expand(len(evidence.completed_units) + len(evidence.constraint_ids) + len(evidence.obligation_results))
+        resolver.materialize((evidence.completed_units, evidence.constraint_ids, evidence.obligation_results))
         units.extend(unit.to_dict() for unit in evidence.completed_units)
         constraints.update(evidence.constraint_ids)
         results.extend(result.to_dict() for result in evidence.obligation_results)
@@ -406,6 +436,7 @@ def _parse_node_closure(
         constraint_ids=sorted(constraints),
         obligation_results=results,
     )
+    resolver.materialize(expanded)
     return _parse_evidence(expanded, record, plan_id=plan_id, node_id=node_id)
 
 
@@ -457,20 +488,28 @@ def build_node_closure(
     inherited_constraints = set()
     children = []
     expected = {unit.unit_id: unit for unit in snapshot.completed_units}
-    for ref in composition.child_refs:
-        origin = attempt.origin(ref["id"], digest=ref["evidence_fingerprint"])
-        if origin.checkpoint_evidence_fingerprint != ref["evidence_fingerprint"]:
-            raise ValueError("Root closure child changed.")
-        child = load_checkpoint_evidence(root, directory, origin, plan_id=snapshot.scope.plan_id, node_id=ref["id"])
-        if not child.covers(attempt.scope.child(ref["id"])):
-            raise ValueError("Node closure child coverage changed.")
-        if any(expected.get(unit.unit_id) != unit for unit in child.completed_units):
-            raise ValueError("Root closure child execution changed.")
-        covered.update(unit.unit_id for unit in child.completed_units)
-        inherited_constraints.update(child.constraint_ids)
-        from core.delivery_candidate_control import compact_record
+    with EvidenceResolver() as resolver:
+        for ref in composition.child_refs:
+            origin = attempt.origin(ref["id"], digest=ref["evidence_fingerprint"], resolver=resolver)
+            if origin.checkpoint_evidence_fingerprint != ref["evidence_fingerprint"]:
+                raise ValueError("Root closure child changed.")
+            child = load_checkpoint_evidence(
+                root, directory, origin, plan_id=snapshot.scope.plan_id, node_id=ref["id"], resolver=resolver
+            )
+            if not child.covers(attempt.scope.child(ref["id"])):
+                raise ValueError("Node closure child coverage changed.")
+            if any(expected.get(unit.unit_id) != unit for unit in child.completed_units):
+                raise ValueError("Root closure child execution changed.")
+            covered.update(unit.unit_id for unit in child.completed_units)
+            inherited_constraints.update(child.constraint_ids)
+            children.append((ref["id"], origin))
+    # Publication is a separate phase; no read context survives these writes.
+    from core.delivery_candidate_control import compact_record
 
-        children.append({"node_id": ref["id"], "verification": compact_record(root, directory, origin).to_dict()})
+    children = [
+        {"node_id": node, "verification": compact_record(root, directory, origin).to_dict()}
+        for node, origin in children
+    ]
     payload = {
         "schema_version": 1,
         "plan_id": snapshot.scope.plan_id,

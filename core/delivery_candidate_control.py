@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
+from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_repair_storage import read_repair_state, write_repair_state
 from core.delivery_verification_model import DeliveryVerificationRecord, parse_delivery_verification_record
 
@@ -21,14 +22,18 @@ class CandidateBudgetExceeded(ValueError):
     """The persisted subtree has spent its finite node reservations."""
 
 
-def expand_record(root: Path, directory: Path, record: DeliveryVerificationRecord) -> DeliveryVerificationRecord:
+@evidence_operation
+def expand_record(
+    root: Path, directory: Path, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> DeliveryVerificationRecord:
     from core.delivery_composition import fingerprint
 
     control = record.reverification
     if control is None or "reference" not in control:
         return record
     digest = control["reference"]
-    payload = read_repair_state(root, directory / f"candidate-node-{digest[7:]}.json")
+    resolver = resolver or EvidenceResolver()
+    payload = resolver.read(root, directory / f"candidate-node-{digest[7:]}.json", reader=read_repair_state)
     if (
         not payload
         or set(payload) != {"gate_id", "control"}
@@ -52,23 +57,33 @@ def compact_record(root: Path, directory: Path, record: DeliveryVerificationReco
     return replace(record, reverification={"reference": digest})
 
 
-def expanded_child(status: DeliveryStatusResult, entry: dict[str, Any]) -> DeliveryVerificationRecord:
+@evidence_operation
+def expanded_child(
+    status: DeliveryStatusResult, entry: dict[str, Any], *, resolver: EvidenceResolver | None = None
+) -> DeliveryVerificationRecord:
     root = Path(status.project_root)
     return expand_record(
         root,
         delivery_progress_path(root, status.plan.plan_id).parent,
         parse_delivery_verification_record(entry["verification"]),
+        resolver=resolver,
     )
 
 
+@evidence_operation
 def record_at(
-    root: Path, directory: Path, anchor: DeliveryVerificationRecord, route: tuple[str, ...]
+    root: Path,
+    directory: Path,
+    anchor: DeliveryVerificationRecord,
+    route: tuple[str, ...],
+    *,
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryVerificationRecord:
     record = anchor
     for key in route:
-        record = expand_record(root, directory, record)
+        record = expand_record(root, directory, record, resolver=resolver)
         record = parse_delivery_verification_record(record.reverification["children"][key]["verification"])
-    return expand_record(root, directory, record)
+    return expand_record(root, directory, record, resolver=resolver)
 
 
 def replace_at(
@@ -101,11 +116,14 @@ def replace_at(
     return replace(record, reverification=control)
 
 
-def reserved_node_count(root: Path, directory: Path, record: DeliveryVerificationRecord) -> int:
+@evidence_operation
+def reserved_node_count(
+    root: Path, directory: Path, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> int:
     pending = [record]
     seen = set()
     while pending:
-        item = expand_record(root, directory, pending.pop())
+        item = expand_record(root, directory, pending.pop(), resolver=resolver)
         if item.gate_id in seen:
             raise ValueError("Repeated candidate node identity.")
         seen.add(item.gate_id)

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_checkpoint_evidence import load_root_evidence
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
 from core.delivery_verification_model import DeliveryVerificationRecord, delivery_verification_is_boundary_stop
@@ -28,8 +29,16 @@ class CheckpointApplicability:
     binding: str | None = None
 
 
-def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, node_id: str) -> None:
+@evidence_operation
+def validate_node_evidence(
+    status: DeliveryStatusResult,
+    record: DeliveryVerificationRecord,
+    *,
+    node_id: str,
+    resolver: EvidenceResolver | None = None,
+) -> None:
     """Validate exact typed coverage; the caller separately validates freshness."""
+    resolver = resolver or EvidenceResolver()
     if not status.plan or not status.project_root:
         raise ValueError("Node evidence requires plan authority.")
     from core.delivery_reverification import validate_reverification
@@ -37,7 +46,7 @@ def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerific
 
     scope = DeliveryVerificationScope.from_plan(status.plan, node_id)
     composition_scope = delivery_composition_scope(status.plan, scope)
-    validate_reverification(status, record, scope=composition_scope)
+    validate_reverification(status, record, scope=composition_scope, resolver=resolver)
     root = Path(status.project_root)
     if node_id == "root":
         evidence = load_root_evidence(
@@ -45,6 +54,7 @@ def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerific
             delivery_progress_path(root, status.plan.plan_id).parent,
             record,
             plan_id=status.plan.plan_id,
+            resolver=resolver,
             unit_order=(
                 tuple(sorted(unit.id for unit in status.units if unit.status == "done"))
                 if any(node.parent_id != "root" for node in status.plan.checkpoints)
@@ -59,6 +69,7 @@ def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerific
             delivery_progress_path(root, status.plan.plan_id).parent,
             record,
             plan_id=status.plan.plan_id,
+            resolver=resolver,
             node_id=node_id,
         )
     if not evidence.covers(scope):
@@ -66,7 +77,7 @@ def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     if record.composition_evidence_fingerprint:
         from core.delivery_composition import load_composition
 
-        composition = load_composition(status, record, scope=composition_scope)
+        composition = load_composition(status, record, scope=composition_scope, resolver=resolver)
         actual = {item.id: item.outcome for item in evidence.obligation_results}
         outcomes_match = (
             (
@@ -81,17 +92,24 @@ def validate_node_evidence(status: DeliveryStatusResult, record: DeliveryVerific
     if record.security_composition_evidence_fingerprint:
         from core.delivery_composition import load_composition
 
-        security = load_composition(status, record, review_kind="security", scope=composition_scope)
+        security = load_composition(status, record, review_kind="security", scope=composition_scope, resolver=resolver)
         if not security.fallback and not security.assessment.approved:
             raise ValueError("Security composition changed.")
 
 
-def validate_root_evidence(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> None:
-    validate_node_evidence(status, record, node_id="root")
+def validate_root_evidence(
+    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> None:
+    validate_node_evidence(status, record, node_id="root", resolver=resolver)
 
 
+@evidence_operation
 def checkpoint_applicability(
-    status: DeliveryStatusResult, cfg: dict[str, Any] | None, usable_handoffs: frozenset[str]
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any] | None,
+    usable_handoffs: frozenset[str],
+    *,
+    resolver: EvidenceResolver | None = None,
 ) -> dict[str, CheckpointApplicability]:
     """Derive bounded decisions from accepted evidence, never audit history.
 
@@ -133,13 +151,13 @@ def checkpoint_applicability(
         try:
             from core.delivery_reverification import validate_reverification
 
-            validate_reverification(status, root_record, cfg)
+            validate_reverification(status, root_record, cfg, resolver=resolver)
             from core.delivery_candidate_control import expanded_child
 
             pending = list(root_record.reverification["children"].items())
             while pending:
                 key, entry = pending.pop()
-                child = expanded_child(status, entry)
+                child = expanded_child(status, entry, resolver=resolver)
                 if child.passed:
                     current_children[key] = child.checkpoint_evidence_fingerprint
                 pending.extend((child.reverification or {}).get("children", {}).items())
@@ -147,7 +165,7 @@ def checkpoint_applicability(
             root_unavailable = True
     if root_current:
         try:
-            validate_root_evidence(status, root_record)
+            validate_root_evidence(status, root_record, resolver=resolver)
         except (OSError, RuntimeError, ValueError):
             root_current = False
             root_unavailable = True

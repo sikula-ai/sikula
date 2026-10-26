@@ -16,6 +16,7 @@ from agents.delivery_integration_review_agent import (
     DeliveryIntegrationReviewResult,
     DeliveryIntegrationReviewAttempt,
 )
+from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code
 from core.delivery_finalize import assemble_delivery_candidate
 from core.llm_client import LLMConfigurationError, LLMReadOnlyViolation
 from core.delivery_plan import DeliveryPlanIssue
@@ -314,8 +315,10 @@ def verify_delivery_plan(
 
                 try:
                     plan_content_fingerprint = checkpoint_plan_fingerprint(status, candidate_commit)
-                except (OSError, UnicodeError, ValueError):
-                    return _blocked_result(status, "delivery_checkpoint.evidence_unavailable")
+                except (OSError, UnicodeError, ValueError) as exc:
+                    return _blocked_result(
+                        status, evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable")
+                    )
 
                 roles = ("reviewer", "security_reviewer") if snapshot.scope.security_required else ("reviewer",)
                 paths = [
@@ -489,7 +492,7 @@ def verify_delivery_plan(
         terminal = replace(
             running,
             status="blocked",
-            stop_code="delivery_verification.internal_failure",
+            stop_code=evidence_failure_code(exc, "delivery_verification.internal_failure"),
             completed_at=_now(),
         )
         _safe_append_audit(
@@ -693,8 +696,10 @@ def _execute_gate(
                     preflight_candidate_tree(status, project_config, snapshot, worktree, source_task, record=running)
                 except CandidateReviewBoundsError:
                     return _review_blocked(running, validation, "delivery_verification.hierarchy_required")
-                except (OSError, ValueError):
-                    return _review_blocked(running, validation, "delivery_verification.evidence_unavailable")
+                except (OSError, ValueError) as exc:
+                    return _review_blocked(
+                        running, validation, evidence_failure_code(exc, "delivery_verification.evidence_unavailable")
+                    )
             try:
                 semantic_reviewer.prepare_workspace(worktree)
             except LLMReadOnlyViolation:
@@ -960,11 +965,11 @@ def _execute_gate(
                         composition=semantic.composition,
                         status=status,
                     )
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     return replace(
                         passed,
                         status="blocked",
-                        stop_code="delivery_checkpoint.evidence_unavailable",
+                        stop_code=evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
                     )
                 passed = replace(passed, checkpoint_evidence_fingerprint=fingerprint)
             elif status.plan.checkpoints:
@@ -983,8 +988,12 @@ def _execute_gate(
                             else {}
                         ),
                     )
-                except (OSError, ValueError):
-                    return replace(passed, status="blocked", stop_code="delivery_verification.evidence_unavailable")
+                except (OSError, ValueError) as exc:
+                    return replace(
+                        passed,
+                        status="blocked",
+                        stop_code=evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+                    )
                 passed = replace(passed, root_evidence_fingerprint=fingerprint)
             return passed
     except _CandidateRepairRequired as exc:
@@ -1344,11 +1353,13 @@ def _composition_review(
                 ),
             ),
         )
-    except (OSError, ValueError, KeyError, DeliveryProgressLockError):
+    except (OSError, ValueError, KeyError, DeliveryProgressLockError) as exc:
         # Validation and accepted-result loading also read private evidence
         # between exchanges; storage loss must stop the entire cycle safely.
         raise DeliveryIntegrationReviewAgentError(
-            "delivery_verification.evidence_unavailable", "Composition evidence is unavailable.", []
+            evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+            evidence_failure_message(exc, "Composition evidence is unavailable."),
+            [],
         ) from None
 
 
@@ -1821,9 +1832,11 @@ def _composition_exchange(
             reverification=control,
         )
         return (None if result.composition.fallback else result), running
-    except (OSError, ValueError, KeyError, DeliveryProgressLockError):
+    except (OSError, ValueError, KeyError, DeliveryProgressLockError) as exc:
         raise DeliveryIntegrationReviewAgentError(
-            "delivery_verification.evidence_unavailable", "Composition evidence is unavailable.", []
+            evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+            evidence_failure_message(exc, "Composition evidence is unavailable."),
+            [],
         ) from None
 
 
@@ -2056,11 +2069,11 @@ def _persist_terminal_if_current(
                     from core.delivery_checkpoint_applicability import validate_node_evidence
 
                     validate_node_evidence(status, terminal, node_id=node_id)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     terminal = replace(
                         terminal,
                         status="blocked",
-                        stop_code="delivery_checkpoint.evidence_unavailable",
+                        stop_code=evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
                         checkpoint_evidence_fingerprint=None,
                     )
                     if terminal.evidence_path:
@@ -2072,11 +2085,11 @@ def _persist_terminal_if_current(
             if node_id == "root" and terminal.passed and status.plan.checkpoints:
                 try:
                     validate_root_evidence(status, terminal)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     terminal = replace(
                         terminal,
                         status="blocked",
-                        stop_code="delivery_verification.evidence_unavailable",
+                        stop_code=evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
                         root_evidence_fingerprint=None,
                     )
                     if terminal.evidence_path:
@@ -2222,7 +2235,7 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                         break
             return _blocked_result(status, boundary.stop_code or "delivery_verification.security_rejected")
         issue = checkpoint_barrier_issue(status, project_config)
-        if issue is not None and issue.code == "delivery_checkpoint.handoff_stale":
+        if issue is not None and issue.code != "delivery_checkpoint.required":
             return _blocked_result(status, issue.code, [issue])
         if any(
             not checkpoint_pass_is_usable(status, checkpoint, project_config)
@@ -2255,8 +2268,8 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                         load_composition(status, record, review_kind=role)
                 if reverification_budget_exhausted(status, record):
                     return _blocked_result(status, "delivery_verification.reverification_budget_exhausted")
-        except (OSError, ValueError, KeyError, TypeError):
-            return _blocked_result(status, "delivery_verification.evidence_unavailable")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return _blocked_result(status, evidence_failure_code(exc, "delivery_verification.evidence_unavailable"))
     from core.delivery_candidate_repair import (
         CANDIDATE_REPAIR_REQUIRED,
         resolve_candidate_repair,
@@ -2277,8 +2290,8 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
             ):
                 resolve_candidate_repair(status, project_config or {})
                 return _result_from_record(status, status.verification, succeeded=False, next_action="run_delivery")
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            return _blocked_result(status, "delivery_verification.evidence_unavailable")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            return _blocked_result(status, evidence_failure_code(exc, "delivery_verification.evidence_unavailable"))
     if readiness.required and not status.progress_exists:
         return _blocked_result(status, "delivery_verification.progress_missing")
     if (
@@ -2297,8 +2310,8 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                 status.verification, identity, obligation_count=_status_obligation_count(status)
             ):
                 validate_root_evidence(status, status.verification)
-        except (OSError, RuntimeError, ValueError):
-            return _blocked_result(status, "delivery_verification.evidence_unavailable")
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _blocked_result(status, evidence_failure_code(exc, "delivery_verification.evidence_unavailable"))
     return None
 
 

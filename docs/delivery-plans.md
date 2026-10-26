@@ -763,6 +763,14 @@ success counts or audit logs. Original checkpoint evidence remains required.
 Only bounded status metadata is projected publicly. Neither artifact contents
 nor past review history accumulate in provider prompts.
 
+Recursive evidence checks share parsed artifacts only within the current read
+operation. File contents are rechecked before completion, and a new operation
+reloads them. Aggregate limits bound file reads, parsing, retained cache and
+expanded coverage. `delivery_verification.evidence_budget_exhausted` reports a
+technical resource stop: investigate the evidence graph and supported limits
+before continuing. It does not request a semantic repair, reset provider budgets
+or override an existing security/read-only stop.
+
 Each checkpoint and the root allow one repair unit and two durable authoring
 attempts. N checkpoints therefore allow at most N+1 automatic repair units, bounded
 further by `--max-units` / `--max-elapsed-minutes` per invocation. Resume, new

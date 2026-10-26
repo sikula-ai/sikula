@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import json
 from typing import TYPE_CHECKING, Any
 
+from core.delivery_evidence_resolution import EvidenceResolver
 from core.delivery_verification_model import DeliveryVerificationRecord, parse_delivery_verification_record
 from core.delivery_verification_scope import DeliveryVerificationScope
 
@@ -110,7 +111,9 @@ class DeliveryCompositionAttempt:
             raise ValueError("Accepted candidate evidence is outside the composition scope.")
         return cls(scope, json.dumps(records), json.dumps(parent.to_dict()) if parent else None)
 
-    def origin(self, node_id: str, *, digest: str | None = None) -> DeliveryVerificationRecord:
+    def origin(
+        self, node_id: str, *, digest: str | None = None, resolver: EvidenceResolver | None = None
+    ) -> DeliveryVerificationRecord:
         self.scope.child(node_id)
         historical = parse_delivery_verification_record(json.loads(self._historical_json)[node_id])
         parent = parse_delivery_verification_record(json.loads(self._parent_json)) if self._parent_json else None
@@ -125,7 +128,9 @@ class DeliveryCompositionAttempt:
             if self._project_root is None:
                 raise ValueError("Candidate control requires an evidence store.")
             root = Path(self._project_root)
-            record = expand_record(root, delivery_progress_path(root, self.scope.parent.plan_id).parent, record)
+            record = expand_record(
+                root, delivery_progress_path(root, self.scope.parent.plan_id).parent, record, resolver=resolver
+            )
         return record
 
     def assert_record(self, record: DeliveryVerificationRecord) -> None:

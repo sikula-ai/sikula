@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING, Callable
 
+from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
 from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_progress import DeliveryStatusResult, delivery_progress_path
@@ -201,6 +202,7 @@ def accepted_composition_origin(
     return historical
 
 
+@evidence_operation
 def validate_reverification(
     status: DeliveryStatusResult,
     record: DeliveryVerificationRecord,
@@ -208,9 +210,11 @@ def validate_reverification(
     *,
     scope: DeliveryCompositionScope | None = None,
     _seen: set[str] | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> None:
     from core.delivery_candidate_control import MAX_CANDIDATE_NODES, expanded_child
 
+    resolver = resolver or EvidenceResolver()
     _seen = set() if _seen is None else _seen
     if record.gate_id in _seen or len(_seen) >= MAX_CANDIDATE_NODES:
         raise ValueError("Repeated or oversized candidate review tree.")
@@ -221,7 +225,9 @@ def validate_reverification(
         from core.delivery_candidate_control import expand_record
 
         root = Path(status.project_root)
-        record = expand_record(root, delivery_progress_path(root, status.plan.plan_id).parent, record)
+        record = expand_record(
+            root, delivery_progress_path(root, status.plan.plan_id).parent, record, resolver=resolver
+        )
     parse_reverification(record.reverification, record.to_dict())
     composition_scope = scope or delivery_composition_scope(
         status.plan, DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
@@ -241,38 +247,42 @@ def validate_reverification(
             if historical is None or historical.checkpoint_evidence_fingerprint != item["origin"]:
                 raise ValueError("Candidate refresh admission changed.")
             evidence = load_checkpoint_evidence(
-                root, directory, historical, plan_id=status.plan.plan_id, node_id=node_id
+                root, directory, historical, plan_id=status.plan.plan_id, node_id=node_id, resolver=resolver
             )
             if not evidence.covers(child_scope):
                 raise ValueError("Candidate refresh coverage changed.")
             if request["review_reserved"]:
                 entry = record.reverification["children"].get(node_id)
-                if entry is None or not expanded_child(status, entry).passed:
+                if entry is None or not expanded_child(status, entry, resolver=resolver).passed:
                     raise ValueError("Candidate refresh prerequisites are incomplete.")
     for role, digest in (
         ("semantic", record.composition_evidence_fingerprint),
         ("security", record.security_composition_evidence_fingerprint),
     ):
         if digest:
-            load_composition(status, record, review_kind=role, scope=composition_scope)
+            load_composition(status, record, review_kind=role, scope=composition_scope, resolver=resolver)
     for role, round_state in record.reverification["reassessments"].items():
         field = (
             "composition_evidence_fingerprint" if role == "semantic" else "security_composition_evidence_fingerprint"
         )
         initial = load_composition(
-            status, replace(record, **{field: round_state["initial"]}), review_kind=role, scope=composition_scope
+            status,
+            replace(record, **{field: round_state["initial"]}),
+            review_kind=role,
+            scope=composition_scope,
+            resolver=resolver,
         )
         if not initial.fallback or not (initial.assessment.approved or (role == "semantic" and initial.has_parent_gap)):
             raise ValueError("Candidate review did not originate in ordinary uncertainty.")
     for role, digest in record.reverification["fallbacks"].items():
         if digest:
-            load_full_result(status, record, role, scope=composition_scope.parent)
+            load_full_result(status, record, role, scope=composition_scope.parent, resolver=resolver)
     for node_id, entry in record.reverification["children"].items():
         child_scope = composition_scope.child(node_id)
         historical = status.checkpoint_verifications.get(node_id)
         if historical is None or historical.checkpoint_evidence_fingerprint != entry["origin"]:
             raise ValueError("Candidate re-verification admission changed.")
-        child = expanded_child(status, entry)
+        child = expanded_child(status, entry, resolver=resolver)
         if cfg is not None:
             snapshot = candidate_snapshot(status, cfg, record, node_id)
             if snapshot.scope != child_scope or any(
@@ -280,12 +290,18 @@ def validate_reverification(
             ):
                 raise ValueError("Candidate re-verification authority changed.")
         child_status = replace(status, verification_node=node_id)
-        validate_reverification(child_status, child, cfg, _seen=_seen)
+        validate_reverification(child_status, child, cfg, _seen=_seen, resolver=resolver)
         if child.passed:
-            evidence = load_checkpoint_evidence(root, directory, child, plan_id=status.plan.plan_id, node_id=node_id)
+            evidence = load_checkpoint_evidence(
+                root, directory, child, plan_id=status.plan.plan_id, node_id=node_id, resolver=resolver
+            )
             if not evidence.covers(child_scope):
                 raise ValueError("Candidate re-verification coverage changed.")
-    if record.passed and semantic_gap_ids(record) and not semantic_fallback_covers_gaps(status, record):
+    if (
+        record.passed
+        and semantic_gap_ids(record)
+        and not semantic_fallback_covers_gaps(status, record, resolver=resolver)
+    ):
         raise ValueError("Final semantic approval predates a rejected candidate child.")
 
 
@@ -295,14 +311,24 @@ def review_result_path(directory: Path, digest: str) -> Path:
     return directory / f"candidate-review-{digest[7:]}.json"
 
 
-def _full_result_payload(status: DeliveryStatusResult, parent: DeliveryVerificationRecord, role: str) -> dict[str, Any]:
+@evidence_operation
+def _full_result_payload(
+    status: DeliveryStatusResult,
+    parent: DeliveryVerificationRecord,
+    role: str,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> dict[str, Any]:
     from core.delivery_composition import fingerprint
     from core.delivery_repair_storage import read_repair_state
 
     digest = parent.reverification["fallbacks"][role]
     root = Path(status.project_root)
-    payload = read_repair_state(
-        root, review_result_path(delivery_progress_path(root, status.plan.plan_id).parent, digest)
+    resolver = resolver or EvidenceResolver()
+    payload = resolver.read(
+        root,
+        review_result_path(delivery_progress_path(root, status.plan.plan_id).parent, digest),
+        reader=read_repair_state,
     )
     if (
         not payload
@@ -328,50 +354,61 @@ def semantic_gap_ids(record: DeliveryVerificationRecord) -> list[str]:
     )
 
 
-def semantic_fallback_covers_gaps(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> bool:
+@evidence_operation
+def semantic_fallback_covers_gaps(
+    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> bool:
     if not (record.reverification or {}).get("fallbacks", {}).get("semantic"):
         return False
-    payload = _full_result_payload(status, record, "semantic")
+    payload = _full_result_payload(status, record, "semantic", resolver=resolver)
     return set(semantic_gap_ids(record)).issubset(payload["semantic_gaps"])
 
 
-def reverification_budget_exhausted(status: DeliveryStatusResult, record: DeliveryVerificationRecord) -> bool:
+@evidence_operation
+def reverification_budget_exhausted(
+    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> bool:
     from core.delivery_verification_model import delivery_verification_is_boundary_stop
 
     from core.delivery_candidate_control import expanded_child
 
-    if delivery_verification_is_boundary_stop(record):
-        return False
-    if record.stop_code == "delivery_verification.reverification_budget_exhausted":
-        return True
-    if record.reverification is None:
-        return False
-    fallbacks = record.reverification["fallbacks"]
-    return (
-        any(digest is None for digest in fallbacks.values())
-        or (
-            "semantic" in fallbacks
-            and record.stop_code != "delivery_verification.candidate_repair_required"
-            and not semantic_fallback_covers_gaps(status, record)
+    with resolver.visit(record.gate_id, str(record.attempt), "budget"):
+        if delivery_verification_is_boundary_stop(record):
+            return False
+        if record.stop_code == "delivery_verification.reverification_budget_exhausted":
+            return True
+        if record.reverification is None:
+            return False
+        fallbacks = record.reverification["fallbacks"]
+        return (
+            any(digest is None for digest in fallbacks.values())
+            or (
+                "semantic" in fallbacks
+                and record.stop_code != "delivery_verification.candidate_repair_required"
+                and not semantic_fallback_covers_gaps(status, record, resolver=resolver)
+            )
+            or any(
+                reverification_budget_exhausted(
+                    status, expanded_child(status, entry, resolver=resolver), resolver=resolver
+                )
+                for entry in record.reverification["children"].values()
+            )
         )
-        or any(
-            reverification_budget_exhausted(status, expanded_child(status, entry))
-            for entry in record.reverification["children"].values()
-        )
-    )
 
 
+@evidence_operation
 def load_full_result(
     status: DeliveryStatusResult,
     parent: DeliveryVerificationRecord,
     role: str,
     *,
     scope: DeliveryVerificationScope | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryIntegrationAssessment:
     from core.delivery_verification_review import parse_delivery_integration_review
     import json
 
-    payload = _full_result_payload(status, parent, role)
+    payload = _full_result_payload(status, parent, role, resolver=resolver)
     scope = scope or DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
     return parse_delivery_integration_review(
         json.dumps(payload["assessment"]),
@@ -420,6 +457,7 @@ def preflight_node_review_packets(
     return parent_bytes, conditional
 
 
+@evidence_operation
 def preflight_candidate_tree(
     status: DeliveryStatusResult,
     cfg: dict[str, Any],
@@ -428,6 +466,7 @@ def preflight_candidate_tree(
     source: str,
     *,
     record: DeliveryVerificationRecord | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> None:
     """Check both roles and all possible child routes before reserving any calls."""
     from core.delivery_composition import CompositionRefresh, build_composition_context
@@ -436,6 +475,7 @@ def preflight_candidate_tree(
 
     from core.delivery_candidate_control import expanded_child
 
+    resolver = resolver or EvidenceResolver()
     record = record or status.verification
     if record is not None and record.gate_id != snapshot.identity.gate_id:
         record = None
@@ -450,7 +490,9 @@ def preflight_candidate_tree(
         scope = current.composition_scope
         for role in ("semantic", "security") if current.scope.security_required else ("semantic",):
             context = (
-                build_composition_context(status, current, cfg, review_kind=role, record=record) if scope else None
+                build_composition_context(status, current, cfg, review_kind=role, record=record, resolver=resolver)
+                if scope
+                else None
             )
             if isinstance(context, CompositionRefresh):
                 context = context.preview_context
@@ -465,7 +507,7 @@ def preflight_candidate_tree(
                     candidate_commit=snapshot.identity.candidate_commit,
                 )
                 entry = (record.reverification or {}).get("children", {}).get(child.node_id) if record else None
-                child_record = expanded_child(status, entry) if entry else None
+                child_record = expanded_child(status, entry, resolver=resolver) if entry else None
                 if child_record is not None:
                     child_snapshot = candidate_snapshot(status, cfg, record, child.node_id)
                 pending.append((child_snapshot, child_record))
