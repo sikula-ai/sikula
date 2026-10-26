@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import uuid4
 
 
@@ -59,7 +59,7 @@ def _parent(root: Path, path: Path, *, create: bool) -> Iterator[int | None]:
             os.close(descriptor)
 
 
-def read_repair_state(root: Path, path: Path) -> dict[str, Any] | None:
+def read_repair_state_bytes(root: Path, path: Path) -> bytes | None:
     try:
         with _parent(root, path, create=False) as parent:
             target = path if parent is None else path.name
@@ -70,6 +70,8 @@ def read_repair_state(root: Path, path: Path) -> dict[str, Any] | None:
             fd = os.open(target, flags, dir_fd=parent)
             with os.fdopen(fd, "rb") as handle:
                 opened = os.fstat(handle.fileno())
+                if _link_like(opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    raise OSError("Unsafe delivery recovery state file.")
                 if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
                     raise OSError("Delivery recovery state file changed.")
                 content = handle.read(_MAX_STATE_BYTES + 1)
@@ -77,10 +79,52 @@ def read_repair_state(root: Path, path: Path) -> dict[str, Any] | None:
         return None
     if len(content) > _MAX_STATE_BYTES:
         raise ValueError("Delivery recovery state is oversized.")
+    return content
+
+
+def read_repair_state(
+    root: Path, path: Path, *, _capture: Callable[[bytes], None] | None = None
+) -> dict[str, Any] | None:
+    content = read_repair_state_bytes(root, path)
+    if content is None:
+        return None
+    if _capture is not None:
+        _capture(content)
     value = json.loads(content, object_pairs_hook=_unique_object)
     if not isinstance(value, dict):
         raise ValueError("Delivery recovery state must be an object.")
     return value
+
+
+def repair_state_identity(root: Path, path: Path) -> tuple[int, ...] | None:
+    """Check the same filesystem boundary as a read, including on cache hits."""
+    try:
+        with _parent(root, path, create=False) as parent:
+            target = path if parent is None else path.name
+            metadata = os.stat(target, dir_fd=parent, follow_symlinks=False)
+            if _link_like(metadata) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("Unsafe delivery recovery state file.")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(target, flags, dir_fd=parent)
+            try:
+                opened = os.fstat(descriptor)
+                if _link_like(opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    raise OSError("Unsafe delivery recovery state file.")
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise OSError("Delivery recovery state file changed.")
+                return (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                    opened.st_mode,
+                    opened.st_nlink,
+                )
+            finally:
+                os.close(descriptor)
+    except FileNotFoundError:
+        return None
 
 
 def write_repair_state(root: Path, path: Path, value: dict[str, Any]) -> None:

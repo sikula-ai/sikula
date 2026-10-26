@@ -6,6 +6,12 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from core.delivery_evidence_resolution import (
+    evidence_failure_message,
+    evidence_failure_code,
+    EvidenceResolver,
+    evidence_operation,
+)
 from core.delivery_assembly import delivery_assembly_branch_is_symbolic
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
@@ -443,14 +449,35 @@ def _preflight_delivery_finalize(
 
 
 def _final_verification_issue(
+    root: Path, status: DeliveryStatusResult, project_config: dict[str, Any] | None
+) -> DeliveryPlanIssue | None:
+    from core.delivery_checkpoints import checkpoint_boundary_issue
+
+    boundary = checkpoint_boundary_issue(status)
+    if boundary is not None:
+        return boundary
+    try:
+        return _resolve_final_verification_issue(root, status, project_config)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return DeliveryPlanIssue(
+            "error",
+            evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+            evidence_failure_message(exc, "Accepted verification evidence could not be resolved safely."),
+        )
+
+
+@evidence_operation
+def _resolve_final_verification_issue(
     root: Path,
     status: DeliveryStatusResult,
     project_config: dict[str, Any] | None,
+    *,
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryPlanIssue | None:
     from core.delivery_checkpoints import checkpoint_pass_is_usable
 
     if status.plan and any(
-        not checkpoint_pass_is_usable(status, checkpoint, project_config)
+        not checkpoint_pass_is_usable(status, checkpoint, project_config, resolver=resolver)
         for checkpoint in getattr(status.plan, "checkpoints", ())
     ):
         return DeliveryPlanIssue(
@@ -526,12 +553,12 @@ def _final_verification_issue(
         from core.delivery_checkpoint_applicability import validate_root_evidence
 
         try:
-            validate_root_evidence(status, verification)
-        except (OSError, RuntimeError, ValueError):
+            validate_root_evidence(status, verification, resolver=resolver)
+        except (OSError, RuntimeError, ValueError) as exc:
             return DeliveryPlanIssue(
                 "error",
-                "delivery_verification.evidence_unavailable",
-                "Restore the accepted root verification evidence before finalizing.",
+                evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+                evidence_failure_message(exc, "Restore the accepted root verification evidence before finalizing."),
             )
     return None
 

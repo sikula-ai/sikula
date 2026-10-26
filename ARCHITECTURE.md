@@ -1719,6 +1719,37 @@ security, read-only and external boundary stops preempt parent work. Unusable or
 still-oversized packets retain the preflighted fallback or technical/budget stop.
 Global plan limits remain unchanged; full review is conditional on packet capacity.
 
+**Shared private evidence resolution:** `core/delivery_evidence_resolution.py`
+provides an explicit read context for one deterministic operation. Recursive
+checkpoint/final-gate closure, composition, candidate-control and full-result
+readers share parsed artifact JSON within that context. Each use still validates
+the expected digest, accepted attempt, node, scope and candidate bindings; the
+cache stores neither approval decisions nor expanded descendant closures.
+Callers receive separate mutable copies. Status projection, barrier checks,
+candidate preflight and finalization use the same readers. Publication closes its
+read phase before writing. No context survives a provider exchange, lock
+reacquisition, publication or a new status/resume snapshot.
+
+Each resolution operation bounds artifact reads, memory use and evidence-tree
+traversal in addition to the storage layer's per-file limit. Concrete allowances
+are defined by `EvidenceResolutionLimits` in `core/delivery_evidence_resolution.py`.
+Accounting includes integrity rechecks, repeated reads and parsing after cache
+eviction, and expanded authority. Expanded descendant closures are never
+memoized at each ancestor. These host-resource limits are independent of provider
+budgets; existing source, plan and active-unit limits remain in force.
+
+Cache hits repeat secure filesystem identity checks. Before a read operation
+returns successfully, every used artifact is read again through the private
+storage boundary and its raw-content hash is checked; timestamps alone cannot
+attest unchanged content across platforms. The integrity read allowance is
+reserved while loading. Resource exhaustion fails closed with
+`delivery_verification.evidence_budget_exhausted` and
+`resolve_delivery_evidence_budget`, without treating it as a semantic rejection,
+refunding provider reservations or authorizing more provider work. Missing,
+changed or corrupt evidence retains its existing stop behavior. Known terminal
+security/read-only classifications are checked without needing descendant
+sidecars and take precedence over resource resolution.
+
 **Conditional full fallback:** `core/delivery_review_route.py` measures full and
 compact routes separately for each role. Preparation uses a sizing-only exact-child
 preview restored from independently checked authority; it cannot predict later code

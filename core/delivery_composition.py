@@ -10,6 +10,7 @@ import subprocess
 from threading import Timer
 from typing import Any, TYPE_CHECKING
 
+from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_checkpoint_evidence import load_checkpoint_evidence
 from core.delivery_delta import inspect_delta_metadata
 from core.delivery_composition_scope import (
@@ -90,6 +91,7 @@ def _git_bounded(root: Path, args: list[str], limit: int) -> str:
             timer.join()
 
 
+@evidence_operation
 def build_composition_context(
     status: DeliveryStatusResult,
     snapshot: DeliveryVerificationSnapshot,
@@ -97,6 +99,7 @@ def build_composition_context(
     *,
     review_kind: str = "semantic",
     record: DeliveryVerificationRecord | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> dict[str, Any] | CompositionRefresh | None:
     """Flat delivery adapter; common construction uses only captured node inputs."""
     composition_scope = snapshot.composition_scope
@@ -104,10 +107,11 @@ def build_composition_context(
         return None
     attempt = capture_composition_attempt(status, record, composition_scope)
     return build_node_composition_context(
-        Path(status.project_root), snapshot, attempt, project_config, review_kind=review_kind
+        Path(status.project_root), snapshot, attempt, project_config, review_kind=review_kind, resolver=resolver
     )
 
 
+@evidence_operation
 def build_node_composition_context(
     root: Path,
     snapshot: DeliveryVerificationSnapshot,
@@ -115,8 +119,10 @@ def build_node_composition_context(
     project_config: dict[str, Any],
     *,
     review_kind: str = "semantic",
+    resolver: EvidenceResolver | None = None,
 ) -> dict[str, Any] | CompositionRefresh | None:
     """Build both roles' packets from exact authority and immediate children only."""
+    resolver = resolver or EvidenceResolver()
     composition_scope = attempt.scope
     attempt.assert_candidate(snapshot.identity)
     if composition_scope.parent != snapshot.scope:
@@ -136,8 +142,10 @@ def build_node_composition_context(
     for scope in composition_scope.children:
         if covered_units.intersection(scope.unit_ids) or inherited.intersection(scope.obligation_ids):
             return None
-        origin = attempt.origin(scope.node_id)
-        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=scope.node_id)
+        origin = attempt.origin(scope.node_id, resolver=resolver)
+        evidence = load_checkpoint_evidence(
+            root, directory, origin, plan_id=scope.plan_id, node_id=scope.node_id, resolver=resolver
+        )
         if not evidence.covers(scope):
             raise ValueError("Composition checkpoint evidence changed.")
         if review_kind == "security" and (not origin.security_required or origin.security_status != "approved"):
@@ -395,26 +403,35 @@ def store_composition(root: Path, directory: Path, gate_id: str, context: dict, 
     return digest
 
 
+@evidence_operation
 def load_composition(
     status: DeliveryStatusResult,
     record: DeliveryVerificationRecord,
     *,
     review_kind: str = "semantic",
     scope: DeliveryCompositionScope | None = None,
+    resolver: EvidenceResolver | None = None,
 ) -> CompositionResult:
     return load_node_composition(
-        Path(status.project_root), capture_composition_attempt(status, record, scope), record, review_kind=review_kind
+        Path(status.project_root),
+        capture_composition_attempt(status, record, scope),
+        record,
+        review_kind=review_kind,
+        resolver=resolver,
     )
 
 
+@evidence_operation
 def load_node_composition(
     root: Path,
     attempt: DeliveryCompositionAttempt,
     record: DeliveryVerificationRecord,
     *,
     review_kind: str = "semantic",
+    resolver: EvidenceResolver | None = None,
 ) -> CompositionResult:
     """Validate accepted results against the same explicit coverage as construction."""
+    resolver = resolver or EvidenceResolver()
     attempt.assert_record(record)
     scope = attempt.scope.parent
     directory = delivery_progress_path(root, scope.plan_id).parent
@@ -423,7 +440,7 @@ def load_node_composition(
         if review_kind == "semantic"
         else record.security_composition_evidence_fingerprint
     )
-    payload = read_repair_state(root, composition_evidence_path(directory, digest))
+    payload = resolver.read(root, composition_evidence_path(directory, digest), reader=read_repair_state)
     if (
         payload is None
         or set(payload)
@@ -444,10 +461,12 @@ def load_node_composition(
     origins = {}
     origin_records = {}
     for child in attempt.scope.children:
-        origin = attempt.origin(child.node_id, digest=payload["origins"].get(child.node_id))
+        origin = attempt.origin(child.node_id, digest=payload["origins"].get(child.node_id), resolver=resolver)
         if origin is None:
             raise ValueError("Composition origin unavailable.")
-        evidence = load_checkpoint_evidence(root, directory, origin, plan_id=scope.plan_id, node_id=child.node_id)
+        evidence = load_checkpoint_evidence(
+            root, directory, origin, plan_id=scope.plan_id, node_id=child.node_id, resolver=resolver
+        )
         if not evidence.covers(child):
             raise ValueError("Composition origin coverage changed.")
         origins[child.node_id] = origin.checkpoint_evidence_fingerprint

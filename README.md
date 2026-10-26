@@ -352,6 +352,10 @@ Successful checkpoints retain private structured obligation results bound to the
 reviewed candidate and gate attempt. Handoff checks verify their integrity without
 replaying review logs or adding history to prompts. Missing or damaged evidence
 blocks continuation; the final gate still reviews the complete final candidate.
+Evidence resolution shares bounded reads within each operation and rechecks file
+contents before returning. Exceeding its aggregate resource allowance produces
+`delivery_verification.evidence_budget_exhausted`, a technical stop requiring
+investigation; it cannot authorize extra review calls or bypass a terminal stop.
 Task completion output and `delivery status` report provider invocation counts,
 failed attempts, measured provider time, content-free input/output sizes, and
 explicit provider-reported token usage when available. Unavailable token data

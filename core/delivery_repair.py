@@ -23,6 +23,7 @@ from agents.delivery_repair_authority_agent import (
     build_authority_renewal_prompt,
     parse_authority_renewal,
 )
+from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code
 from core.delivery_repair_authority import (
     renewal_nodes,
     captured_renewal_contracts,
@@ -251,6 +252,8 @@ def _current_input(
         barrier = checkpoint_barrier_issue(status, cfg)
         if barrier is not None and barrier.code == "delivery_checkpoint.handoff_stale":
             _stop("stale", "Checkpoint authority changed after downstream execution started.")
+        if barrier is not None and barrier.code != "delivery_checkpoint.required":
+            raise DeliveryRepairError(barrier.code, barrier.message)
     plan = status.plan
     if not plan.requires_final_verification or not plan.obligations or not plan.source_accounting:
         _stop("authority_required", "Automatic integration repair requires source-bound obligations and accounting.")
@@ -368,12 +371,14 @@ def coordinate_delivery_repair(
         return DeliveryRepairResult(
             issue=DeliveryPlanIssue("error", exc.code, "Repair authority preflight or assessment failed.")
         )
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
         return DeliveryRepairResult(
             issue=DeliveryPlanIssue(
                 "error",
-                "delivery_repair.evidence_unavailable",
-                "Integration repair could not validate or persist required local evidence.",
+                evidence_failure_code(exc, "delivery_repair.evidence_unavailable"),
+                evidence_failure_message(
+                    exc, "Integration repair could not validate or persist required local evidence."
+                ),
             )
         )
 
@@ -840,8 +845,8 @@ def _assert_readonly(
     )
     try:
         unchanged = _review_workspace_unchanged(worktree, cfg, before) and _candidate_is_clean(worktree, commit)
-    except (OSError, RuntimeError, ValueError):
-        code = retained or "delivery_repair.evidence_unavailable"
+    except (OSError, RuntimeError, ValueError) as exc:
+        code = retained or evidence_failure_code(exc, "delivery_repair.evidence_unavailable")
         state.update(phase="blocked", stop_code=code)
         write_repair_state(root, path, state)
         raise DeliveryRepairError(code, "Read-only review could not preserve required workspace evidence.") from None

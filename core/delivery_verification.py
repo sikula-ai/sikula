@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code
 from core.delivery_authority import verification_authority_fragments
 from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
@@ -446,12 +447,12 @@ def check_delivery_verification_readiness(
                     "verification_packet",
                 )
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             errors.append(
                 DeliveryPlanIssue(
                     "error",
-                    "delivery_verification.evidence_unavailable",
-                    "Required review authority is unavailable.",
+                    evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+                    evidence_failure_message(exc, "Required review authority is unavailable."),
                 )
             )
 
@@ -510,11 +511,11 @@ def _conditional_candidate_route_issue(status, cfg, source: str) -> DeliveryPlan
         )
     except DeliveryIntegrationReviewAgentError as exc:
         return DeliveryPlanIssue("error", exc.code, exc.message)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError) as exc:
         return DeliveryPlanIssue(
             "error",
-            "delivery_verification.evidence_unavailable",
-            "Required candidate review evidence is unavailable.",
+            evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+            evidence_failure_message(exc, "Required candidate review evidence is unavailable."),
         )
     return None
 
@@ -526,9 +527,11 @@ def with_delivery_verification_readiness(
     if not status.valid:
         return status
     if status.plan and getattr(status.plan, "checkpoints", ()):
-        from core.delivery_checkpoints import with_checkpoint_barriers
+        from core.delivery_checkpoints import checkpoint_boundary_issue, with_checkpoint_barriers
 
         status = with_checkpoint_barriers(status, project_config)
+        if not status.valid or checkpoint_boundary_issue(status) is not None:
+            return status
     readiness = check_delivery_verification_readiness(status, project_config)
     if not readiness.required:
         return status
@@ -585,7 +588,7 @@ def with_delivery_verification_readiness(
                 if verification.stop_code == CANDIDATE_REPAIR_REQUIRED:
                     resolve_candidate_repair(status, project_config)
                 exhausted = reverification_budget_exhausted(status, verification)
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                 return replace(
                     status,
                     status="invalid",
@@ -594,8 +597,10 @@ def with_delivery_verification_readiness(
                         *status.errors,
                         DeliveryPlanIssue(
                             "error",
-                            "delivery_verification.evidence_unavailable",
-                            "Restore the accepted composition evidence before continuing.",
+                            evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+                            evidence_failure_message(
+                                exc, "Restore the accepted composition evidence before continuing."
+                            ),
                         ),
                     ],
                 )
@@ -620,7 +625,7 @@ def with_delivery_verification_readiness(
 
                 try:
                     validate_root_evidence(status, verification)
-                except (OSError, RuntimeError, ValueError):
+                except (OSError, RuntimeError, ValueError) as exc:
                     return replace(
                         status,
                         status="invalid",
@@ -628,8 +633,10 @@ def with_delivery_verification_readiness(
                             *status.errors,
                             DeliveryPlanIssue(
                                 "error",
-                                "delivery_verification.evidence_unavailable",
-                                "Restore the accepted root verification evidence before continuing.",
+                                evidence_failure_code(exc, "delivery_verification.evidence_unavailable"),
+                                evidence_failure_message(
+                                    exc, "Restore the accepted root verification evidence before continuing."
+                                ),
                             ),
                         ],
                         verification_status="blocked",

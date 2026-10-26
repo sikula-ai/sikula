@@ -251,11 +251,11 @@ def test_recursive_validation_storage_failure_preserves_reservations(candidate, 
     damaged = []
     failed_reads = []
 
-    def unreadable(project_root, file):
+    def unreadable(project_root, file, **kwargs):
         if file == sidecar:
             failed_reads.append(file)
             raise PermissionError("Private candidate control diagnostic")
-        return read_control(project_root, file)
+        return read_control(project_root, file, **kwargs)
 
     def lose_control_after_exchange(**kwargs):
         result = exchange(**kwargs)
@@ -321,11 +321,11 @@ def test_readiness_handles_sidecar_loss_during_budget_rescan(candidate, monkeypa
         validated.append(verification.gate_id)
         return result
 
-    def unreadable(project_root, file):
+    def unreadable(project_root, file, **kwargs):
         if file == sidecar:
             failed_reads.append(file)
             raise PermissionError("Private candidate control diagnostic")
-        return read_control(project_root, file)
+        return read_control(project_root, file, **kwargs)
 
     def rescan_after_storage_failure(current, verification):
         if verification.gate_id == record.gate_id:
@@ -554,10 +554,10 @@ def test_nested_boundary_survives_audit_failure_and_candidate_change(candidate, 
 
                 original_read = control_module.read_repair_state
 
-                def unreadable(project_root, file):
+                def unreadable(project_root, file, **kwargs):
                     if file == sidecar:
                         raise PermissionError("Candidate control unavailable")
-                    return original_read(project_root, file)
+                    return original_read(project_root, file, **kwargs)
 
                 monkeypatch.setattr(control_module, "read_repair_state", unreadable)
             if violation == "readonly":
