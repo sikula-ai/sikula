@@ -407,7 +407,8 @@ def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_pr
     assert select_next_delivery_unit(after).id == repaired.unit_id
     # Isolate the leaf barrier: the ancestor must not mask a missing transitive guard.
     with patch(
-        "core.delivery_checkpoints.checkpoint_pass_is_usable", side_effect=lambda _, node, cfg: node.id == "integration"
+        "core.delivery_checkpoints.checkpoint_pass_is_usable",
+        side_effect=lambda _, node, cfg, *, resolver=None: node.id == "integration",
     ):
         assert checkpoint_barrier_issue(after, cfg, unit_id="shipping").code == "delivery_checkpoint.required"
     _complete(path, repaired.unit_id)

@@ -1730,15 +1730,13 @@ candidate preflight and finalization use the same readers. Publication closes it
 read phase before writing. No context survives a provider exchange, lock
 reacquisition, publication or a new status/resume snapshot.
 
-The existing 2 MiB per-file limit remains. One resolution operation permits at
-most 4,096 unique artifacts, 16,384 read requests, 64 MiB of actual file reads
-(including integrity rechecks), 128 MiB of conservatively accounted Python
-materialization, an 8 MiB parsed-JSON LRU, 128 active closure levels, 16,384
-closure visits and 1,000,000 expanded coverage items. Eviction charges subsequent
-reads and parsing again. Expanded authority is charged separately and never
-memoized at each ancestor. These are host-resource ceilings, not provider
-budgets or a claim that larger plans are already supported; existing source,
-plan and active-unit limits remain unchanged.
+Each resolution operation bounds artifact reads, memory use and evidence-tree
+traversal in addition to the storage layer's per-file limit. Concrete allowances
+are defined by `EvidenceResolutionLimits` in `core/delivery_evidence_resolution.py`.
+Accounting includes integrity rechecks, repeated reads and parsing after cache
+eviction, and expanded authority. Expanded descendant closures are never
+memoized at each ancestor. These host-resource limits are independent of provider
+budgets; existing source, plan and active-unit limits remain in force.
 
 Cache hits repeat secure filesystem identity checks. Before a read operation
 returns successfully, every used artifact is read again through the private
