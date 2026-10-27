@@ -3056,9 +3056,12 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
         plan_id="checkpoint-flow",
         node_id="arithmetic",
     )
-    assert [(item.id, item.outcome) for item in evidence.obligation_results] == [("combined-operation", "satisfied")]
-    assert repair["unit_id"] in {item.unit_id for item in evidence.completed_units}
-    assert consumer["unit_id"] not in {item.unit_id for item in evidence.completed_units}
+    assert [(item.id, item.outcome) for item in evidence.closure.iter_obligation_results()] == [
+        ("combined-operation", "satisfied")
+    ]
+    covered_units = {item.unit_id for item in evidence.closure.iter_completed_units()}
+    assert repair["unit_id"] in covered_units
+    assert consumer["unit_id"] not in covered_units
     assert "checkpoint_evidence_fingerprint" not in progress["verification"]
     if correct_declaration:
         audit = (git_project / ".sikula/contract-reports/checkpoint-flow.delivery-prepare.auto-llm.jsonl").read_text()
