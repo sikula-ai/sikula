@@ -94,7 +94,7 @@ def test_candidate_evidence_requires_exact_tree_or_fresh_semantic_results(
     evidence = load_root_evidence(
         path.parent, delivery_progress_path(path.parent, "cache").parent, root_record, plan_id="cache"
     )
-    assert [(r.id, r.outcome) for r in evidence.obligation_results] == [("consistent-read", "satisfied")]
+    assert [(r.id, r.outcome) for r in evidence.closure.iter_obligation_results()] == [("consistent-read", "satisfied")]
     assert parse_delivery_verification_record(root_record.to_dict()) == root_record
     (path.parent / root_record.evidence_path).unlink()
     again, llm = _verify_node(path, cfg, node_id="root")

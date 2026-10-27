@@ -353,7 +353,9 @@ reviewed candidate and gate attempt. Handoff checks verify their integrity witho
 replaying review logs or adding history to prompts. Missing or damaged evidence
 blocks continuation; the final gate still reviews the complete final candidate.
 Evidence resolution shares bounded reads within each operation and rechecks file
-contents before returning. Exceeding its aggregate resource allowance produces
+contents before returning. Hierarchical coverage checks traverse direct results and
+child references without copying every descendant result into each ancestor.
+Exceeding the aggregate resource allowance produces
 `delivery_verification.evidence_budget_exhausted`, a technical stop requiring
 investigation; it cannot authorize extra review calls or bypass a terminal stop.
 Task completion output and `delivery status` report provider invocation counts,

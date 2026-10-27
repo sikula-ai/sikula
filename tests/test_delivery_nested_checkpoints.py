@@ -183,7 +183,7 @@ def test_nested_admission_composition_resume_and_finalization(nested_plan, inter
     assert [item["id"] for item in payload["obligation_results"]] == ["visible"]
     assert [item["node_id"] for item in payload["child_evidence"]] == ["storage"]
     evidence = load_checkpoint_evidence(root, directory, record, plan_id=status.plan.plan_id, node_id="integration")
-    assert {item.id for item in evidence.obligation_results} == {"deliver-team-invites", "visible"}
+    assert {item.id for item in evidence.closure.iter_obligation_results()} == {"deliver-team-invites", "visible"}
     leaf_path = checkpoint_evidence_path(directory, status.checkpoint_verifications["storage"])
     leaf_bytes = leaf_path.read_bytes()
     leaf_path.write_text("{}")

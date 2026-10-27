@@ -1750,6 +1750,25 @@ changed or corrupt evidence retains its existing stop behavior. Known terminal
 security/read-only classifications are checked without needing descendant
 sidecars and take precedence over resource resolution.
 
+**Compact exact evidence closure:** accepted node evidence is represented in memory
+by direct typed results and immediate-child references, matching the existing private
+artifact structure. Sorted iterators merge execution bindings and obligation outcomes;
+shared constraints retain union semantics. Every node checks exact identities,
+duplicate coverage, accepted counts and its ordered execution fingerprint without
+constructing and reparsing an expanded descendant payload. Scope checks and composition
+outcome matching consume these views directly. Noncanonical declaration order uses a
+temporary index at the requesting node; ordinary canonical traversal streams the hash.
+Publication checks child execution against the captured snapshot and validates the
+resulting closure through the same reader before acceptance.
+
+Local typed allocations and traversal work charge the existing resolver budgets.
+Typed results are retained once per occurrence in the loaded tree, rather than copied
+into every ancestor. The tree still grows with evidence size, and existing per-node
+execution hashes still require visiting covered units; this is not constant-memory or
+linear-time validation of an arbitrary graph. Plan/scope snapshots and global capacity
+limits remain unchanged. No persisted schema, prompt, provider allowance or acceptance
+boundary changes with this representation.
+
 **Conditional full fallback:** `core/delivery_review_route.py` measures full and
 compact routes separately for each role. Preparation uses a sizing-only exact-child
 preview restored from independently checked authority; it cannot predict later code

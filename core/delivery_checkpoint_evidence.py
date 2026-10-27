@@ -6,12 +6,14 @@ applicability to later code, or replace the mandatory root review.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
+from heapq import merge
+from itertools import zip_longest
 import json
 from pathlib import Path
 import re
-from typing import Any, TYPE_CHECKING
+from typing import Any, Iterator, TYPE_CHECKING
 
 from core.delivery_evidence_resolution import EvidenceResolver, evidence_operation
 from core.delivery_repair_storage import read_repair_state, write_repair_state
@@ -31,25 +33,102 @@ _GIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 
 
 @dataclass(frozen=True)
+class _EvidenceClosure:
+    """Direct typed results and child coverage, without retained child control records."""
+
+    direct_completed_units: tuple[DeliveryVerificationCompletedUnit, ...]
+    direct_constraint_ids: tuple[str, ...]
+    direct_obligation_results: tuple[DeliveryObligationAssessment, ...]
+    children: tuple[_EvidenceClosure, ...] = ()
+    _sorted_units: tuple[DeliveryVerificationCompletedUnit, ...] = field(init=False, repr=False)
+    _sorted_results: tuple[DeliveryObligationAssessment, ...] = field(init=False, repr=False)
+    unit_count: int = field(init=False)
+    obligation_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_sorted_units", tuple(sorted(self.direct_completed_units, key=lambda item: item.unit_id))
+        )
+        object.__setattr__(
+            self, "_sorted_results", tuple(sorted(self.direct_obligation_results, key=lambda item: item.id))
+        )
+        object.__setattr__(
+            self, "unit_count", len(self.direct_completed_units) + sum(child.unit_count for child in self.children)
+        )
+        object.__setattr__(
+            self,
+            "obligation_count",
+            len(self.direct_obligation_results) + sum(child.obligation_count for child in self.children),
+        )
+
+    def iter_completed_units(self) -> Iterator[DeliveryVerificationCompletedUnit]:
+        yield from merge(
+            self._sorted_units,
+            *(child.iter_completed_units() for child in self.children),
+            key=lambda item: item.unit_id,
+        )
+
+    def iter_obligation_results(self) -> Iterator[DeliveryObligationAssessment]:
+        yield from merge(
+            self._sorted_results,
+            *(child.iter_obligation_results() for child in self.children),
+            key=lambda item: item.id,
+        )
+
+    def iter_constraint_ids(self) -> Iterator[str]:
+        # Shared constraints legitimately occur in several child scopes.
+        previous = None
+        for key in merge(self.direct_constraint_ids, *(child.iter_constraint_ids() for child in self.children)):
+            if key != previous:
+                yield key
+                previous = key
+
+
+@dataclass(frozen=True)
 class DeliveryVerificationEvidence:
-    """Bounded typed results for one scope and one accepted verification attempt."""
+    """Accepted binding plus exact compact coverage for this requested node."""
 
     plan_id: str
     node_id: str
     verification: DeliveryVerificationRecord
-    completed_units: tuple[DeliveryVerificationCompletedUnit, ...]
-    constraint_ids: tuple[str, ...]
-    obligation_results: tuple[DeliveryObligationAssessment, ...]
+    closure: _EvidenceClosure
 
     def covers(self, scope: DeliveryVerificationScope) -> bool:
         return (
             self.plan_id == scope.plan_id
             and self.node_id == scope.node_id
             and self.verification.security_required == scope.security_required
-            and {unit.unit_id for unit in self.completed_units} == set(scope.unit_ids)
-            and set(self.constraint_ids) == set(scope.constraint_ids)
-            and {result.id for result in self.obligation_results} == set(scope.obligation_ids)
+            and all(
+                actual == expected
+                for actual, expected in zip_longest(
+                    (unit.unit_id for unit in self.closure.iter_completed_units()), sorted(scope.unit_ids)
+                )
+            )
+            and all(
+                actual == expected
+                for actual, expected in zip_longest(self.closure.iter_constraint_ids(), sorted(scope.constraint_ids))
+            )
+            and all(
+                actual == expected
+                for actual, expected in zip_longest(
+                    (result.id for result in self.closure.iter_obligation_results()), sorted(scope.obligation_ids)
+                )
+            )
         )
+
+    def matches_results(self, results: list[DeliveryObligationAssessment], *, inherited_count: int | None) -> bool:
+        if inherited_count is None:
+            return not self.closure.children and tuple(results) == self.closure.direct_obligation_results
+        if len(results) + inherited_count != self.closure.obligation_count:
+            return False
+        expected = iter(sorted(results, key=lambda item: item.id))
+        wanted = next(expected, None)
+        for actual in self.closure.iter_obligation_results():
+            if wanted is not None and actual.id == wanted.id:
+                if actual.outcome != wanted.outcome:
+                    return False
+                wanted = next(expected, None)
+        return wanted is None
 
 
 def _fingerprint(payload: Any) -> str:
@@ -69,21 +148,29 @@ def _record_binding(record: DeliveryVerificationRecord) -> dict[str, Any]:
     return replace(record, checkpoint_evidence_fingerprint=None, root_evidence_fingerprint=None).to_dict()
 
 
-def _parse_evidence(
-    payload: dict[str, Any], record: DeliveryVerificationRecord, *, plan_id: str, node_id: str
+def _parse_direct_evidence(
+    payload: dict[str, Any],
+    record: DeliveryVerificationRecord,
+    *,
+    plan_id: str,
+    node_id: str,
+    closure: bool = False,
 ) -> DeliveryVerificationEvidence:
     parsed_record = parse_delivery_verification_record(payload.get("verification"))
     if (
         set(payload)
-        != {
-            "schema_version",
-            "plan_id",
-            "node_id",
-            "verification",
-            "completed_units",
-            "constraint_ids",
-            "obligation_results",
-        }
+        != (
+            {
+                "schema_version",
+                "plan_id",
+                "node_id",
+                "verification",
+                "completed_units",
+                "constraint_ids",
+                "obligation_results",
+            }
+            | ({"child_evidence"} if closure else set())
+        )
         or type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or payload["plan_id"] != plan_id
@@ -100,7 +187,7 @@ def _parse_evidence(
     ):
         raise ValueError("Checkpoint evidence does not match accepted verification.")
     units = payload["completed_units"]
-    if not isinstance(units, list) or not units:
+    if not isinstance(units, list) or (not units and not closure):
         raise ValueError("Checkpoint evidence requires completed inputs.")
     seen: set[str] = set()
     for unit in units:
@@ -124,7 +211,7 @@ def _parse_evidence(
         ):
             raise ValueError("Checkpoint execution evidence is invalid.")
         seen.add(unit["unit_id"])
-    if _fingerprint(units) != record.completed_scope_fingerprint:
+    if not closure and _fingerprint(units) != record.completed_scope_fingerprint:
         raise ValueError("Checkpoint execution evidence changed.")
     constraints = payload["constraint_ids"]
     if (
@@ -136,7 +223,7 @@ def _parse_evidence(
     results = payload["obligation_results"]
     if (
         not isinstance(results, list)
-        or len(results) != record.obligation_count
+        or (not closure and len(results) != record.obligation_count)
         or record.obligation_satisfied_count != record.obligation_count
         or record.obligation_gap_count != 0
     ):
@@ -157,10 +244,94 @@ def _parse_evidence(
         plan_id,
         node_id,
         record,
-        tuple(DeliveryVerificationCompletedUnit(**unit) for unit in units),
-        tuple(constraints),
-        tuple(DeliveryObligationAssessment(**result) for result in results),
+        _EvidenceClosure(
+            tuple(DeliveryVerificationCompletedUnit(**unit) for unit in units),
+            tuple(sorted(constraints)),
+            tuple(DeliveryObligationAssessment(**result) for result in results),
+        ),
     )
+
+
+def _charge_direct_evidence(evidence: _EvidenceClosure, resolver: EvidenceResolver) -> None:
+    # Charge only local allocations. Walking children here would re-account every
+    # descendant at each ancestor and defeat the compact representation.
+    resolver.materialize({**vars(evidence), "children": tuple(None for _ in evidence.children)})
+
+
+def _parse_evidence(
+    payload: dict[str, Any],
+    record: DeliveryVerificationRecord,
+    *,
+    plan_id: str,
+    node_id: str,
+    resolver: EvidenceResolver | None = None,
+) -> DeliveryVerificationEvidence:
+    evidence = _parse_direct_evidence(payload, record, plan_id=plan_id, node_id=node_id)
+    if resolver is not None:
+        resolver.expand(
+            evidence.closure.unit_count
+            + evidence.closure.obligation_count
+            + len(evidence.closure.direct_constraint_ids)
+        )
+        _charge_direct_evidence(evidence.closure, resolver)
+    return evidence
+
+
+def _validate_closure_coverage(
+    evidence: DeliveryVerificationEvidence,
+    unit_order: tuple[str, ...] | None,
+    resolver: EvidenceResolver,
+) -> None:
+    """Check exact identities and the existing ordered execution hash incrementally."""
+    if not evidence.closure.unit_count:
+        raise ValueError("Checkpoint evidence requires completed inputs.")
+    if evidence.closure.obligation_count != evidence.verification.obligation_count:
+        raise ValueError("Checkpoint obligation coverage is incomplete.")
+    previous = None
+    for result in evidence.closure.iter_obligation_results():
+        resolver.expand(1)
+        if result.id == previous:
+            raise ValueError("Checkpoint obligation result is invalid.")
+        previous = result.id
+    for _ in evidence.closure.iter_constraint_ids():
+        resolver.expand(1)
+
+    units = evidence.closure.iter_completed_units()
+    # Flat compositions can bind declaration order, whereas nested nodes
+    # use canonical ID order. Only that explicit noncanonical root needs an index.
+    if unit_order is not None and any(left >= right for left, right in zip(unit_order, unit_order[1:])):
+        by_id = {}
+        for unit in units:
+            resolver.expand(1)
+            if unit.unit_id in by_id:
+                raise ValueError("Root closure execution inputs changed.")
+            by_id[unit.unit_id] = unit
+        resolver.materialize(by_id)
+        if len(unit_order) != len(by_id) or set(unit_order) != set(by_id):
+            raise ValueError("Root closure execution inputs changed.")
+        units = (by_id[key] for key in unit_order)
+    digest = sha256(b"[")
+    first = True
+    previous = None
+    expected = iter(unit_order) if unit_order is not None else None
+    for unit in units:
+        resolver.expand(1)
+        if expected is not None:
+            if unit.unit_id != next(expected, None):
+                raise ValueError("Root closure execution inputs changed.")
+        elif unit.unit_id == previous:
+            raise ValueError("Root closure execution inputs changed.")
+        if not first:
+            digest.update(b",")
+        digest.update(
+            json.dumps(unit.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        )
+        previous, first = unit.unit_id, False
+    if expected is not None and next(expected, None) is not None:
+        raise ValueError("Root closure execution inputs changed.")
+    digest.update(b"]")
+    if "sha256:" + digest.hexdigest() != evidence.verification.completed_scope_fingerprint:
+        raise ValueError("Checkpoint execution evidence changed.")
 
 
 def store_checkpoint_evidence(
@@ -303,7 +474,7 @@ def load_checkpoint_evidence(
                 )
             except (KeyError, TypeError, AttributeError, RecursionError):
                 raise ValueError("Accepted checkpoint closure is invalid.") from None
-        return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id)
+        return _parse_evidence(payload, record, plan_id=plan_id, node_id=node_id, resolver=resolver)
 
 
 @evidence_operation
@@ -344,7 +515,7 @@ def load_root_evidence(
                 )
             except (KeyError, TypeError, AttributeError, RecursionError):
                 raise ValueError("Accepted root closure is invalid.") from None
-        return _parse_evidence(payload, record, plan_id=plan_id, node_id="root")
+        return _parse_evidence(payload, record, plan_id=plan_id, node_id="root", resolver=resolver)
 
 
 @evidence_operation
@@ -365,17 +536,8 @@ def _parse_node_closure(
 
     resolver = resolver or EvidenceResolver()
 
-    if set(payload) != {
-        "schema_version",
-        "plan_id",
-        "node_id",
-        "verification",
-        "completed_units",
-        "constraint_ids",
-        "obligation_results",
-        "child_evidence",
-    }:
-        raise ValueError("Invalid root closure fields.")
+    direct = _parse_direct_evidence(payload, record, plan_id=plan_id, node_id=node_id, closure=True)
+    _charge_direct_evidence(direct.closure, resolver)
     children = payload["child_evidence"]
     if not isinstance(children, list) or not 0 < len(children) <= MAX_COMPOSITION_CHILDREN:
         raise ValueError("Invalid root closure fan-in.")
@@ -402,12 +564,7 @@ def _parse_node_closure(
     if len(set(ids)) != len(ids) or any(item["outcome"] != "applicable" for item in decisions):
         raise ValueError("Root closure requires every child to be applicable.")
     origins = {}
-    resolver.expand(
-        len(payload["completed_units"]) + len(payload["constraint_ids"]) + len(payload["obligation_results"])
-    )
-    units = list(payload["completed_units"])
-    constraints = set(payload["constraint_ids"])
-    results = list(payload["obligation_results"])
+    resolved_children = []
     for child in children:
         if not isinstance(child, dict) or set(child) != {"node_id", "verification"} or child["node_id"] in origins:
             raise ValueError("Invalid child closure reference.")
@@ -416,28 +573,13 @@ def _parse_node_closure(
             root, directory, origin, plan_id=plan_id, node_id=child["node_id"], _ancestors=_ancestors, resolver=resolver
         )
         origins[child["node_id"]] = origin.checkpoint_evidence_fingerprint
-        resolver.expand(len(evidence.completed_units) + len(evidence.constraint_ids) + len(evidence.obligation_results))
-        resolver.materialize((evidence.completed_units, evidence.constraint_ids, evidence.obligation_results))
-        units.extend(unit.to_dict() for unit in evidence.completed_units)
-        constraints.update(evidence.constraint_ids)
-        results.extend(result.to_dict() for result in evidence.obligation_results)
+        resolved_children.append(evidence.closure)
     if origins != composed["origins"] or set(origins) != set(ids):
         raise ValueError("Root closure origins changed.")
-    # Restore the captured declaration order, then use the same immutable execution
-    # fingerprint check as full evidence. No per-unit order list enters the artifact.
-    by_id = {unit["unit_id"]: unit for unit in units}
-    if unit_order is None:
-        unit_order = tuple(sorted(by_id))
-    if len(by_id) != len(units) or set(by_id) != set(unit_order):
-        raise ValueError("Root closure execution inputs changed.")
-    expanded = {key: value for key, value in payload.items() if key != "child_evidence"}
-    expanded.update(
-        completed_units=[by_id[key] for key in unit_order],
-        constraint_ids=sorted(constraints),
-        obligation_results=results,
-    )
-    resolver.materialize(expanded)
-    return _parse_evidence(expanded, record, plan_id=plan_id, node_id=node_id)
+    evidence = replace(direct, closure=replace(direct.closure, children=tuple(resolved_children)))
+    resolver.materialize(tuple(None for _ in evidence.closure.children))
+    _validate_closure_coverage(evidence, unit_order, resolver)
+    return evidence
 
 
 def _store_root_closure(
@@ -498,10 +640,10 @@ def build_node_closure(
             )
             if not child.covers(attempt.scope.child(ref["id"])):
                 raise ValueError("Node closure child coverage changed.")
-            if any(expected.get(unit.unit_id) != unit for unit in child.completed_units):
+            if any(expected.get(unit.unit_id) != unit for unit in child.closure.iter_completed_units()):
                 raise ValueError("Root closure child execution changed.")
-            covered.update(unit.unit_id for unit in child.completed_units)
-            inherited_constraints.update(child.constraint_ids)
+            covered.update(unit.unit_id for unit in child.closure.iter_completed_units())
+            inherited_constraints.update(child.closure.iter_constraint_ids())
             children.append((ref["id"], origin))
     # Publication is a separate phase; no read context survives these writes.
     from core.delivery_candidate_control import compact_record

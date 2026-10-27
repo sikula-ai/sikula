@@ -78,14 +78,9 @@ def validate_node_evidence(
         from core.delivery_composition import load_composition
 
         composition = load_composition(status, record, scope=composition_scope, resolver=resolver)
-        actual = {item.id: item.outcome for item in evidence.obligation_results}
-        outcomes_match = (
-            (
-                all(actual.get(item.id) == item.outcome for item in composition.assessment.obligation_results)
-                and len(composition.assessment.obligation_results) + composition.inherited_count == len(actual)
-            )
-            if composition.child_refs
-            else composition.assessment.obligation_results == list(evidence.obligation_results)
+        outcomes_match = evidence.matches_results(
+            composition.assessment.obligation_results,
+            inherited_count=composition.inherited_count if composition.child_refs else None,
         )
         if not composition.fallback and (not composition.assessment.approved or not outcomes_match):
             raise ValueError("Composition outcomes changed.")

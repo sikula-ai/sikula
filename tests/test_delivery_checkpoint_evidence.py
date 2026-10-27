@@ -100,8 +100,8 @@ def test_evidence_roundtrip_is_typed_private_and_idempotent(evidence_input):
     record = _store(evidence_input)
     evidence = _load(evidence_input, record)
     assert evidence.covers(snapshot.scope)
-    assert evidence.completed_units == snapshot.completed_units
-    assert evidence.obligation_results == tuple(assessment.obligation_results)
+    assert tuple(evidence.closure.iter_completed_units()) == snapshot.completed_units
+    assert evidence.closure.direct_obligation_results == tuple(assessment.obligation_results)
     assert evidence.verification.candidate_commit == original.candidate_commit
     assert parse_delivery_verification_record(record.to_dict()) == record
     path = checkpoint_evidence_path(directory, record)
@@ -279,7 +279,9 @@ def test_gate_publishes_and_reuses_evidence_without_audit_replay(checkpoint_plan
     directory = delivery_progress_path(path.parent, "cache").parent
     evidence = load_checkpoint_evidence(path.parent, directory, record, plan_id="cache", node_id="storage")
     assert evidence.covers(DeliveryVerificationScope.from_plan(status.plan, "storage"))
-    assert [(item.id, item.outcome) for item in evidence.obligation_results] == [("consistent-read", "satisfied")]
+    assert [(item.id, item.outcome) for item in evidence.closure.iter_obligation_results()] == [
+        ("consistent-read", "satisfied")
+    ]
     (path.parent / record.evidence_path).unlink()
     result, llm = _verify_node(path, cfg)
     assert result.succeeded and not llm.calls

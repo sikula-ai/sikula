@@ -766,7 +766,11 @@ nor past review history accumulate in provider prompts.
 Recursive evidence checks share parsed artifacts only within the current read
 operation. File contents are rechecked before completion, and a new operation
 reloads them. Aggregate limits bound file reads, parsing, retained cache and
-expanded coverage. `delivery_verification.evidence_budget_exhausted` reports a
+coverage traversal. Exact hierarchical coverage is checked through direct results
+and child references, without repeatedly materializing all descendant outcomes.
+Execution bindings, obligation identities and shared constraint coverage remain
+validated; counts alone cannot establish approval. Plan-size limits are unchanged.
+`delivery_verification.evidence_budget_exhausted` reports a
 technical resource stop: investigate the evidence graph and supported limits
 before continuing. It does not request a semantic repair, reset provider budgets
 or override an existing security/read-only stop.
