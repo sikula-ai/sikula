@@ -725,3 +725,41 @@ def test_rejects_reserved_source_manifest(tmp_path: Path) -> None:
         _render("## Asset manifest\n", [_unit("one")], tmp_path)
 
     assert exc_info.value.code == "source_asset_manifest_reserved"
+
+
+@pytest.mark.parametrize("damage", [None, "changed", "duplicate", "hidden"])
+def test_preserving_rendered_assignment_requires_exact_source_suffix(tmp_path, damage):
+    source = "## Assets\n\n- Reference asset: `assets/reference.png`\n  - Usage: Never ship this reference.\n"
+    rendered = _render(source, [_unit("one", ["assets/reference.png"])], tmp_path)["one"].rstrip("\n")
+    if damage == "changed":
+        rendered = rendered.replace("Never ship", "Ship")
+    elif damage == "duplicate":
+        rendered += "\n\n" + source
+    elif damage == "hidden":
+        rendered = "```\n" + rendered
+    units = [_unit("one", ["assets/reference.png"], markdown=rendered)]
+    # Ordinary authoring still cannot supply source asset declarations itself.
+    with pytest.raises(DeliveryAssetAssignmentError):
+        _render(source, units, tmp_path)
+    if damage is not None:
+        with pytest.raises(DeliveryAssetAssignmentError):
+            render_delivery_asset_assignments(
+                source,
+                units,
+                source_task_path=None,
+                project_root=tmp_path,
+                project_config=None,
+                preserve_rendered_assignments=True,
+            )
+    else:
+        assert (
+            render_delivery_asset_assignments(
+                source,
+                units,
+                source_task_path=None,
+                project_root=tmp_path,
+                project_config=None,
+                preserve_rendered_assignments=True,
+            )["one"]
+            == rendered
+        )

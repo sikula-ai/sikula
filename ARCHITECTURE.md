@@ -344,6 +344,115 @@ metadata is bounded, single-line, and rejects absolute local paths while
 preserving explicit HTTP routes such as `GET /users`. Slash-prefixed values are
 treated as routes only in HTTP method or `endpoint`/`route` context; otherwise
 they remain private absolute-path candidates.
+
+For work that cannot fit a complete contract draft and its review in one exchange,
+the author can select hierarchical preparation instead of returning the flat draft.
+`agents/delivery_hierarchical_preparation_agent.py` drives bounded local authoring
+and independent checks; `core/delivery_preparation_tree.py` validates declarations
+and assembles their checked result. This uses the existing `delivery prepare` command,
+plan format, deterministic writer and readiness boundary. Small plans retain the
+existing flat preparation path.
+
+Each local proposal owns direct units and immediate child groups. It accounts for
+every supplied exact source fragment, including context-only material and enclosing
+headings. Private preparation exchanges use short host-assigned source references
+that are stable across the tree and resolve only to the supplied local fragments.
+The host translates reference fields exactly to canonical source IDs before validation
+and assembly; it never guesses unknown references or rewrites contract/source text.
+Independent reviews receive the same reference mapping and exact source text.
+Published accounting and receipts retain canonical source identities and fingerprints.
+Child delegation carries exact source references and a bounded promised
+integration interface; shared prohibitions and cross-group requirements remain the
+parent's responsibility and must also reach affected children. Author and reviewer
+share the same instructions for host-expanded checkpoints, inherited dependencies and
+local scope. An independent local review checks the proposal against the source and
+incoming interface. It distinguishes missing authority or conflicting promises from
+routine implementation choices a single owner can resolve using authorized context.
+Child declarations are preparation assignments: review checks their selected exact
+source together with the promised contribution, without requiring future child
+contracts or repetition of that source in an interface summary. Direct units are
+execution contracts and must themselves preserve requirements governing their work.
+Shared choices require an accountable owner and consumers bound to its decision;
+delegation cannot replace source-defined rules or waive external prerequisites.
+After children pass their own checks, a separate parent completion review sees its own contracts and
+accepted immediate-child references/interfaces. It never receives all descendant
+contracts or review history. Approval of a child establishes preparation authority,
+not successful implementation. Runtime checkpoint and final gates remain mandatory.
+
+Local IDs are prefixed deterministically during assembly. Group ownership and dependency
+references expand to the group's units. Child preparation receives both declared
+local prerequisite interfaces and inherited prerequisite interfaces at every level,
+within the same rendered-packet bounds. Private interface IDs include their declaring
+node so equally named local owners cannot shadow inherited inputs. No descendant
+contracts or review history are added to these interfaces.
+An omitted local `depends_on` defaults to an empty list; explicit null
+or unknown references remain invalid. Exact repeats of inherited prerequisite IDs in
+local dependencies are normalized before review, since assembly already attaches
+those prerequisites to every unit in the group. They cannot become local owners,
+and unknown references still stop.
+Checkpoints must have downstream consumers. Canonical Markdown headings
+and exact assigned source assets are rendered before independent local review, so the
+writer cannot turn an approval of different contract text into an attribution receipt.
+The local authoring protocol includes `asset_paths`: direct units assign declared
+source assets there, while child assignments receive the relevant exact declarations.
+Authors do not handwrite asset sections or generated manifests in unit Markdown.
+The existing writer still checks complete asset assignment, the complete assembled
+dependency/checkpoint graph, unit readiness and publication safety. No whole-plan LLM
+verification or repair is appended after the local checks.
+
+`core/delivery_preparation_session.py` reserves provider exchanges before calling the
+provider, under an exclusive preparation lock. Private control, responses and assessments
+live in `.sikula/state/delivery-preparation/<plan-id>/`, separate from delivery execution
+progress. A selected hierarchy resumes from these records on the same prepare command;
+completed exchanges are reused only with exact source, policy (including author and
+review instruction text), effective provider,
+project context and output bindings. An audit append failure retries the audit append
+without repeating the received provider response. Receipt is persisted before post-call
+input validation, so temporarily unavailable repository context cannot turn a returned
+rejection into another provider attempt. Interrupted response-storage writes block reuse
+rather than reopen the reservation. Oversized responses remain unusable for preparation;
+their full private output is retained in fingerprinted, individually bounded parts for
+audit retry, without increasing the control-file size limit or inlining it in prompts.
+Missing/corrupt evidence blocks reuse;
+changed bindings require a new preparation identity, not a budget reset. The initial
+flat authoring/routing exchange keeps its existing audit and retry behavior; once the
+hierarchy is selected, re-entry skips that exchange.
+An author may request a bounded set of local files once per node through the existing
+sandboxed delivery context reader. Its exact private result is retained for that node's
+authoring and independent review, with hashes rechecked before subsequent calls and
+publication. Unavailable evidence blocks further provider calls; source, privacy and
+read-scope guards are not bypassed to satisfy a context request.
+
+Each node has bounded semantic correction, and a local reviewer can correct a protocol
+error once with unchanged authoritative inputs. Readable authority mismatches and
+prerequisite stops preempt correction even in malformed envelopes; malformed responses
+with readable negative verdicts cannot be retried into approval. Semantic corrections
+retain only the prior local proposal and bounded feedback. Review of a changed proposal
+also receives the bounded findings that prompted that correction, without accumulating
+review history. Findings identify the affected local record, governing authority and
+concrete gap; previous feedback is not new authority. Review can still reject additional
+defects. An unchanged proposal reuses its existing assessment rather than seeking a
+different verdict. Reservations, rejections and
+terminal stops survive interruption, including read-only violations followed by audit
+failure. Rendered request/response allowances are checked before calls where knowable.
+Before independent review, an unapproved proposal can use its remaining semantic
+correction round for incomplete contract sections/commands, missing enclosing source
+context, inconsistent accounting among known references, or source excerpts in public
+summaries. Deterministic checks collect these defects and return bounded private
+feedback only after checking the entire local proposal. When a correction remains,
+independent local review also assesses that readable draft before the author corrects
+it, so deterministic and semantic findings share the same correction exchange. Each
+feedback remains bounded; neither an approving review nor resume clears deterministic
+defects. A last-round deterministic failure stops before another review. Unknown
+source/owner references, changed authoritative inputs and prerequisite stops still
+preempt review and correction, including mixed-error responses. A corrected proposal
+must pass all deterministic and independent checks; correction does not add another
+semantic round or refill reservations on resume.
+Fan-in, depth, node and call ceilings are owned by the preparation modules and tested
+there. Existing global source, plan, obligation and active-unit limits remain in force;
+this removes descendant-contract prompt growth within those limits, not all capacity
+limits or the need for later large-source preparation.
+
 The authoring schema requires an explicit `constraints` list. Each inherited
 hard constraint has a stable ID, one supported kind, a bounded paraphrased
 summary, exact generated-unit references, and a disposition. Deterministic

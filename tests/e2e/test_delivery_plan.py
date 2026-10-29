@@ -2849,16 +2849,21 @@ def test_delivery_check_json_does_not_project_verbatim_source_constraint(
     assert source_rule not in payload_text
 
 
-@pytest.mark.parametrize("correct_declaration", [False, True])
+@pytest.mark.parametrize("correct_declaration", [False, True, "hierarchical"])
 def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
     git_project: Path,
     seq_fake_llm,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    correct_declaration: bool,
+    correct_declaration: bool | str,
 ) -> None:
     """LLM placement -> bounded correction -> intermediate recovery -> root approval."""
     import copy
+
+    hierarchical = correct_declaration == "hierarchical"
+    combined_id = "arithmetic.combined" if hierarchical else "combined-operation"
+    consumer_id = "consumer" if hierarchical else "consumer-result"
+    producers = ["arithmetic.subtract", "arithmetic.multiply"] if hierarchical else ["subtract", "multiply"]
 
     source = "# Calculator integration\n\nSubtraction and multiplication must work through a combined operation before a downstream consumer uses it. The consumer must expose the combined result.\n"
     task = git_project / ".sikula/tasks/checkpoint-flow.md"
@@ -2915,7 +2920,7 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
         ],
     }
     outputs = []
-    if correct_declaration:
+    if correct_declaration is True:
         invalid = copy.deepcopy(draft)
         invalid["checkpoints"][0]["unit_ids"] = ["subtract"]
         outputs.append(json.dumps(invalid))
@@ -2947,6 +2952,55 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
             },
         ],
     )
+    if hierarchical:
+
+        def generate(system: str, prompt: str) -> str:
+            if "INPUT JSON:\n" not in prompt:
+                return json.dumps({"plan_id": "checkpoint-flow", "preparation_mode": "hierarchical"})
+            packet = json.loads(prompt.split("INPUT JSON:\n", 1)[1])
+            if "proposal" in packet:
+                return json.dumps(
+                    {"kind": "approved", "input_fingerprint": packet["input_fingerprint"], "feedback": ""}
+                )
+            is_root = packet["node_id"] == "root"
+            local_units = copy.deepcopy(draft["units"][2:] if is_root else draft["units"][:2])
+            if is_root:
+                local_units[0]["depends_on"] = ["arithmetic"]
+            local_obligation = copy.deepcopy(obligations[1] if is_root else obligations[0])
+            local_obligation["id"] = "consumer" if is_root else "combined"
+            local_fragments = [fragment["id"] for fragment in packet["source_fragments"]]
+            local_obligation["source_fragment_ids"] = local_fragments
+            return json.dumps(
+                {
+                    "title": "Calculator integration",
+                    "units": local_units,
+                    "children": [
+                        {
+                            "id": "arithmetic",
+                            "integration_context": "Provide subtraction and multiplication through a combined operation for the downstream consumer.",
+                            "source_fragment_ids": local_fragments,
+                            "depends_on": [],
+                        }
+                    ]
+                    if is_root
+                    else [],
+                    "constraints": [],
+                    "obligations": [local_obligation],
+                    "source_accounting": [
+                        {
+                            "source_fragment_id": fragment,
+                            "disposition": "mapped",
+                            "constraint_ids": [],
+                            "rationale": "This supplied fragment governs the local behavior.",
+                            "obligation_ids": [local_obligation["id"]],
+                            "child_ids": ["arithmetic"] if is_root else [],
+                        }
+                        for fragment in local_fragments
+                    ],
+                }
+            )
+
+        fake.generate = generate
     readonly_original = fake.run_readonly_agent
     implementation_original = fake.run_agent
     gates: list[tuple[str, bool]] = []
@@ -2960,7 +3014,10 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
             if not checkpoint:
                 passed = passed and (cwd / "src/consumer.py").exists()
             gates.append(("checkpoint" if checkpoint else "root", passed))
-            ids = ["combined-operation"] if checkpoint else ["combined-operation", "consumer-result"]
+            if hierarchical and not checkpoint and '"checkpoint_results"' in prompt:
+                assert passed
+                return prompt.rstrip().splitlines()[-1]
+            ids = [combined_id] if checkpoint else [combined_id, consumer_id]
             return json.dumps(
                 {
                     "schema_version": 2,
@@ -2972,11 +3029,23 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
                         {
                             "code": "entrypoint_missing",
                             "summary": "Connect the arithmetic operations.",
-                            "unit_ids": ["subtract", "multiply"],
-                            "obligation_ids": ["combined-operation"],
+                            "unit_ids": producers,
+                            "obligation_ids": [combined_id],
                         }
                     ],
                     "obligation_results": [{"id": key, "outcome": "satisfied" if passed else "missing"} for key in ids],
+                }
+            )
+        if hierarchical and "Independently assess the proposed repair authority" in prompt:
+            import re
+
+            fingerprint = re.search(r'"packet_fingerprint": "(sha256:[a-f0-9]+)"', prompt).group(1)
+            return json.dumps(
+                {
+                    "schema_version": 1,
+                    "packet_fingerprint": fingerprint,
+                    "disposition": "approved",
+                    "summary": "Authority preserved.",
                 }
             )
         if "Author one small, self-contained delivery repair contract" in prompt:
@@ -3019,7 +3088,11 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
         plan_path = git_project / ".sikula/delivery/checkpoint-flow/plan.yaml"
         plan = yaml.safe_load(plan_path.read_text())
         assert plan["schema_version"] == 3
-        assert plan["checkpoints"] == draft["checkpoints"]
+        if hierarchical:
+            assert plan["final_gate_authority"] and plan["checkpoint_authority"]
+            assert plan["checkpoints"][0]["unit_ids"] == producers
+        else:
+            assert plan["checkpoints"] == draft["checkpoints"]
         _git_commit_all(git_project, "prepared checkpoint flow")
         index_before = (git_project / ".git/index").read_bytes()
         paused = invoke(["run", str(plan_path), "--max-units", "2"])
@@ -3057,12 +3130,12 @@ def test_delivery_prepares_checkpoint_repairs_and_releases_consumer(
         node_id="arithmetic",
     )
     assert [(item.id, item.outcome) for item in evidence.closure.iter_obligation_results()] == [
-        ("combined-operation", "satisfied")
+        (combined_id, "satisfied")
     ]
     covered_units = {item.unit_id for item in evidence.closure.iter_completed_units()}
     assert repair["unit_id"] in covered_units
     assert consumer["unit_id"] not in covered_units
     assert "checkpoint_evidence_fingerprint" not in progress["verification"]
-    if correct_declaration:
+    if correct_declaration is True:
         audit = (git_project / ".sikula/contract-reports/checkpoint-flow.delivery-prepare.auto-llm.jsonl").read_text()
         assert "delivery_authoring.checkpoints_invalid" in audit
