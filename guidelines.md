@@ -476,6 +476,28 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   A format correction grants no additional semantic repair round. Public preparation
   diagnostics expose only allowlisted phase/code metadata and fixed descriptions,
   never raw exceptions, model output, source excerpts, or private identifiers.
+- **Hierarchical delivery preparation** must independently check source delegation,
+  local contracts and parent integration before publishing attribution. Carry exact
+  source fragments, enclosing context and shared requirements to affected children;
+  parent prompts contain only their own work and immediate-child interfaces/references.
+  Never append a hidden all-contract verification or repair exchange. Normalize rendered
+  contracts before local review and retain the existing writer/readiness boundary.
+  Preflight bounded rendered exchanges, reserve finite attempts durably, and reuse
+  accepted work only under unchanged authority and policy. Re-entry cannot refill
+  reservations or erase rejections, prerequisite stops or read-only violations.
+  Mixed protocol/semantic failures obey the same non-retryable boundaries as flat
+  preparation. Correctable inconsistencies in an unapproved proposal may consume its
+  remaining semantic round only after all local authority checks finish; they must not
+  mask unknown source/owner references or prerequisite stops. Gather independent semantic
+  feedback on readable drafts before spending the shared correction round; an approving
+  reviewer cannot waive deterministic defects. Corrected proposals still require independent
+  review with the bounded preceding correction feedback; unchanged proposals retain their
+  existing verdict. Distinguish child preparation assignments (exact selected source plus
+  interface) from self-contained executable unit contracts. Shared decisions must have an
+  owner and compatible consumers. Carry inherited prerequisite interfaces through nested
+  preparation under the same packet limits; qualify their origins to avoid local ID collisions.
+  Keep this preparation-specific; do not introduce a generic workflow engine
+  or raise global plan limits as a substitute for bounded processing.
 - **Stop-and-follow-up constraints are execution blockers.** A preserved
   `stop_and_follow_up` constraint means the required external decision or input
   remains unresolved; it must make generated unit readiness blocking. Delivery

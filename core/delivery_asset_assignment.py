@@ -76,6 +76,8 @@ def render_delivery_asset_assignments(
     project_root: Path,
     project_config: dict | None,
     allow_source_asset_manifest: bool = False,
+    require_complete_assignment: bool = True,
+    preserve_rendered_assignments: bool = False,
 ) -> dict[str, str]:
     """Append exact source declarations to the units selected by authoring."""
     del source_task_path, project_config
@@ -90,8 +92,8 @@ def render_delivery_asset_assignments(
 
     assigned_paths: set[str] = set()
     assigned_by_unit: dict[str, set[str]] = {}
+    unit_bodies: dict[str, str] = {}
     for unit in units:
-        _validate_unit_markdown(unit, aliases)
         canonical_paths: list[str] = []
         for alias in unit.asset_paths:
             project_path = aliases.get(_alias_key(alias))
@@ -117,8 +119,18 @@ def render_delivery_asset_assignments(
             )
         assigned_by_unit[unit.unit_id] = canonical_path_set
         assigned_paths.update(canonical_path_set)
+        body = unit.task_markdown
+        if preserve_rendered_assignments and canonical_path_set:
+            selected = [asset for asset in source_assets if asset.project_path in canonical_path_set]
+            # Accept only an exact deterministic suffix. Other declarations,
+            # altered provenance and hidden/duplicate sections still fail below.
+            suffix = "\n\n" + _append_assigned_assets("", selected)[0].strip("\n")
+            if body.rstrip("\n").endswith(suffix):
+                body = body.rstrip("\n")[: -len(suffix)]
+        _validate_unit_markdown(replace(unit, task_markdown=body), aliases)
+        unit_bodies[unit.unit_id] = body
 
-    if set(source_by_path) - assigned_paths:
+    if require_complete_assignment and set(source_by_path) - assigned_paths:
         raise DeliveryAssetAssignmentError(
             "source_asset_unassigned",
             "At least one source task asset is not assigned to any delivery unit.",
@@ -128,7 +140,9 @@ def render_delivery_asset_assignments(
     for unit in units:
         assigned = assigned_by_unit[unit.unit_id]
         selected = [asset for asset in source_assets if asset.project_path in assigned]
-        task_markdown, asset_heading_line = _append_assigned_assets(unit.task_markdown, selected)
+        task_markdown, asset_heading_line = _append_assigned_assets(unit_bodies[unit.unit_id], selected)
+        if preserve_rendered_assignments and task_markdown.rstrip("\n") == unit.task_markdown.rstrip("\n"):
+            task_markdown = unit.task_markdown
         if asset_heading_line is not None:
             _assert_rendered_assets_visible(
                 task_markdown,

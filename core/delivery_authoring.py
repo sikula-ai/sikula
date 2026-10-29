@@ -421,6 +421,7 @@ def public_delivery_preparation_failure(error: BaseException) -> tuple[str, str]
     phase = getattr(error, "phase", None)
     if not isinstance(phase, str) or phase not in {
         "delivery_prepare_authoring",
+        "delivery_prepare_hierarchy",
         "delivery_prepare_constraint_verification",
         "delivery_prepare_draft_recovery",
         "delivery_prepare_constraint_repair",
@@ -1213,6 +1214,7 @@ def _parse_units(
     project_root: Path,
     allow_asset_paths: bool = False,
     allow_asset_manifest: bool = False,
+    markdown_corrections: list[tuple[str, DeliveryAuthoringParseError]] | None = None,
 ) -> list[DeliveryAuthoringUnitDraft]:
     if not isinstance(value, list):
         raise DeliveryAuthoringParseError(
@@ -1248,7 +1250,17 @@ def _parse_units(
         title = _bounded_authoring_string(item, "title", f"{unit_path}.title")
         depends_on = _require_string_list(item, "depends_on", f"{unit_path}.depends_on")
         task_markdown = _require_string(item, "task_markdown", f"{unit_path}.task_markdown")
-        _validate_unit_task_markdown(task_markdown, allow_asset_manifest=allow_asset_manifest)
+        try:
+            _validate_unit_task_markdown(task_markdown, allow_asset_manifest=allow_asset_manifest)
+        except DeliveryAuthoringParseError as exc:
+            if markdown_corrections is None or exc.code not in {
+                "delivery_authoring.unit_markdown_missing_section",
+                "delivery_authoring.unit_markdown_missing_verification_commands",
+            }:
+                raise
+            # An unapproved hierarchical draft may correct incomplete Markdown,
+            # but all identity, scope, asset and budget checks still run below.
+            markdown_corrections.append((unit_id, exc))
 
         units.append(
             DeliveryAuthoringUnitDraft(

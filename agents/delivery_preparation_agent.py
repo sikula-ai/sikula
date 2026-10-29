@@ -56,6 +56,14 @@ You are Sikula's read-only delivery-plan authoring assistant.
 Your job is to split one source task description into a strict structured delivery-plan draft
 for later deterministic writer code. You do not write files or create delivery artifacts.
 
+For a small cohesive plan return the complete draft described below. If all unit contracts,
+independent completeness checks or correction would require a large whole-plan exchange,
+choose bounded hierarchical preparation instead: return ONLY
+{{"plan_id":"{plan_id}","preparation_mode":"hierarchical"}}.
+Do not include a partial draft with that routing decision. Sikula will prepare and independently
+check coherent groups in local exchanges, preserving source authority and the final gate.
+Do not use hierarchical routing to evade a known external prerequisite or stop-and-follow-up rule.
+
 Hard rules:
 - Do not write, edit, delete, move, rename, format, or create files.
 - Do not run commands at all, including read-only commands such as grep, find, ls, git, package,
@@ -850,6 +858,24 @@ class DeliveryPreparationAgent:
                 "delivery_authoring.authority_too_large",
                 "The source task has too many authority fragments for one delivery plan.",
             )
+        from agents.delivery_hierarchical_preparation_agent import has_hierarchical_preparation, prepare_hierarchy
+        from core.delivery_preparation_tree import MAX_PREPARATION_PACKET_BYTES, failure
+        from core.delivery_verification import MAX_DELIVERY_VERIFICATION_SOURCE_BYTES
+
+        if len(task_description.encode("utf-8")) > MAX_DELIVERY_VERIFICATION_SOURCE_BYTES:
+            raise failure("hierarchy_required")
+
+        hierarchy_arguments = dict(
+            task_description=task_description,
+            task_path=task_path,
+            plan_id=plan_id,
+            project_root=root,
+            output_dir=output_dir,
+            project_context=project_context,
+            audit_recorder=audit_recorder,
+        )
+        if has_hierarchical_preparation(root, plan_id):
+            return prepare_hierarchy(self, **hierarchy_arguments)
         authoring_prompt = self._build_authoring_prompt(
             task_description=task_description,
             task_path=task_path,
@@ -875,6 +901,8 @@ class DeliveryPreparationAgent:
                     else ""
                 )
             )
+            if len(prompt.encode("utf-8")) > MAX_PREPARATION_PACKET_BYTES:
+                raise failure("hierarchy_required")
             try:
                 output = self.llm.generate("", prompt)
             except Exception as exc:
@@ -893,6 +921,32 @@ class DeliveryPreparationAgent:
                 ) from None
 
             try:
+                # Routing is not a draft or an approval. Only the bounded tree flow can
+                # assemble independently checked contracts after this explicit choice.
+                try:
+                    from core.delivery_authoring import _object_pairs_without_duplicates
+
+                    route = json.loads(output, object_pairs_hook=_object_pairs_without_duplicates)
+                except (ValueError, TypeError, RecursionError):
+                    route = None
+                if isinstance(route, dict) and route.get("preparation_mode") == "hierarchical":
+                    if delivery_output_has_prerequisite_stop(output):
+                        raise failure("prerequisite_stop")
+                    if route != {"plan_id": plan_id, "preparation_mode": "hierarchical"}:
+                        raise DeliveryAuthoringParseError(
+                            "delivery_authoring.unknown_field", "Invalid hierarchical routing response."
+                        )
+                    if audit_recorder is not None:
+                        audit_recorder(
+                            {
+                                "phase": "delivery_prepare_authoring",
+                                "round_index": round_index,
+                                "prompt": prompt,
+                                "raw_output": output,
+                                "parsed": {"status": "hierarchical", "plan_id": plan_id},
+                            }
+                        )
+                    return prepare_hierarchy(self, **hierarchy_arguments)
                 draft = parse_delivery_authoring_output(
                     output,
                     expected_plan_id=plan_id,
@@ -903,6 +957,8 @@ class DeliveryPreparationAgent:
                     require_source_accounting=True,
                 )
             except DeliveryAuthoringParseError as exc:
+                if getattr(exc, "phase", None) == "delivery_prepare_hierarchy":
+                    raise
                 exc.phase = "delivery_prepare_authoring"
                 self._record_failure(
                     audit_recorder,

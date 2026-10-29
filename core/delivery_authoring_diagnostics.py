@@ -61,7 +61,11 @@ PUBLIC_AUTHORING_ERROR_CODES = frozenset(
             "gap_summary_source_excerpt gap_units_invalid gaps_invalid gaps_required gaps_unexpected "
             "obligations_mismatch "
         ),
-        "delivery_prepare": ("authoring_failed output_invalid recovery_failed recovery_scope_changed "),
+        "delivery_prepare": (
+            "authoring_failed output_invalid recovery_failed recovery_scope_changed "
+            "hierarchy_required hierarchy_output_invalid hierarchy_draft_invalid hierarchy_authority_changed hierarchy_stale "
+            "hierarchy_evidence_unavailable hierarchy_budget_exhausted hierarchy_locked prerequisite_stop readonly_violation "
+        ),
         "delivery_unit_context_verification": (
             "authority_required complete_invalid gap_not_object gaps_invalid_type gaps_required "
             "gaps_too_many gaps_unexpected literal_already_present literal_duplicate literal_invalid "

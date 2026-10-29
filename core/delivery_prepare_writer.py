@@ -1118,6 +1118,7 @@ def _assign_source_assets(
             source_task_path=source_task_path,
             project_root=project_root,
             project_config=project_config,
+            preserve_rendered_assignments=_checkpoint_authority_matches_draft(draft),
         )
     except DeliveryAssetAssignmentError as exc:
         path = unit_task_paths.get(exc.unit_id) if exc.unit_id else None

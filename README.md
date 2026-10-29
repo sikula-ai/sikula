@@ -195,6 +195,17 @@ splitting an existing unit. See [Writing Sikula Tasks](docs/writing-tasks.md#tas
 and [Delivery Plans](docs/delivery-plans.md) for the asset syntax and assignment
 rules.
 
+For larger work, the preparation assistant can choose a hierarchy of local groups.
+Each group gets independent contract and source-authority checks; parents review
+their own work and checked child interfaces without receiving every descendant
+contract. Repeating the same `delivery prepare` command resumes saved preparation
+under unchanged inputs and configuration, with finite attempts and terminal stops
+preserved. Private preparation records stay under `.sikula/state/delivery-preparation/`.
+Changed inputs require a new plan ID. The resulting plan uses the usual readiness,
+checkpoint, repair and final-gate flow; current source and plan capacity limits still apply.
+Maintainers can exercise this path with the opt-in
+[real-provider preparation smoke](docs/hierarchical-preparation-smoke.md).
+
 Freshly authored plans are bound to the source task path and content hash. The
 authoring draft must explicitly classify inherited hard constraints such as
 repository ownership, authoritative read-only dependencies, stop-and-follow-up
