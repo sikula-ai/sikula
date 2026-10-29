@@ -744,6 +744,9 @@ def test_delivery_scope_regular_file_snapshot_rejects_type_race_and_read_error(
 ) -> None:
     source = tmp_path / "file.txt"
     source.write_text("content\n", encoding="utf-8")
+    # Keep deliberately incomplete stat results local to the snapshot helper;
+    # pytest and its capture machinery also use the shared os module.
+    monkeypatch.setattr(validation_artifacts_module, "os", SimpleNamespace(**vars(os)))
     monkeypatch.setattr(
         validation_artifacts_module.os,
         "fstat",
