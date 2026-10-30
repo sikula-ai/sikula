@@ -205,6 +205,8 @@ Changed inputs require a new plan ID. The resulting plan uses the usual readines
 checkpoint, repair and final-gate flow; current source and plan capacity limits still apply.
 Maintainers can exercise this path with the opt-in
 [real-provider preparation smoke](docs/hierarchical-preparation-smoke.md).
+The [deterministic capacity experiment](docs/hierarchical-delivery-capacity.md)
+exercises full delivery and recovery on growing synthetic plans without external provider calls.
 
 Freshly authored plans are bound to the source task path and content hash. The
 authoring draft must explicitly classify inherited hard constraints such as
