@@ -78,6 +78,101 @@ def test_preparation_reviews_authority_at_every_level(tmp_path):
     assert "composition_authority" not in checked.plan.to_dict()
 
 
+@pytest.mark.parametrize("repair_node", ["root", "integration"])
+def test_composition_delegation_binds_contributors_inside_its_scope(tmp_path, repair_node):
+    import yaml
+    from core.delivery_final_authority import final_authority_context
+    from core.delivery_plan import check_delivery_plan_file
+    from core.delivery_repair import _appended_plan
+
+    path, cfg, before, *_ = _prepared(tmp_path)
+    assert set(before.plan.verified_composition_authority) == {"integration"}
+    data = yaml.safe_load(path.read_text())
+    unit = dict(
+        id="integration-repair-aaaaaaaaaaaaaaaa",
+        task_path=".sikula/delivery/team-invites/units/integration-repair-aaaaaaaaaaaaaaaa.md",
+        depends_on=["foundation", "consumer", *(["shipping"] if repair_node == "root" else [])],
+        scope_paths=["agents"],
+        repair_node=repair_node,
+    )
+    (tmp_path / unit["task_path"]).write_bytes((tmp_path / before.plan.units[0].task_path).read_bytes())
+    path.write_bytes(
+        _appended_plan(
+            data,
+            unit,
+            ["deliver-team-invites"],
+            tmp_path,
+            cfg,
+            str(path),
+            node_id=repair_node,
+            completed_unit_ids=frozenset(item.id for item in before.plan.units),
+        )
+    )
+    after = check_delivery_plan_file(path, project_root=tmp_path)
+    assert after.valid, after.errors
+    if repair_node == "root":
+        # A later contribution outside integration changes final responsibility,
+        # not the original group's exact independently reviewed contribution.
+        assert after.plan.verified_composition_authority == before.plan.verified_composition_authority
+    else:
+        # A new owner inside integration but outside storage invalidates storage
+        # discharge at integration and requires fresh local attribution.
+        assert "integration" not in after.plan.verified_composition_authority
+        with pytest.raises(ValueError, match="Later contributors"):
+            final_authority_context(after.plan, SOURCE, "integration")
+    assert after.plan.verified_final_gate_authority is None
+    if repair_node == "root":
+        with pytest.raises(ValueError, match="Later contributors"):
+            final_authority_context(after.plan, SOURCE)
+
+
+def test_later_constraint_owner_preserves_nested_source_delegation(tmp_path):
+    import yaml
+    from core.delivery_plan import check_delivery_plan_file
+    from core.delivery_repair import _appended_plan
+
+    data = _data()
+    data["constraints"] = [
+        dict(
+            id="private-storage",
+            kind="security_boundary",
+            summary="Keep stored values private.",
+            unit_ids=["foundation"],
+            disposition="preserved",
+        )
+    ]
+    data["source_accounting"][1].update(disposition="mapped", constraint_ids=["private-storage"])
+    path, cfg, before, *_ = _prepare(
+        tmp_path,
+        SOURCE,
+        data,
+        verification={"constraints": data["constraints"], "final_gate_authority_complete": True},
+    )
+    assert set(before.plan.verified_composition_authority) == {"integration"}
+    unit = dict(
+        id="integration-repair-aaaaaaaaaaaaaaaa",
+        task_path=".sikula/delivery/team-invites/units/integration-repair-aaaaaaaaaaaaaaaa.md",
+        depends_on=["foundation", "consumer", "shipping"],
+        scope_paths=["agents"],
+        repair_node="root",
+    )
+    (tmp_path / unit["task_path"]).write_bytes((tmp_path / before.plan.units[0].task_path).read_bytes())
+    path.write_bytes(
+        _appended_plan(
+            yaml.safe_load(path.read_text()),
+            unit,
+            ["visible"],
+            tmp_path,
+            cfg,
+            str(path),
+        )
+    )
+    after = check_delivery_plan_file(path, project_root=tmp_path)
+    assert after.valid, after.errors
+    assert after.plan.verified_composition_authority == before.plan.verified_composition_authority
+    assert after.plan.verified_final_gate_authority is None
+
+
 def test_authoring_rejects_context_attribution_missing_an_ancestor(tmp_path):
     from core.delivery_authoring import DeliveryAuthoringParseError, parse_delivery_authoring_output
 

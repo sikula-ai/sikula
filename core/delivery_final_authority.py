@@ -34,6 +34,7 @@ def final_authority_context(plan: DeliveryPlan, source: str, node_id: str = "roo
     if not immediate:
         raise ValueError("Composition authority requires immediate children.")
     scope = DeliveryVerificationScope.from_plan(plan, node_id)
+    scope_units = set(scope.unit_ids)
     nodes = {node.id: node for node in immediate}
     outcomes = {item.id: item for item in plan.obligations}
     rules = {item.id: item for item in plan.constraints}
@@ -45,7 +46,10 @@ def final_authority_context(plan: DeliveryPlan, source: str, node_id: str = "roo
             or inherited.intersection(node.obligation_ids)
         ):
             raise ValueError("Final delegation requires disjoint reviewed child interfaces.")
-        if any(not set(outcomes[key].unit_ids) <= set(node.unit_ids) for key in node.obligation_ids):
+        # A checkpoint discharges only its scoped contribution. Later owners
+        # outside that scope still belong to ancestor/final verification; they
+        # cannot invalidate unchanged local delegation or be discharged by it.
+        if any(not (set(outcomes[key].unit_ids) & scope_units) <= set(node.unit_ids) for key in node.obligation_ids):
             raise ValueError("Later contributors require fresh final attribution.")
         covered.update(node.unit_ids)
         inherited.update(node.obligation_ids)
@@ -72,7 +76,9 @@ def final_authority_context(plan: DeliveryPlan, source: str, node_id: str = "roo
                 for child in immediate
                 if child.id in (record.checkpoint_ids or ())
                 and set(record.obligation_ids) <= set(child.obligation_ids)
-                and all(set(rules[key].unit_ids) <= set(child.unit_ids) for key in record.constraint_ids)
+                and all(
+                    (set(rules[key].unit_ids) & scope_units) <= set(child.unit_ids) for key in record.constraint_ids
+                )
             ]
             if (node_id == "root" and record.final_gate) or len(owning_children) != 1:
                 selected.add(record.source_fragment_id)
@@ -84,7 +90,7 @@ def final_authority_context(plan: DeliveryPlan, source: str, node_id: str = "roo
             raise ValueError("Final authority has no single owning child.")
         child = nodes[record.checkpoint_ids[0]]
         if not set(record.obligation_ids) <= set(child.obligation_ids) or any(
-            not set(rules[key].unit_ids) <= set(child.unit_ids) for key in record.constraint_ids
+            not (set(rules[key].unit_ids) & scope_units) <= set(child.unit_ids) for key in record.constraint_ids
         ):
             raise ValueError("Shared outcomes and constraints cannot be delegated as child-local authority.")
     selected = _enclosing_fragments(source, selected)

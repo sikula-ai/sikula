@@ -1544,6 +1544,12 @@ and contracts remain unchanged. Schema-3 coordinator repairs carry `repair_node`
 a later node's repair may extend root obligation ownership without retroactively
 making it a prerequisite of an earlier accepted group. The earlier scope retains
 only its own contributions; final verification still checks the complete outcome.
+Nested composition applies the same scoped ownership rule to child obligations
+and source constraints. Owners outside the current checkpoint do not change its
+unchanged local delegation receipt. Owners added inside it must still satisfy
+child attribution or invalidate that receipt. At the final gate the scope is the
+whole plan: later repair owners cannot be discharged by an earlier child receipt,
+and require renewed authority or a bounded full review.
 Unfinished publication blocks children and resumes from private control snapshots.
 Repair preflight determines accepted groups using currently usable handoffs under
 the effective policy, not merely stored `passed` results. It freezes that set in
