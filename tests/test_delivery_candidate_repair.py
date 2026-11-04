@@ -63,7 +63,8 @@ def test_repair_barrier_propagates_through_completed_consumers(repair_done):
         ],
     )
     with (
-        patch("core.delivery_checkpoints.checkpoint_pass_is_usable", return_value=False) as usable,
+        patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", return_value=False) as usable,
+        patch("core.delivery_checkpoints.checkpoint_pass_is_usable", new=usable),
         patch("core.delivery_checkpoint_applicability.checkpoint_applicability", return_value={}),
         patch("core.delivery_repair.candidate_repair_reconciles_checkpoint", return_value=True) as reconciled,
     ):

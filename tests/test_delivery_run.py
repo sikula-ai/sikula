@@ -732,6 +732,43 @@ def test_delivery_run_stops_when_status_becomes_invalid(monkeypatch: pytest.Monk
     assert [issue.code for issue in result.errors] == ["delivery.invalid"]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("failure", ["integrity", "budget"])
+def test_checkpoint_selection_failure_blocks_run_before_provider_work(monkeypatch, dry_run, failure):
+    from core.delivery_evidence_resolution import EvidenceResolutionLimit
+
+    status = _status(["pending"])
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    monkeypatch.setattr("core.delivery_verification.with_delivery_verification_readiness", lambda status, cfg: status)
+    error_type = EvidenceResolutionLimit if failure == "budget" else ValueError
+
+    def selection(*args, **kwargs):
+        raise error_type("Private evidence detail must not reach public output")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Checkpoint selection failure must preempt all provider and unit work")
+
+    monkeypatch.setattr("core.delivery_checkpoints.due_delivery_checkpoint", selection)
+    monkeypatch.setattr("core.delivery_repair.coordinate_delivery_repair", forbidden)
+    monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", forbidden)
+    context = replace(_context(), verify_plan=forbidden)
+    args = _args(dry_run=dry_run)
+    if dry_run:
+        result = _preview_delivery_run(args, {}, context=context, project_root=Path("/project"))
+    else:
+        result = _run_delivery_plan(args, {}, context, project_root=Path("/project"))
+    expected = (
+        "delivery_verification.evidence_budget_exhausted"
+        if failure == "budget"
+        else "delivery_checkpoint.evidence_unavailable"
+    )
+    assert result.stop_code == expected
+    assert not result.ready and not result.succeeded and not result.completed
+    assert result.units_attempted == 0
+    assert [issue.code for issue in result.errors] == [expected]
+    assert "Private evidence detail" not in json.dumps(result.to_dict())
+
+
 @pytest.mark.parametrize("bound", ["unit", "elapsed"])
 @pytest.mark.parametrize(
     "blocker", [None, "budget_exhausted", "authoring_budget_exhausted", "readonly_mutation", "hierarchy_required"]
@@ -784,39 +821,42 @@ def test_repair_blocker_takes_precedence_over_resumable_limit(
         assert not result.errors
 
 
-def test_finalize_delivery_run_routes_current_finalization_through_finalizer(
+@pytest.mark.parametrize("already_finalized", [False, True])
+def test_finalize_delivery_run_delegates_preflight_and_current_checks_to_finalizer(
     monkeypatch: pytest.MonkeyPatch,
+    already_finalized: bool,
 ) -> None:
-    monkeypatch.setattr("core.delivery_finalize._final_verification_issue", lambda *args: None)
-    status = _status(["done"], final_commit="a" * 40)
+    status = _status(["done"], final_commit="a" * 40 if already_finalized else None)
+    cfg = {"agents": {"reviewer": {"llm": {"model": "effective-reviewer"}}}}
     seen: list[str] = []
     monkeypatch.setattr(
-        "core.delivery_finalize.delivery_assembly_branch_is_symbolic",
-        lambda *args, **kwargs: False,
+        "sikula_cli.delivery._delivery_run_is_current_finalization",
+        lambda *args, **kwargs: pytest.fail("The finalizer owns current-result checks"),
     )
-    monkeypatch.setattr("core.delivery_finalize._branch_commit", lambda *args, **kwargs: "a" * 40)
-    monkeypatch.setattr("core.delivery_finalize._resolve_commit", lambda *args, **kwargs: "a" * 40)
     monkeypatch.setattr(
         "core.delivery_finalize.preview_delivery_finalize",
-        lambda *args, **kwargs: pytest.fail("current finalization must bypass mutating finalize preview"),
+        lambda *args, **kwargs: pytest.fail("Execution must use the finalizer's own preflight"),
     )
 
     def finalize(*args, **kwargs):
+        assert args == ("plan.yaml",)
+        assert kwargs == {"project_root": Path("/project"), "project_config": cfg}
         seen.append("finalize")
         return SimpleNamespace(
             finalized=True,
-            final_branch=status.final_branch,
-            final_commit=status.final_commit,
+            final_branch=status.plan.final_branch,
+            final_commit="a" * 40,
             errors=[],
             warnings=[],
             message="Delivery finalization is current.",
         )
 
+    def refreshed(*args, **kwargs):
+        seen.append("status")
+        return status
+
     monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", finalize)
-    monkeypatch.setattr(
-        "core.delivery_progress.get_delivery_status",
-        lambda *args, **kwargs: status,
-    )
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", refreshed)
 
     result = _finalize_delivery_run(
         _args(),
@@ -828,12 +868,13 @@ def test_finalize_delivery_run_routes_current_finalization_through_finalizer(
         units_succeeded=0,
         last_unit=None,
         child_task_id=None,
+        cfg=cfg,
     )
 
     assert result.succeeded is True
     assert result.finalized is True
     assert result.stop_code == DELIVERY_RUN_COMPLETED
-    assert seen == ["finalize"]
+    assert seen == ["finalize", "status"]
 
 
 def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
@@ -855,10 +896,6 @@ def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
         lambda current, cfg: current,
     )
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
-    monkeypatch.setattr(
-        "core.delivery_finalize.preview_delivery_finalize",
-        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
-    )
     monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
@@ -987,10 +1024,6 @@ def test_finalize_delivery_run_retries_technical_verification_failure(
     )
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
     monkeypatch.setattr(
-        "core.delivery_finalize.preview_delivery_finalize",
-        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
-    )
-    monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
             finalized=True,
@@ -1043,10 +1076,6 @@ def test_finalize_delivery_run_reverifies_projected_stale_record(
     monkeypatch.setattr("core.delivery_verification.with_delivery_verification_readiness", project)
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
     monkeypatch.setattr(
-        "core.delivery_finalize.preview_delivery_finalize",
-        lambda *args, **kwargs: SimpleNamespace(ready=True, errors=[], warnings=[]),
-    )
-    monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
             finalized=True,
@@ -1079,14 +1108,17 @@ def test_finalize_delivery_run_reverifies_projected_stale_record(
 def test_finalize_delivery_run_stops_on_blocked_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _status(["done"])
     issue = DeliveryPlanIssue("error", "delivery.finalize_blocked", "Blocked.")
-    preview = SimpleNamespace(
+    blocked = SimpleNamespace(
         ready=False,
+        finalized=False,
         final_branch="sikula/delivery/demo",
         final_commit=None,
         errors=[issue],
         warnings=[],
+        message="Finalization preflight is blocked.",
     )
-    monkeypatch.setattr("core.delivery_finalize.preview_delivery_finalize", lambda *args, **kwargs: preview)
+    monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", lambda *args, **kwargs: blocked)
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
 
     result = _finalize_delivery_run(
         _args(),
@@ -1111,13 +1143,6 @@ def test_finalize_delivery_run_projects_mutating_result(
     finalized: bool,
 ) -> None:
     status = _status(["done"])
-    preview = SimpleNamespace(
-        ready=True,
-        final_branch="sikula/delivery/demo",
-        final_commit=None,
-        errors=[],
-        warnings=[],
-    )
     final_result = SimpleNamespace(
         finalized=finalized,
         final_branch="sikula/delivery/demo",
@@ -1127,7 +1152,6 @@ def test_finalize_delivery_run_projects_mutating_result(
         message="Finalization failed.",
     )
     updated_status = _status(["done"], final_commit="b" * 40) if finalized else status
-    monkeypatch.setattr("core.delivery_finalize.preview_delivery_finalize", lambda *args, **kwargs: preview)
     monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", lambda *args, **kwargs: final_result)
     monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: updated_status)
 

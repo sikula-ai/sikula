@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from core.delivery_checkpoint_model import parse_delivery_checkpoints, DeliveryCheckpointError
+from core.delivery_checkpoint_model import parse_delivery_checkpoints, DeliveryCheckpointError, DeliveryCheckpoint
 from core.delivery_checkpoints import due_delivery_checkpoint, verification_node_status
 from core.delivery_composition import build_composition_context, composition_example
 from core.delivery_checkpoint_evidence import checkpoint_evidence_path, load_checkpoint_evidence
@@ -258,6 +259,200 @@ def _compose(path, cfg, node, interrupt=False):
     return contexts
 
 
+@pytest.mark.parametrize("depth", [2, 16])
+def test_handoff_traversal_checks_each_node_once_and_starts_fresh(depth: int) -> None:
+    from core.delivery_checkpoints import checkpoint_handoffs
+
+    nodes = [
+        DeliveryCheckpoint(str(index), (), (), parent_id=str(index - 1) if index else "root") for index in range(depth)
+    ]
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=nodes))
+    with patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", return_value=True) as check:
+        assert checkpoint_handoffs(status, {}) == frozenset(node.id for node in nodes)
+        assert [call.args[1].id for call in check.call_args_list] == [node.id for node in reversed(nodes)]
+        first_resolver = check.call_args.kwargs["resolver"]
+        check.reset_mock()
+        assert checkpoint_handoffs(status, {}) == frozenset(node.id for node in nodes)
+        assert check.call_count == depth
+        assert check.call_args.kwargs["resolver"] is not first_resolver
+
+
+def test_unaccepted_parent_does_not_resolve_child_evidence() -> None:
+    from core.delivery_checkpoints import checkpoint_pass_is_usable
+
+    parent = DeliveryCheckpoint("parent", (), ())
+    child = DeliveryCheckpoint("leaf", (), (), parent_id="parent")
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=[parent, child]), checkpoint_verifications={})
+    with patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable") as check:
+        assert not checkpoint_pass_is_usable(status, parent)
+        check.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", [2, 16])
+def test_checkpoint_selection_checks_each_node_once_and_starts_fresh(depth: int) -> None:
+    nodes = [
+        DeliveryCheckpoint(str(index), (), (), parent_id=str(index - 1) if index else "root") for index in range(depth)
+    ]
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=nodes))
+    with (
+        patch("core.delivery_checkpoints.verification_node_status", return_value=status),
+        patch("core.delivery_checkpoints.verification_scope_complete", return_value=True),
+        patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", return_value=True) as check,
+    ):
+        assert due_delivery_checkpoint(status, {}) is None
+        assert [call.args[1].id for call in check.call_args_list] == [node.id for node in reversed(nodes)]
+        first_resolver = check.call_args.kwargs["resolver"]
+        assert all(call.kwargs["resolver"] is first_resolver for call in check.call_args_list)
+        check.reset_mock()
+        check.return_value = False
+        assert due_delivery_checkpoint(status, {}) == nodes[-1].id
+        assert check.call_count == 1
+        assert check.call_args.kwargs["resolver"] is not first_resolver
+
+
+@pytest.mark.parametrize(
+    ("complete", "accepted", "expected", "visited"),
+    [
+        ({"parent", "sibling"}, set(), "sibling", ["sibling"]),
+        ({"leaf", "parent", "sibling"}, set(), "leaf", ["leaf"]),
+        ({"leaf", "sibling"}, {"leaf", "sibling"}, None, ["leaf", "sibling"]),
+        ({"leaf", "parent", "sibling"}, {"leaf"}, "sibling", ["leaf", "sibling"]),
+        ({"leaf", "parent", "sibling"}, {"leaf", "sibling"}, "parent", ["leaf", "sibling", "parent"]),
+    ],
+)
+def test_checkpoint_selection_preserves_subtree_order_and_incomplete_barriers(complete, accepted, expected, visited):
+    nodes = [
+        DeliveryCheckpoint("parent", (), ()),
+        DeliveryCheckpoint("leaf", (), (), parent_id="parent"),
+        DeliveryCheckpoint("sibling", (), ()),
+    ]
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=nodes))
+    with (
+        patch("core.delivery_checkpoints.verification_node_status", side_effect=lambda _, key: key),
+        patch("core.delivery_checkpoints.verification_scope_complete", side_effect=lambda key: key in complete),
+        patch(
+            "core.delivery_checkpoints._checkpoint_local_pass_is_usable",
+            side_effect=lambda _, node, cfg, **kwargs: node.id in accepted,
+        ) as check,
+    ):
+        assert due_delivery_checkpoint(status, {}) == expected
+        assert [call.args[1].id for call in check.call_args_list] == visited
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "budget", "changed_pass", "changed_due"])
+def test_checkpoint_selection_retains_integrity_checks_on_every_return(tmp_path: Path, failure: str) -> None:
+    from core.delivery_evidence_resolution import EvidenceResolutionLimit, EvidenceResolver
+    from core.delivery_repair_storage import write_repair_state
+
+    nodes = [DeliveryCheckpoint("parent", (), ()), DeliveryCheckpoint("leaf", (), (), parent_id="parent")]
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=nodes))
+    path = tmp_path / "leaf.json"
+    write_repair_state(tmp_path, path, {"accepted": True})
+
+    def check(status, node, cfg, *, resolver: EvidenceResolver):
+        if node.id == "leaf":
+            resolver.read(tmp_path, path)
+            if failure == "unavailable":
+                raise OSError("Unavailable evidence")
+            if failure == "budget":
+                # Exhaust the operation's real read allowance, not a reviewer budget.
+                resolver._charge("reads", resolver.limits.reads)
+        else:
+            write_repair_state(tmp_path, path, {"accepted": False})
+        return failure != "changed_due" or node.id == "leaf"
+
+    with (
+        patch("core.delivery_checkpoints.verification_node_status", return_value=status),
+        patch("core.delivery_checkpoints.verification_scope_complete", return_value=True),
+        patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", side_effect=check),
+    ):
+        if failure == "unavailable":
+            assert due_delivery_checkpoint(status, {}) == "leaf"
+        else:
+            with pytest.raises(EvidenceResolutionLimit if failure == "budget" else ValueError):
+                due_delivery_checkpoint(status, {})
+
+
+@pytest.mark.parametrize("failure", ["rejected", "unavailable", "budget", "changed"])
+def test_handoff_traversal_retains_failed_subtrees_and_integrity_checks(tmp_path: Path, failure: str) -> None:
+    from core.delivery_checkpoints import checkpoint_handoffs
+    from core.delivery_evidence_resolution import EvidenceResolutionLimit, EvidenceResolver
+    from core.delivery_repair_storage import write_repair_state
+
+    nodes = [
+        DeliveryCheckpoint("parent", (), ()),
+        DeliveryCheckpoint("leaf", (), (), parent_id="parent"),
+        DeliveryCheckpoint("sibling", (), ()),
+    ]
+    status = SimpleNamespace(valid=True, plan=SimpleNamespace(checkpoints=nodes))
+    path = tmp_path / "leaf.json"
+    write_repair_state(tmp_path, path, {"accepted": True})
+
+    def check(status: SimpleNamespace, node: DeliveryCheckpoint, cfg: dict, *, resolver: EvidenceResolver) -> bool:
+        if node.id == "leaf":
+            resolver.read(tmp_path, path)
+            if failure == "unavailable":
+                raise ValueError("Unavailable evidence")
+            if failure == "budget":
+                raise EvidenceResolutionLimit("Exhausted")
+            return failure == "changed"
+        if node.id == "parent" and failure == "changed":
+            write_repair_state(tmp_path, path, {"accepted": False})
+        return True
+
+    with patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", side_effect=check) as checked:
+        if failure in {"budget", "changed"}:
+            with pytest.raises(EvidenceResolutionLimit if failure == "budget" else ValueError):
+                checkpoint_handoffs(status, {})
+        else:
+            assert checkpoint_handoffs(status, {}) == frozenset({"sibling"})
+            assert [call.args[1].id for call in checked.call_args_list] == ["leaf", "sibling"]
+
+
+def test_nested_status_handoffs_visit_once_and_revalidate_mutable_inputs(nested_plan: tuple[Path, dict]) -> None:
+    from core import delivery_checkpoints as checkpoints
+
+    path, cfg = nested_plan
+    assert _run(path, cfg, _LLM(delivery_integration_review_control_example({"deliver-team-invites"})))[0].succeeded
+    _complete(path, "consumer")
+    _compose(path, cfg, "integration")
+    status = get_delivery_status(path)
+    with patch(
+        "core.delivery_checkpoints._checkpoint_local_pass_is_usable", wraps=checkpoints._checkpoint_local_pass_is_usable
+    ) as check:
+        projected = checkpoints.with_checkpoint_barriers(status, cfg)
+        assert projected.checkpoint_handoffs == frozenset({"storage", "integration"})
+        assert [call.args[1].id for call in check.call_args_list] == ["storage", "integration"]
+        check.reset_mock()
+        assert due_delivery_checkpoint(projected, cfg) is None
+        assert [call.args[1].id for call in check.call_args_list] == ["storage", "integration"]
+
+    # Neither a prior projection nor an unchanged status object authorizes reuse.
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n# changed checkout\n")
+    assert not checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs
+    assert due_delivery_checkpoint(projected, cfg) == "storage"
+    path.write_bytes(original)
+    changed_cfg = deepcopy(cfg)
+    changed_cfg["agents"] = {"reviewer": {"llm": {"model": "changed"}}}
+    assert not checkpoints.with_checkpoint_barriers(projected, changed_cfg).checkpoint_handoffs
+    assert due_delivery_checkpoint(projected, changed_cfg) == "storage"
+    assert checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs == projected.checkpoint_handoffs
+    root = path.parents[3]
+    historical = status.checkpoint_verifications["storage"].candidate_commit
+    assert historical != status.assembled_commit
+    _git(root, "update-ref", "refs/heads/" + status.plan.final_branch, historical)
+    assert not checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs
+    _git(root, "update-ref", "refs/heads/" + status.plan.final_branch, status.assembled_commit)
+    assert checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs == projected.checkpoint_handoffs
+    leaf = checkpoint_evidence_path(
+        delivery_progress_path(root, status.plan.plan_id).parent, status.checkpoint_verifications["storage"]
+    )
+    leaf.write_text("{}")
+    assert not checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs
+    assert due_delivery_checkpoint(projected, cfg) == "storage"
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_nested_admission_composition_resume_and_finalization(nested_plan, interrupt):
     path, cfg = nested_plan
@@ -293,6 +488,15 @@ def test_nested_admission_composition_resume_and_finalization(nested_plan, inter
 
     result = finalize_delivery_plan(path, project_config=cfg)
     assert result.finalized, result
+    from core import delivery_checkpoints as checkpoints
+    from core.delivery_finalize import _final_verification_issue
+
+    status = get_delivery_status(path)
+    with patch(
+        "core.delivery_checkpoints._checkpoint_local_pass_is_usable", wraps=checkpoints._checkpoint_local_pass_is_usable
+    ) as check:
+        assert _final_verification_issue(root, status, cfg) is None
+        assert [call.args[1].id for call in check.call_args_list] == ["storage", "integration"]
 
 
 @pytest.mark.parametrize("change", ["cycle", "unknown", "outside", "siblings"])

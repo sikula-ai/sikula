@@ -180,9 +180,13 @@ def _read_state(root: Path, plan_id: str, node_id: str = "root") -> dict[str, An
     return state
 
 
-def pending_delivery_repair_node(path: str | Path, *, project_root: Path | None) -> str | None:
-    """Return the durable recovery node, including malformed/terminal control."""
-    status = get_delivery_status(path, project_root=project_root)
+def pending_delivery_repair_node(status: DeliveryStatusResult) -> str | None:
+    """Read fresh repair control for the captured plan, including malformed/terminal state.
+
+    Discovery only uses the plan identity and declared nodes. It neither needs a
+    checkpoint handoff projection nor authorizes recovery; the coordinator still
+    reloads and validates its inputs under the delivery lock.
+    """
     if status.plan is None or status.project_root is None or not getattr(status.plan, "plan_id", None):
         return None
     for node_id in ["root", *(item.id for item in getattr(status.plan, "checkpoints", ()))]:
@@ -195,8 +199,8 @@ def pending_delivery_repair_node(path: str | Path, *, project_root: Path | None)
     return None
 
 
-def delivery_repair_pending(path: str | Path, *, project_root: Path | None) -> bool:
-    return pending_delivery_repair_node(path, project_root=project_root) is not None
+def delivery_repair_pending(status: DeliveryStatusResult) -> bool:
+    return pending_delivery_repair_node(status) is not None
 
 
 def delivery_repair_input_needs_refresh(status: DeliveryStatusResult, cfg: dict[str, Any]) -> bool:
@@ -330,7 +334,7 @@ def coordinate_delivery_repair(
         return DeliveryRepairResult(
             issue=DeliveryPlanIssue("error", "delivery_repair.plan_invalid", "Delivery repair requires a valid plan.")
         )
-    node_id = node_id or pending_delivery_repair_node(path, project_root=project_root) or "root"
+    node_id = node_id or pending_delivery_repair_node(status) or "root"
     root = Path(status.project_root)
     # Preserve the validated identity through preparation, publication, and resume.
     plan_path = Path(status.plan_path)

@@ -202,6 +202,55 @@ def _checkpoint_pass_is_usable(
     *,
     resolver: EvidenceResolver | None = None,
 ) -> bool:
+    record = status.checkpoint_verifications.get(checkpoint.id)
+    if not status.valid or status.plan is None or record is None or not record.passed:
+        return False
+    if any(
+        not checkpoint_pass_is_usable(status, child, cfg, resolver=resolver)
+        for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+    ):
+        return False
+    return _checkpoint_local_pass_is_usable(status, checkpoint, cfg, resolver=resolver)
+
+
+@evidence_operation
+def checkpoint_handoffs(
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any] | None = None,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> frozenset[str]:
+    """Resolve the whole hierarchy once, children first, within a fresh read operation.
+
+    The returned IDs are a projection, not a reusable authority cache. Each new
+    decision must call this function again; evidence integrity is checked on exit.
+    """
+    usable: set[str] = set()
+    if not status.valid or status.plan is None:
+        return frozenset()
+    declarations = getattr(status.plan, "checkpoints", ())
+    for checkpoint in checkpoint_postorder(declarations):
+        if any(child.id not in usable for child in checkpoint_children(declarations, checkpoint.id)):
+            continue
+        try:
+            if _checkpoint_local_pass_is_usable(status, checkpoint, cfg, resolver=resolver):
+                usable.add(checkpoint.id)
+        except EvidenceResolutionLimit:
+            raise
+        except (OSError, RuntimeError, ValueError):
+            # An unusable subtree must not hide independently usable siblings.
+            continue
+    return frozenset(usable)
+
+
+def _checkpoint_local_pass_is_usable(
+    status: DeliveryStatusResult,
+    checkpoint: DeliveryCheckpoint,
+    cfg: dict[str, Any] | None,
+    *,
+    resolver: EvidenceResolver,
+) -> bool:
+    """Validate this node's complete authority; the traversal checks child handoffs."""
     from core.delivery_verification import build_delivery_verification_identity
     from core.delivery_verification_model import delivery_verification_covers_obligations
     from core.delivery_assembly import delivery_branch_commit
@@ -240,20 +289,27 @@ def _checkpoint_pass_is_usable(
         from core.delivery_checkpoint_applicability import validate_node_evidence
 
         validate_node_evidence(node, record, node_id=checkpoint.id, resolver=resolver)
-        if any(
-            not checkpoint_pass_is_usable(status, child, cfg, resolver=resolver)
-            for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+    plan_path, plan_fingerprint = _checkpoint_checkout_plan_fingerprint(status)
+    source = status.plan.source_task
+    if source is None:
+        return False
+    # Plan and source use the same regular-file and newline policy. Read them
+    # together, once per distinct commit, without caching mutable checkout data.
+    for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
+        authority = _checkpoint_file_fingerprints(
+            root, commit, [plan_path, source.path], follow_links=False, normalize_newlines=True
+        )
+        if authority[source.path] != source.sha256:
+            return False
+        if commit == record.candidate_commit and authority[plan_path] != record.plan_content_fingerprint:
+            return False
+        if commit == status.assembled_commit and authority[plan_path] != plan_fingerprint:
+            return False
+        if (
+            checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
+            != record.review_rule_fingerprints
         ):
             return False
-    plan_path = Path(status.plan_path).relative_to(root).as_posix()
-    if (
-        _checkpoint_file_fingerprints(
-            root, record.candidate_commit, [plan_path], follow_links=False, normalize_newlines=True
-        )[plan_path]
-        != record.plan_content_fingerprint
-    ):
-        return False
-    checkpoint_plan_fingerprint(status, status.assembled_commit)
     contract_paths = [
         unit.task_path
         for unit in status.plan.units
@@ -268,17 +324,6 @@ def _checkpoint_pass_is_usable(
         root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
     ):
         return False
-    source = status.plan.source_task
-    if source is None:
-        return False
-    for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
-        if _checkpoint_source_fingerprint(root, commit, source.path) != source.sha256:
-            return False
-        if (
-            checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
-            != record.review_rule_fingerprints
-        ):
-            return False
     identity = build_delivery_verification_identity(node, cfg or {}, candidate_commit=record.candidate_commit)
     keys = ("candidate_tree", "source_fingerprint", "completed_scope_fingerprint", "policy_fingerprint")
     if any(getattr(record, key) != getattr(identity, key) for key in keys):
@@ -310,6 +355,17 @@ def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collecti
 
 def checkpoint_plan_fingerprint(status: DeliveryStatusResult, commit: str) -> str:
     """Bind a candidate plan to captured checkout bytes without changing raw identity."""
+    relative, expected = _checkpoint_checkout_plan_fingerprint(status)
+    actual = _checkpoint_file_fingerprints(
+        Path(status.project_root), commit, [relative], follow_links=False, normalize_newlines=True
+    )[relative]
+    if actual != expected:
+        raise ValueError("Candidate plan differs from captured authority")
+    return expected
+
+
+def _checkpoint_checkout_plan_fingerprint(status: DeliveryStatusResult) -> tuple[str, str]:
+    """Revalidate checkout bytes before comparing them with immutable Git authority."""
     root = Path(status.project_root)
     plan_path = Path(status.plan_path)
     raw = plan_path.read_bytes()
@@ -318,12 +374,7 @@ def checkpoint_plan_fingerprint(status: DeliveryStatusResult, commit: str) -> st
     normalized = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     expected = "sha256:" + sha256(normalized.encode("utf-8")).hexdigest()
     relative = plan_path.relative_to(root).as_posix()
-    actual = _checkpoint_file_fingerprints(root, commit, [relative], follow_links=False, normalize_newlines=True)[
-        relative
-    ]
-    if actual != expected:
-        raise ValueError("Candidate plan differs from captured authority")
-    return expected
+    return relative, expected
 
 
 def _checkpoint_source_fingerprint(root: Path, commit: str, path: str) -> str:
@@ -486,19 +537,36 @@ def _checkpoint_file_fingerprints(
     return result
 
 
-def due_delivery_checkpoint(status: DeliveryStatusResult, cfg: dict[str, Any] | None = None) -> str | None:
+@evidence_operation
+def due_delivery_checkpoint(
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any] | None = None,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> str | None:
+    """Select children before parents, validating each handoff once in this operation.
+
+    Selection is not permission to invoke a reviewer. The selected node still
+    requires fresh preflight. Resolver integrity and resource failures must reach the
+    caller rather than looking like an empty queue or a reviewable checkpoint.
+    """
     if not status.valid or status.plan is None:
         return None
+    usable: set[str] = set()
     for checkpoint in checkpoint_postorder(status.plan.checkpoints):
-        if (
-            verification_scope_complete(verification_node_status(status, checkpoint.id))
-            and all(
-                checkpoint_pass_is_usable(status, child, cfg)
-                for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
-            )
-            and not checkpoint_pass_is_usable(status, checkpoint, cfg)
+        if not verification_scope_complete(verification_node_status(status, checkpoint.id)) or any(
+            child.id not in usable for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
         ):
+            continue
+        try:
+            accepted = _checkpoint_local_pass_is_usable(status, checkpoint, cfg, resolver=resolver)
+        except EvidenceResolutionLimit:
+            raise
+        except (OSError, RuntimeError, ValueError):
+            accepted = False
+        if not accepted:
             return checkpoint.id
+        usable.add(checkpoint.id)
     return None
 
 
@@ -844,9 +912,7 @@ def _with_checkpoint_barriers(
 ) -> DeliveryStatusResult:
     if status.plan is None or not status.plan.checkpoints:
         return status
-    usable = frozenset(
-        item.id for item in status.plan.checkpoints if checkpoint_pass_is_usable(status, item, cfg, resolver=resolver)
-    )
+    usable = checkpoint_handoffs(status, cfg, resolver=resolver)
     from core.delivery_checkpoint_applicability import checkpoint_applicability
 
     applicability = checkpoint_applicability(status, cfg, usable, resolver=resolver)

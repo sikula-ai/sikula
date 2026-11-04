@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -38,6 +39,7 @@ from core.delivery_progress import (
 )
 from core.delivery_verify import DeliveryVerifyResult, verify_delivery_plan
 from core.delivery_verification import with_delivery_verification_readiness
+from core.delivery_verification_model import DeliveryVerificationRecord
 from core.delivery_verification_validation import DeliveryVerificationValidationResult
 from core.state import JsonStateStore, TaskState
 from core.delivery_write_scope import resolve_delivery_write_scope
@@ -125,6 +127,75 @@ def _assessment(disposition: str = "repair_required") -> str:
             "obligation_results": [{"id": "consistent-read", "outcome": "satisfied" if approved else "missing"}],
         }
     )
+
+
+@pytest.mark.parametrize("node_id", ["root", "storage"])
+def test_pending_repair_reads_current_control_without_reloading_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, node_id: str
+) -> None:
+    # Discovery needs identity only, even when checkpoint evidence is unavailable.
+    status = SimpleNamespace(
+        project_root=str(tmp_path),
+        plan=SimpleNamespace(plan_id="cache", checkpoints=[SimpleNamespace(id="storage")]),
+    )
+    monkeypatch.setattr(
+        repair_module, "get_delivery_status", lambda *a, **k: pytest.fail("Discovery must not reload checkpoint status")
+    )
+    assert repair_module.pending_delivery_repair_node(status) is None
+    state_path = repair_module._state_path(tmp_path, "cache", node_id)
+    state = {
+        "schema_version": 1,
+        "plan_id": "cache",
+        "node_id": node_id,
+        "phase": "authoring",
+        "attempts": 1,
+        "verification": DeliveryVerificationRecord(
+            schema_version=1,
+            gate_id="sha256:" + "a" * 64,
+            candidate_commit="b" * 40,
+            candidate_tree="c" * 40,
+            source_fingerprint="sha256:" + "d" * 64,
+            plan_fingerprint="sha256:" + "e" * 64,
+            completed_scope_fingerprint="sha256:" + "f" * 64,
+            config_fingerprint="sha256:" + "1" * 64,
+            policy_fingerprint="sha256:" + "2" * 64,
+            status="failed",
+            attempt=1,
+        ).to_dict(),
+        "config_fingerprint": "captured-config",
+        "unit_id": "integration-repair",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    write_repair_state(tmp_path, state_path, state)
+    assert repair_module._read_state(tmp_path, "cache", node_id)["phase"] == "authoring"
+    assert repair_module.pending_delivery_repair_node(status) == node_id
+    assert repair_module.delivery_repair_pending(status)
+
+    state.update(
+        phase="published",
+        source_plan="",
+        task_markdown="",
+        authored_markdown="",
+        unit={},
+        contracts={},
+        completed_progress={},
+        child_evidence={},
+        obligation_ids=[],
+    )
+    write_repair_state(tmp_path, state_path, state)
+    assert repair_module.pending_delivery_repair_node(status) is None
+    assert not repair_module.delivery_repair_pending(status)
+
+    # A newer terminal or malformed record must still block the same snapshot.
+    state.update(phase="blocked", stop_code="delivery_repair.readonly_mutation")
+    write_repair_state(tmp_path, state_path, state)
+    assert repair_module.pending_delivery_repair_node(status) == node_id
+    state_path.write_bytes(b"{invalid")
+    assert repair_module.pending_delivery_repair_node(status) == node_id
+    if node_id != "root":
+        root_state = repair_module._state_path(tmp_path, "cache")
+        root_state.write_bytes(b"{invalid")
+        assert repair_module.pending_delivery_repair_node(status) == "root"
 
 
 @pytest.fixture

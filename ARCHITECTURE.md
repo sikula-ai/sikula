@@ -1266,7 +1266,10 @@ therefore stops the loop again; the operator can start another explicit
 `delivery run --reset-failed` invocation.
 
 When durable status becomes `done`, the coordinator calls the existing delivery
-finalization engine. An already current finalized plan returns idempotently
+finalization engine. The engine owns finalization preflight and current-result
+checks, including fresh validation under its lock; the coordinator invokes it
+directly after the final gate and projects its result from fresh status.
+An already current finalized plan returns idempotently
 without duplicating its finalization event. Dry-run uses the existing run-next
 and finalize previews and does not mutate state or Git. JSON output is one
 compact aggregate projection rather than accumulated child state; child
@@ -1437,9 +1440,29 @@ contents cannot substitute for this evidence. Checkpoint rule fingerprints do no
 alter the root verification identity.
 Checkpoint authority reads batch regular-file metadata and bounded blob payloads
 from Git, deduplicating identical blobs and repeated commits within a check.
+Plan and source fingerprints share one read per distinct commit under their
+common regular-file and newline-normalization policy; raw contract and reviewer-rule
+fingerprints retain their own policies. Checkout plan bytes are still checked
+against the captured status before comparing candidate content.
 Symlink and missing-path checks retain component-level validation. No authority
 result is cached across checks; candidate refs, checkout contracts and effective
 policy are revalidated on every handoff decision.
+Whole-plan handoff checks in status/readiness and finalization traverse checkpoints
+children first, computing each node's historical handoff once per operation.
+Checkpoint selection uses the same children-first order and checks each visited
+handoff once in a fresh evidence operation, stopping at the first due node.
+Selection integrity or resource failures block both preview and execution before
+provider work; a selected checkpoint still requires fresh preflight.
+Recursive closure bindings and artifact integrity still require validation.
+A failed child prevents
+its ancestors from admitting consumers while independent siblings remain checkable.
+The traversal retains no decisions between operations; evidence integrity is still
+checked before returning, and later status captures, provider calls, publication
+and lock reacquisition cannot reuse its handoff projection as authority.
+Pending-repair discovery uses the caller's captured plan identity and declared
+nodes, reading repair control afresh without constructing another checkpoint
+status projection. Discovery does not authorize repair; recovery still reloads
+and validates its inputs under the delivery lock.
 Authority paths use literal Git pathspecs and blobs are read by object ID. Colons
 inside repository-relative filenames are supported where the host filesystem
 allows them; absolute paths, Windows drive prefixes, backslashes and parent
