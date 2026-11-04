@@ -260,7 +260,7 @@ def preview_delivery_run_next(
     if status.valid and status.plan and status.plan.obligations:
         from core.delivery_repair import delivery_repair_pending
 
-        if delivery_repair_pending(path, project_root=project_root):
+        if delivery_repair_pending(status):
             errors.append(
                 DeliveryPlanIssue(
                     "error",

@@ -6,6 +6,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -199,6 +200,46 @@ def test_checkpoint_pass_releases_consumer_and_survives_downstream_commits(check
     status = get_delivery_status(path)
     assert due_delivery_checkpoint(status, cfg) is None
     assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)
+
+
+@pytest.mark.parametrize("advanced", [False, True])
+def test_checkpoint_authority_reads_batch_plan_and_source_per_commit(checkpoint_plan, advanced: bool) -> None:
+    path, cfg = checkpoint_plan
+    assert _verify_node(path, cfg)[0].succeeded
+    if advanced:
+        _complete(path, "consumer")
+        assert _verify_node(path, cfg, node_id="root")[0].succeeded
+    status = get_delivery_status(path)
+    checkpoint = status.plan.checkpoints[0]
+    record = status.checkpoint_verifications[checkpoint.id]
+    commits = {record.candidate_commit, status.assembled_commit}
+    assert len(commits) == (2 if advanced else 1)
+
+    # Count actual Git work, not helper invocations or machine-dependent timings.
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as git:
+        assert checkpoint_pass_is_usable(status, checkpoint, cfg)
+    tree_reads = [call.args[0] for call in git.call_args_list if "ls-tree" in call.args[0]]
+    blob_reads = [call.args[0] for call in git.call_args_list if "cat-file" in call.args[0]]
+    assert len(tree_reads) == len(blob_reads) == 2 * len(commits)
+    for commit in commits:
+        authority_reads = [command for command in tree_reads if commit in command and "plan.yaml" in command]
+        assert len(authority_reads) == 1
+        assert "source.md" in authority_reads[0]
+
+    # Sharing immutable reads must not hide edits even with the same status object.
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n# changed checkout\n")
+    assert not checkpoint_pass_is_usable(status, checkpoint, cfg)
+    path.write_bytes(original)
+    assert checkpoint_pass_is_usable(status, checkpoint, cfg)
+    assert not checkpoint_pass_is_usable(
+        replace(
+            status,
+            checkpoint_verifications={checkpoint.id: replace(record, plan_content_fingerprint="sha256:" + "0" * 64)},
+        ),
+        checkpoint,
+        cfg,
+    )
 
 
 def test_checkpoint_repairs_only_completed_group_and_passes_repair_to_consumers(checkpoint_plan) -> None:

@@ -474,11 +474,10 @@ def _resolve_final_verification_issue(
     *,
     resolver: EvidenceResolver | None = None,
 ) -> DeliveryPlanIssue | None:
-    from core.delivery_checkpoints import checkpoint_pass_is_usable
+    from core.delivery_checkpoints import checkpoint_handoffs
 
-    if status.plan and any(
-        not checkpoint_pass_is_usable(status, checkpoint, project_config, resolver=resolver)
-        for checkpoint in getattr(status.plan, "checkpoints", ())
+    if status.plan and checkpoint_handoffs(status, project_config, resolver=resolver) != frozenset(
+        checkpoint.id for checkpoint in getattr(status.plan, "checkpoints", ())
     ):
         return DeliveryPlanIssue(
             "error",

@@ -27,6 +27,7 @@ from core.delivery_authoring import (
     public_delivery_preparation_failure,
 )
 from core.delivery_handoff import SUPPORTED_DELIVERY_HANDOFF_SCHEMA_VERSION, load_delivery_dependency_handoffs
+from core.delivery_evidence_resolution import evidence_failure_code, evidence_failure_message
 from core.delivery_plan import (
     DeliveryBudgetExceeded,
     DeliveryPlanIssue,
@@ -2316,8 +2317,25 @@ def _preview_delivery_run(
     max_units = _delivery_run_unit_limit(args, status)
     from core.delivery_checkpoints import checkpoint_preflight_issue, due_delivery_checkpoint, verification_node_status
 
-    checkpoint_id = due_delivery_checkpoint(status, cfg)
-    if checkpoint_id is not None and not delivery_repair_pending(args.plan_file, project_root=project_root):
+    try:
+        checkpoint_id = due_delivery_checkpoint(status, cfg)
+    except (OSError, RuntimeError, ValueError) as exc:
+        issue = DeliveryPlanIssue(
+            "error",
+            evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+            evidence_failure_message(exc, "Checkpoint selection could not validate its evidence."),
+        )
+        return _delivery_run_result(
+            status=status,
+            max_units=max_units,
+            max_elapsed_minutes=getattr(args, "max_elapsed_minutes", None),
+            dry_run=True,
+            ready=False,
+            stop_code=issue.code,
+            errors=[issue],
+            message=issue.message,
+        )
+    if checkpoint_id is not None and not delivery_repair_pending(status):
         node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
         issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
         recovery = _delivery_verification_recovery_stop_code(node)
@@ -2346,7 +2364,7 @@ def _preview_delivery_run(
             if issue
             else "Dry run would verify or recover the due checkpoint before downstream execution.",
         )
-    if delivery_repair_pending(args.plan_file, project_root=project_root) or (
+    if delivery_repair_pending(status) or (
         status.plan
         and getattr(status.plan, "obligations", None)
         and _delivery_verification_recovery_stop_code(status) in REPAIR_REQUIRED_CODES
@@ -2565,8 +2583,28 @@ def _run_delivery_plan(
         )
         if getattr(status.plan, "checkpoints", ()):
             status = with_delivery_verification_readiness(status, cfg)
-        pending_repair = pending_delivery_repair_node(args.plan_file, project_root=project_root)
-        checkpoint_id = due_delivery_checkpoint(status, cfg)
+        pending_repair = pending_delivery_repair_node(status)
+        try:
+            checkpoint_id = due_delivery_checkpoint(status, cfg)
+        except (OSError, RuntimeError, ValueError) as exc:
+            issue = DeliveryPlanIssue(
+                "error",
+                evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+                evidence_failure_message(exc, "Checkpoint selection could not validate its evidence."),
+            )
+            return _delivery_run_result(
+                status=status,
+                max_units=max_units,
+                max_elapsed_minutes=max_elapsed_minutes,
+                started=units_attempted > 0,
+                units_attempted=units_attempted,
+                units_succeeded=units_succeeded,
+                last_unit=last_unit,
+                child_task_id=child_task_id,
+                stop_code=issue.code,
+                errors=[issue],
+                message=issue.message,
+            )
         if checkpoint_id is not None and repair_requested is None and pending_repair is None:
             node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
             checkpoint_issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
@@ -2842,7 +2880,7 @@ def _finalize_delivery_run(
     cfg: dict | None = None,
     context: DeliveryRunNextContext | None = None,
 ):
-    from core.delivery_finalize import finalize_delivery_plan, preview_delivery_finalize
+    from core.delivery_finalize import finalize_delivery_plan
     from core.delivery_progress import get_delivery_status
     from core.delivery_run import DELIVERY_RUN_COMPLETED, DELIVERY_RUN_FINALIZE_FAILED
     from core.delivery_verification import with_delivery_verification_readiness
@@ -2914,30 +2952,6 @@ def _finalize_delivery_run(
                 warnings=list(verification.warnings),
                 message="Delivery units completed, but final verification did not pass.",
             )
-    if not _delivery_run_is_current_finalization(status, cfg):
-        preview = preview_delivery_finalize(
-            args.plan_file,
-            project_root=project_root,
-            project_config=cfg,
-        )
-        if not preview.ready:
-            return _delivery_run_result(
-                status=status,
-                max_units=max_units,
-                max_elapsed_minutes=max_elapsed_minutes,
-                started=units_attempted > 0,
-                units_attempted=units_attempted,
-                units_succeeded=units_succeeded,
-                last_unit=last_unit,
-                child_task_id=child_task_id,
-                stop_code=DELIVERY_RUN_FINALIZE_FAILED,
-                final_branch=preview.final_branch,
-                final_commit=preview.final_commit,
-                errors=preview.errors,
-                warnings=preview.warnings,
-                message="Delivery units completed, but finalization preflight is blocked.",
-            )
-
     final_result = finalize_delivery_plan(
         args.plan_file,
         project_root=project_root,
@@ -3596,7 +3610,7 @@ def _run_next_delivery_unit(
         errors = list(status.errors)
         from core.delivery_repair import delivery_repair_pending
 
-        if delivery_repair_pending(args.plan_file, project_root=project_root):
+        if delivery_repair_pending(status):
             issue = DeliveryPlanIssue(
                 "error",
                 "delivery_repair.pending",
