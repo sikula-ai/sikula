@@ -64,7 +64,7 @@ def test_repair_barrier_propagates_through_completed_consumers(repair_done):
     )
     with (
         patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", return_value=False) as usable,
-        patch("core.delivery_checkpoints.checkpoint_pass_is_usable", new=usable),
+        patch("core.delivery_checkpoints._checkpoint_pass_is_usable", new=usable),
         patch("core.delivery_checkpoint_applicability.checkpoint_applicability", return_value={}),
         patch("core.delivery_repair.candidate_repair_reconciles_checkpoint", return_value=True) as reconciled,
     ):
@@ -408,8 +408,8 @@ def test_checkpoint_initiated_repair_preserves_completed_consumers_and_allows_pr
     assert select_next_delivery_unit(after).id == repaired.unit_id
     # Isolate the leaf barrier: the ancestor must not mask a missing transitive guard.
     with patch(
-        "core.delivery_checkpoints.checkpoint_pass_is_usable",
-        side_effect=lambda _, node, cfg, *, resolver=None: node.id == "integration",
+        "core.delivery_checkpoints._checkpoint_pass_is_usable",
+        side_effect=lambda _, node, cfg, *, resolver=None, resolved=None: node.id == "integration",
     ):
         assert checkpoint_barrier_issue(after, cfg, unit_id="shipping").code == "delivery_checkpoint.required"
     _complete(path, repaired.unit_id)

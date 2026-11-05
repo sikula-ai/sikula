@@ -417,19 +417,35 @@ def test_nested_status_handoffs_visit_once_and_revalidate_mutable_inputs(nested_
     _complete(path, "consumer")
     _compose(path, cfg, "integration")
     status = get_delivery_status(path)
-    with patch(
-        "core.delivery_checkpoints._checkpoint_local_pass_is_usable", wraps=checkpoints._checkpoint_local_pass_is_usable
-    ) as check:
+    with (
+        patch(
+            "core.delivery_checkpoints._checkpoint_local_pass_is_usable",
+            wraps=checkpoints._checkpoint_local_pass_is_usable,
+        ) as check,
+        patch(
+            "core.delivery_checkpoints._read_checkpoint_file_fingerprints",
+            wraps=checkpoints._read_checkpoint_file_fingerprints,
+        ) as read,
+    ):
         projected = checkpoints.with_checkpoint_barriers(status, cfg)
+        authority_reads = [call for call in read.call_args_list if call.kwargs.get("normalize_newlines")]
+        assert len(authority_reads) == len({call.args[1] for call in authority_reads})
+        read.reset_mock()
         assert projected.checkpoint_handoffs == frozenset({"storage", "integration"})
         assert [call.args[1].id for call in check.call_args_list] == ["storage", "integration"]
         check.reset_mock()
         assert due_delivery_checkpoint(projected, cfg) is None
+        assert any(call.kwargs.get("normalize_newlines") for call in read.call_args_list)
         assert [call.args[1].id for call in check.call_args_list] == ["storage", "integration"]
 
     # Neither a prior projection nor an unchanged status object authorizes reuse.
     original = path.read_bytes()
-    path.write_bytes(original + b"\n# changed checkout\n")
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    with EvidenceResolver() as resolver:
+        assert checkpoints.checkpoint_handoffs(projected, cfg, resolver=resolver) == projected.checkpoint_handoffs
+        path.write_bytes(original + b"\n# changed checkout\n")
+        assert not checkpoints.checkpoint_handoffs(projected, cfg, resolver=resolver)
     assert not checkpoints.with_checkpoint_barriers(projected, cfg).checkpoint_handoffs
     assert due_delivery_checkpoint(projected, cfg) == "storage"
     path.write_bytes(original)

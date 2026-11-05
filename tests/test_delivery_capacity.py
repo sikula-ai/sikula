@@ -1,6 +1,7 @@
 """Cheap checks for the opt-in capacity experiment; no external providers."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -78,3 +79,59 @@ def test_operator_interrupt_is_not_treated_as_injected_resume(tmp_path, monkeypa
     report = json.loads((root / ".capacity/report.json").read_text())
     assert not report["completed"] and not report["checks_passed"]
     assert not report["calls"] and not report["operations"]
+
+
+def test_local_repair_fixture_prepares_compact_routes_without_changing_limits(tmp_path: Path) -> None:
+    from core.delivery_plan import check_delivery_plan_file
+    from core.delivery_composition_scope import delivery_composition_scope
+    from core.delivery_review_route import preview_composition_context, review_route
+    from core.delivery_verification_scope import DeliveryVerificationScope
+    from sikula_cli.config import load_config
+    from tests.delivery_capacity import LOCAL_OUTCOMES, SOURCE
+
+    root = tmp_path / "fixture"
+    report = run_case(root, depth=2, fanout=1, scenario="local-repair", prepare_only=True)
+    assert report["checks_passed"] and not report["completed"]
+    assert not report.get("local_repair_lifecycle_verified")
+    cfg = load_config(root / ".sikula/config.yaml")
+    cfg["project"]["root_path"] = str(root)
+    checked = check_delivery_plan_file(root / ".sikula/delivery/capacity/plan.yaml", project_root=root)
+    assert checked.valid, checked.errors
+    assert len(checked.plan.obligations) == 3 * len(LOCAL_OUTCOMES)
+    for node in ("g0.g0", "g0", "root"):
+        scope = DeliveryVerificationScope.from_plan(checked.plan, node)
+        composition = delivery_composition_scope(checked.plan, scope)
+        for role in ("semantic", "security"):
+            route = review_route(scope, cfg, root, SOURCE, role, context=preview_composition_context(composition, role))
+            assert route.ready and route.full_available
+            assert route.composition_available == (node != "g0.g0")
+
+
+def test_local_repair_oracle_rejects_full_parent_review(tmp_path: Path) -> None:
+    fake = CapacityLLM(tmp_path, 2, 1, "local-repair", False)
+    prompt = 'Delivery plan context:\n{"units": [], "verification_node": {"id": "g0"}}'
+    prompt += "\n\nDeterministic validation summary:\n{}"
+    with pytest.raises(AssertionError, match="compact authority"):
+        fake.run_readonly_agent(prompt, tmp_path)
+
+
+def test_local_repair_requires_checkpoint_before_creating_fixture(tmp_path: Path) -> None:
+    root = tmp_path / "fixture"
+    with pytest.raises(ValueError, match="checkpoint level"):
+        run_case(root, depth=0, scenario="local-repair")
+    assert not root.exists()
+
+
+def test_renewal_oracle_uses_top_level_identity_not_nested_child_identity(tmp_path: Path) -> None:
+    from agents.delivery_repair_authority_agent import build_authority_renewal_prompt
+
+    fake = CapacityLLM(tmp_path, 2, 1, "local-repair", False)
+    packet = {
+        "after": {"node_id": "child", "packet_fingerprint": "sha256:" + "a" * 64},
+        "node_id": "root",
+        "packet_fingerprint": "sha256:" + "b" * 64,
+    }
+    prompt = build_authority_renewal_prompt(packet, {}, tmp_path)
+    result = json.loads(fake.run_readonly_agent(prompt, tmp_path))
+    assert result["packet_fingerprint"] == packet["packet_fingerprint"]
+    assert fake.calls[-1]["node"] == "root" and fake.renewals == 1

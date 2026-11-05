@@ -201,16 +201,35 @@ def _checkpoint_pass_is_usable(
     cfg: dict[str, Any] | None = None,
     *,
     resolver: EvidenceResolver | None = None,
+    resolved: dict[str, bool] | None = None,
 ) -> bool:
-    record = status.checkpoint_verifications.get(checkpoint.id)
-    if not status.valid or status.plan is None or record is None or not record.passed:
-        return False
-    if any(
-        not checkpoint_pass_is_usable(status, child, cfg, resolver=resolver)
-        for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
-    ):
-        return False
-    return _checkpoint_local_pass_is_usable(status, checkpoint, cfg, resolver=resolver)
+    """Lazily validate a subtree once within the caller's barrier traversal.
+
+    Only the private traversal shares results; the public entry point always
+    starts fresh. Keep child short-circuit order and do not inspect descendants
+    of an unaccepted parent. No results survive the enclosing read operation.
+    """
+    if resolved is None:
+        resolved = {}
+    if checkpoint.id in resolved:
+        return resolved[checkpoint.id]
+    # Also fail closed on cycles in unparsed callers; parsed plans forbid them.
+    resolved[checkpoint.id] = False
+    try:
+        record = status.checkpoint_verifications.get(checkpoint.id)
+        if not status.valid or status.plan is None or record is None or not record.passed:
+            return False
+        if any(
+            not _checkpoint_pass_is_usable(status, child, cfg, resolver=resolver, resolved=resolved)
+            for child in checkpoint_children(status.plan.checkpoints, checkpoint.id)
+        ):
+            return False
+        resolved[checkpoint.id] = _checkpoint_local_pass_is_usable(status, checkpoint, cfg, resolver=resolver)
+    except EvidenceResolutionLimit:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return resolved[checkpoint.id]
 
 
 @evidence_operation
@@ -297,7 +316,7 @@ def _checkpoint_local_pass_is_usable(
     # together, once per distinct commit, without caching mutable checkout data.
     for commit in dict.fromkeys((record.candidate_commit, status.assembled_commit)):
         authority = _checkpoint_file_fingerprints(
-            root, commit, [plan_path, source.path], follow_links=False, normalize_newlines=True
+            root, commit, [plan_path, source.path], follow_links=False, normalize_newlines=True, resolver=resolver
         )
         if authority[source.path] != source.sha256:
             return False
@@ -382,6 +401,21 @@ def _checkpoint_source_fingerprint(root: Path, commit: str, path: str) -> str:
     return _checkpoint_file_fingerprints(root, commit, [path], follow_links=False, normalize_newlines=True)[path]
 
 
+def _checkpoint_git(
+    root: Path, *args: str, resolver: EvidenceResolver | None = None, input: bytes | None = None
+) -> bytes:
+    if resolver is not None:
+        resolver.git_read_started()
+    result = subprocess.run(
+        ["git", *args], cwd=root, env=delivery_verification_git_env(), input=input, capture_output=True, check=False
+    )
+    if resolver is not None:
+        resolver.git_read_finished(result.stdout, result.stderr)
+    if result.returncode:
+        raise ValueError("Checkpoint authority files are unavailable")
+    return result.stdout
+
+
 def _checkpoint_file_fingerprints(
     root: Path,
     commit: str,
@@ -391,29 +425,12 @@ def _checkpoint_file_fingerprints(
     follow_links: bool = True,
     normalize_contract: bool = False,
     normalize_newlines: bool = False,
+    resolver: EvidenceResolver | None = None,
 ) -> dict[str, str]:
-    """Hash authority files in a commit without consulting checkout contents."""
     from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
 
-    if not paths:
-        return {}
-
-    def fingerprint(content: bytes) -> str:
-        if normalize_contract:
-            return _executed_contract_fingerprint(content.decode("utf-8"))
-        if normalize_newlines:
-            content = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-        return "sha256:" + sha256(content).hexdigest()
-
-    def git(*args: str, input: bytes | None = None) -> bytes:
-        result = subprocess.run(
-            ["git", *args], cwd=root, env=delivery_verification_git_env(), input=input, capture_output=True, check=False
-        )
-        if result.returncode:
-            raise ValueError("Checkpoint authority files are unavailable")
-        return result.stdout
-
-    result = {}
+    if resolver is not None:
+        resolver._check()
     for path in paths:
         if (
             not isinstance(path, str)
@@ -425,7 +442,79 @@ def _checkpoint_file_fingerprints(
         ):
             raise ValueError("Checkpoint authority file path is invalid")
     paths = tuple(dict.fromkeys(paths))
-    prefix = git("rev-parse", "--show-prefix").decode("utf-8").rstrip("\n")
+    options = dict(
+        allow_missing=allow_missing,
+        follow_links=follow_links,
+        normalize_contract=normalize_contract,
+        normalize_newlines=normalize_newlines,
+    )
+    # Symbolic refs and abbreviations are mutable/ambiguous and must never be cached.
+    exact = len(commit) in (40, 64) and all(char in "0123456789abcdef" for char in commit)
+    if resolver is None or not exact or not paths:
+        return _read_checkpoint_file_fingerprints(root, commit, paths, resolver=resolver, **options)
+    context = _checkpoint_git(root, "rev-parse", "--show-prefix", "--absolute-git-dir", resolver=resolver)
+    lines = context.decode("utf-8").splitlines()
+    if len(lines) != 2 or not Path(lines[1]).is_absolute():
+        # Line breaks in project paths make the combined context ambiguous.
+        # Keep the original uncached reader rather than invent a cache identity.
+        return _read_checkpoint_file_fingerprints(root, commit, paths, resolver=resolver, **options)
+    prefix, git_dir = lines
+    identity = (
+        str(root.absolute()),
+        git_dir,
+        prefix,
+        commit,
+        paths,
+        allow_missing,
+        follow_links,
+        normalize_contract,
+        normalize_newlines,
+        MAX_DELIVERY_VERIFICATION_PACKET_BYTES,
+    )
+    return resolver.git_fingerprints(
+        identity,
+        lambda: _read_checkpoint_file_fingerprints(root, commit, paths, prefix=prefix, resolver=resolver, **options),
+    )
+
+
+def _read_checkpoint_file_fingerprints(
+    root: Path,
+    commit: str,
+    paths: Collection[str],
+    *,
+    allow_missing: bool = False,
+    follow_links: bool = True,
+    normalize_contract: bool = False,
+    normalize_newlines: bool = False,
+    prefix: str | None = None,
+    resolver: EvidenceResolver | None = None,
+) -> dict[str, str]:
+    """Hash authority files in a commit without consulting checkout contents."""
+    from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+
+    if not paths:
+        return {}
+
+    def fingerprint(content: bytes) -> str:
+        if resolver is not None:
+            # Blob slices, decoding/normalization and re-encoding are transient
+            # allocations too; charge conservatively even when Python reuses them.
+            resolver.materialize((content, content))
+        if normalize_contract or normalize_newlines:
+            text = content.decode("utf-8")
+            if resolver is not None:
+                resolver.materialize((text, text, text, text))
+            if normalize_contract:
+                return _executed_contract_fingerprint(text)
+            content = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+        return "sha256:" + sha256(content).hexdigest()
+
+    def git(*args: str, input: bytes | None = None) -> bytes:
+        return _checkpoint_git(root, *args, input=input, resolver=resolver)
+
+    result = {}
+    if prefix is None:
+        prefix = git("rev-parse", "--show-prefix").decode("utf-8").rstrip("\n")
 
     # Read ordinary file metadata together, including sizes before loading blobs.
     # Missing paths and links still take the component-by-component safety path.
@@ -456,7 +545,7 @@ def _checkpoint_file_fingerprints(
                     raise ValueError("Checkpoint authority file exceeds the bounded packet")
                 regular[path] = (oid.decode("ascii"), size_int)
 
-    # Batch and deduplicate blobs without caching authority between checks.
+    # Batch and deduplicate blobs within this immutable read.
     # Each response remains bounded even for many large contracts.
     pending_blobs = list(dict(regular.values()).items())
     hashes: dict[str, str] = {}
@@ -616,8 +705,9 @@ def _checkpoint_barrier_issue(
 ) -> DeliveryPlanIssue | None:
     if not status.valid or status.plan is None:
         return None
+    resolved: dict[str, bool] = {}
     for checkpoint in getattr(status.plan, "checkpoints", ()):
-        if checkpoint_pass_is_usable(status, checkpoint, cfg, resolver=resolver):
+        if _checkpoint_pass_is_usable(status, checkpoint, cfg, resolver=resolver, resolved=resolved):
             continue
         guarded = _checkpoint_runtime_consumers(checkpoint, status.plan.units)
         from core.delivery_repair import candidate_repair_reconciles_checkpoint

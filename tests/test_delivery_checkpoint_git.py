@@ -90,3 +90,152 @@ def test_authority_rejects_invalid_batch_response(candidate, corruption: str) ->
     with patch("core.delivery_checkpoints.subprocess.run", side_effect=run):
         with pytest.raises(ValueError):
             checkpoint_review_rule_fingerprints(root, commit, contents)
+
+
+def test_shared_authority_reads_are_operation_local_and_copy_results(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, commit, contents = candidate
+    expected = checkpoint_review_rule_fingerprints(root, commit, contents)
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as run:
+        with EvidenceResolver() as resolver:
+            first = _checkpoint_file_fingerprints(root, commit, contents, resolver=resolver)
+            first.clear()
+            (root / "one.md").write_bytes(b"checkout does not replace a committed blob")
+            assert _checkpoint_file_fingerprints(root, commit, contents, resolver=resolver) == expected
+            assert resolver.bytes_read > 0
+        assert run.call_count == 4  # Initial context/metadata/blobs, then fresh repository context.
+        with EvidenceResolver() as resolver:
+            assert _checkpoint_file_fingerprints(root, commit, contents, resolver=resolver) == expected
+        assert run.call_count == 7
+    assert not resolver._git_keys and resolver.cache_bytes == 0
+
+
+def test_shared_authority_separates_commits_projects_and_policies(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, commit, _ = candidate
+    with EvidenceResolver() as resolver:
+        raw = read(root, commit, ["space name.md"], resolver=resolver)
+        normalized = read(root, commit, ["space name.md"], normalize_newlines=True, resolver=resolver)
+        contract = read(root, commit, ["space name.md"], normalize_contract=True, resolver=resolver)
+        assert len({raw["space name.md"], normalized["space name.md"], contract["space name.md"]}) == 3
+        assert (
+            read(root.parent, commit, ["app/space name.md"], resolver=resolver)["app/space name.md"]
+            == raw["space name.md"]
+        )
+        with pytest.raises(ValueError):
+            read(root.parent, commit, ["space name.md"], resolver=resolver)
+        assert read(root, commit, ["missing"], allow_missing=True, resolver=resolver) == {"missing": "absent"}
+        with pytest.raises(ValueError):
+            read(root, commit, ["missing"], resolver=resolver)
+        before = read(root, "HEAD", ["one.md"], resolver=resolver)
+        (root / "one.md").write_bytes(b"new candidate")
+        _git(root, "add", ".")
+        _git(root, "commit", "-m", "new candidate")
+        changed = _git(root, "rev-parse", "HEAD")
+        assert read(root, changed, ["one.md"], resolver=resolver) != before
+        assert read(root, "HEAD", ["one.md"], resolver=resolver) != before
+        assert read(root, commit, ["one.md"], resolver=resolver) == before
+
+
+def test_shared_authority_does_not_hide_repository_loss(candidate, tmp_path):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, commit, _ = candidate
+    with EvidenceResolver() as resolver:
+        read(root, commit, ["one.md"], resolver=resolver)
+        # Same project path now belongs to a different repository with no such object.
+        _git(root, "init")
+        with pytest.raises(ValueError):
+            read(root, commit, ["one.md"], resolver=resolver)
+    with EvidenceResolver() as resolver, pytest.raises(ValueError):
+        read(root, commit, ["one.md"], resolver=resolver)
+
+
+@pytest.mark.parametrize("field", ["artifacts", "reads", "bytes_read", "materialized_bytes"])
+def test_shared_authority_limits_are_sticky(candidate, field):
+    from dataclasses import replace
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver, EvidenceResolutionLimit, EvidenceResolutionLimits
+
+    root, commit, _ = candidate
+    resolver = EvidenceResolver(replace(EvidenceResolutionLimits(), **{field: 0}))
+    with pytest.raises(EvidenceResolutionLimit):
+        read(root, commit, ["one.md"], resolver=resolver)
+    with pytest.raises(EvidenceResolutionLimit):
+        read(root, commit, ["one.md"], resolver=resolver)
+
+
+def test_git_and_sidecar_reads_share_lru_and_artifact_allowance(candidate):
+    from dataclasses import replace
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver, EvidenceResolutionLimits, EvidenceResolutionLimit
+    from core.delivery_repair_storage import write_repair_state
+
+    root, commit, _ = candidate
+    state = root / "state.json"
+    write_repair_state(root, state, {"value": "x" * 4000})
+    limits = replace(EvidenceResolutionLimits(), cache_bytes=5000)
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as run:
+        with EvidenceResolver(limits) as resolver:
+            expected = read(root, commit, ["one.md"], resolver=resolver)
+            resolver.read(root, state)
+            assert read(root, commit, ["one.md"], resolver=resolver) == expected
+            assert resolver.cache_bytes <= limits.cache_bytes
+        assert sum("--batch" in c.args[0] for c in run.call_args_list) == 2
+    with pytest.raises(EvidenceResolutionLimit):
+        with EvidenceResolver(replace(limits, artifacts=1)) as resolver:
+            read(root, commit, ["one.md"], resolver=resolver)
+            resolver.read(root, state)
+    with pytest.raises(EvidenceResolutionLimit):
+        with EvidenceResolver(replace(limits, artifacts=1)) as resolver:
+            resolver.read(root, state)
+            read(root, commit, ["one.md"], resolver=resolver)
+
+
+def test_shared_authority_keeps_link_policy_and_packet_limit(candidate, monkeypatch):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, _, _ = candidate
+    try:
+        (root / "alias").symlink_to("one.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks unavailable")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "linked rule")
+    commit = _git(root, "rev-parse", "HEAD")
+    with EvidenceResolver() as resolver:
+        assert read(root, commit, ["alias"], resolver=resolver)["alias"].startswith("sha256:")
+        with pytest.raises(ValueError, match="regular"):
+            read(root, commit, ["alias"], follow_links=False, resolver=resolver)
+        read(root, commit, ["one.md"], resolver=resolver)
+        monkeypatch.setattr("core.delivery_verification.MAX_DELIVERY_VERIFICATION_PACKET_BYTES", 1)
+        with pytest.raises(ValueError, match="exceeds"):
+            read(root, commit, ["one.md"], resolver=resolver)
+
+
+def test_ambiguous_repository_context_uses_uncached_reads(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, commit, _ = candidate
+    original = subprocess.run
+
+    def run(args, **kwargs):
+        result = original(args, **kwargs)
+        if "--absolute-git-dir" in args:
+            result.stdout = b"app/\n/project/with\nnewline/.git\n"
+        return result
+
+    with patch("core.delivery_checkpoints.subprocess.run", side_effect=run) as git:
+        with EvidenceResolver() as resolver:
+            assert read(root, commit, ["one.md"], resolver=resolver) == read(
+                root, commit, ["one.md"], resolver=resolver
+            )
+            assert not resolver._git_keys
+        assert sum("--batch" in call.args[0] for call in git.call_args_list) == 2
