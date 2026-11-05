@@ -1444,15 +1444,25 @@ Plan and source fingerprints share one read per distinct commit under their
 common regular-file and newline-normalization policy; raw contract and reviewer-rule
 fingerprints retain their own policies. Checkout plan bytes are still checked
 against the captured status before comparing candidate content.
-Symlink and missing-path checks retain component-level validation. No authority
-result is cached across checks; candidate refs, checkout contracts and effective
-policy are revalidated on every handoff decision.
+Symlink and missing-path checks retain component-level validation. Within one
+read-only evidence operation, checkpoint handoffs share plan/source fingerprints
+for the same exact commit, project and repository context, paths and interpretation
+policy. Repository context is read again on each request; symbolic refs and
+abbreviated object IDs are not cached. Candidate refs, checkout plan/contracts and
+effective policy are revalidated on every handoff decision. Neither handoff
+verdicts nor Git fingerprints survive the operation.
 Whole-plan handoff checks in status/readiness and finalization traverse checkpoints
 children first, computing each node's historical handoff once per operation.
 Checkpoint selection uses the same children-first order and checks each visited
 handoff once in a fresh evidence operation, stopping at the first due node.
 Selection integrity or resource failures block both preview and execution before
 provider work; a selected checkpoint still requires fresh preflight.
+Consumer barrier checks retain declaration order and stop at the first blocker.
+Their lazy subtree traversal checks each needed handoff at most once, including
+unusable handoffs, within that one read operation. Unaccepted parents and failing
+children retain short-circuit behavior; unrelated later subtrees are not inspected
+before returning an earlier blocker. Global terminal boundaries still preempt the
+traversal, and artifact integrity is checked even on an early return.
 Recursive closure bindings and artifact integrity still require validation.
 A failed child prevents
 its ancestors from admitting consumers while independent siblings remain checkable.
@@ -1860,8 +1870,9 @@ Global plan limits remain unchanged; full review is conditional on packet capaci
 **Shared private evidence resolution:** `core/delivery_evidence_resolution.py`
 provides an explicit read context for one deterministic operation. Recursive
 checkpoint/final-gate closure, composition, candidate-control and full-result
-readers share parsed artifact JSON within that context. Each use still validates
-the expected digest, accepted attempt, node, scope and candidate bindings; the
+readers share parsed artifact JSON within that context. Checkpoint plan/source
+Git fingerprints use the same bounded LRU and resource accounting. Each use still
+validates the expected digest, accepted attempt, node, scope and candidate bindings; the
 cache stores neither approval decisions nor expanded descendant closures.
 Callers receive separate mutable copies. Status projection, barrier checks,
 candidate preflight and finalization use the same readers. Publication closes its
@@ -1872,12 +1883,15 @@ Each resolution operation bounds artifact reads, memory use and evidence-tree
 traversal in addition to the storage layer's per-file limit. Concrete allowances
 are defined by `EvidenceResolutionLimits` in `core/delivery_evidence_resolution.py`.
 Accounting includes integrity rechecks, repeated reads and parsing after cache
-eviction, and expanded authority. Expanded descendant closures are never
+eviction, and expanded authority. Shared Git requests also charge unique request
+identities, actual Git exchanges and output bytes, retained fingerprints and
+caller copies; eviction requires a new Git read. Limits are shared with sidecars,
+not multiplied by adding a second cache. Expanded descendant closures are never
 memoized at each ancestor. These host-resource limits are independent of provider
 budgets; existing source, plan and active-unit limits remain in force.
 
-Cache hits repeat secure filesystem identity checks. Before a read operation
-returns successfully, every used artifact is read again through the private
+Private sidecar cache hits repeat secure filesystem identity checks. Before a read
+operation returns successfully, every used sidecar is read again through the private
 storage boundary and its raw-content hash is checked; timestamps alone cannot
 attest unchanged content across platforms. The integrity read allowance is
 reserved while loading. Resource exhaustion fails closed with

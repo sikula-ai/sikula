@@ -2,6 +2,9 @@
 
 Run with ``python -m tests.delivery_capacity --depths 1 2 3``. Nothing is
 created in the operator checkout; each case uses a fresh temporary repository.
+Use ``--depths 2 --fanout 1 --scenario local-repair`` to require a composed
+final gate, recursive leaf repair and independent authority renewal at every
+affected level. Full parent review cannot satisfy that scenario's assertions.
 """
 
 from __future__ import annotations
@@ -14,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import re
 import subprocess
 import tempfile
 import time
@@ -42,6 +44,24 @@ their consumers. The final root total must equal the number of delivered nodes.
 Preserve already delivered contributions when integrating other groups. Keep all
 data local; do not log private inputs or introduce network access.
 """
+
+# Separate observable facets keep the small local-repair fixture representative
+# of a detailed plan. They make composition useful without patching route sizing,
+# changing production limits, or inflating provider prompts at runtime.
+LOCAL_OUTCOMES = {
+    "total": "The local contribution integrates with child totals.",
+    "constant": "The module contributes exactly one to the aggregate, including when it has no descendants. Integrating a later consumer must not replace this contribution with zero or count it twice.",
+    "interface": "Consumers can import the assigned module and call its total function without supplying arguments. The same public entrypoint remains available after other groups are integrated or repaired.",
+    "leaf": "A module with no child interfaces returns its own contribution directly. It does not rely on a parent being present, a process-wide registry, or an initialization call by a future consumer.",
+    "children": "A parent includes every immediate child's reported total exactly once in its result. No immediate child is omitted merely because another child exposes the same function name or returns the same value.",
+    "delegation": "The parent consumes child totals through their public module interfaces. It does not duplicate descendant implementations or substitute a constant for the contribution computed by a child subtree.",
+    "ownership": "Each delivered contribution belongs to one node in the hierarchy. Ancestors include it through their immediate child totals rather than adding that descendant again as a separate direct contribution.",
+    "preservation": "Integrating a new module preserves previously delivered contributions and child entrypoints. A later write must not silently alter a completed leaf or reset an existing subtree's aggregate behavior.",
+    "completion": "The completed hierarchy exposes an aggregate equal to the count of delivered original nodes. Completing an implementation repair restores the required result without creating an additional logical contribution.",
+    "locality": "Computing a contribution uses the local module hierarchy only. It does not fetch values from external services or require a network connection to import a module or calculate the aggregate.",
+    "privacy": "Private inputs and credentials are not written to logs by the delivered modules. The aggregation interface exposes only the required numerical result while keeping unrelated local information undisclosed.",
+    "dependencies": "Child modules are delivered before consumers use their entrypoints. Each consumer can resolve all of its declared immediate child interfaces from the assembled candidate without inventing a replacement dependency.",
+}
 
 
 def children(node: str, depth: int, fanout: int) -> list[str]:
@@ -144,6 +164,7 @@ class CapacityLLM(FakeLLMClient):
             return self.record("author", node, prompt, '{"kind":"stop_and_follow_up"}')
         refs = [fragment["id"] for fragment in packet["source_fragments"]]
         local_children = [child.rsplit(".", 1)[-1] for child in children(node, self.depth, self.fanout)]
+        outcomes = LOCAL_OUTCOMES if self.scenario == "local-repair" else {"total": LOCAL_OUTCOMES["total"]}
         proposal = {
             "title": "Hierarchical totals",
             "children": [
@@ -170,18 +191,19 @@ class CapacityLLM(FakeLLMClient):
             "constraints": [],
             "obligations": [
                 {
-                    "id": "total",
-                    "summary": "The local contribution integrates with child totals.",
+                    "id": key,
+                    "summary": summary,
                     "source_fragment_ids": refs,
                     "unit_ids": ["work", *local_children],
                     "disposition": "preserved",
                 }
+                for key, summary in outcomes.items()
             ],
             "source_accounting": [
                 {
                     "source_fragment_id": ref,
                     "disposition": "mapped",
-                    "obligation_ids": ["total"],
+                    "obligation_ids": list(outcomes),
                     "constraint_ids": [],
                     "child_ids": local_children,
                     "rationale": "This rule governs every local contribution.",
@@ -197,11 +219,11 @@ class CapacityLLM(FakeLLMClient):
         if len(self.implemented) < len(self.order):
             node = self.order[len(self.implemented)]
             changes = {f"src/{module(node)}.py": implementation(node, self.depth, self.fanout)}
-            if node == "root" and self.scenario == "repair":
+            if node == "root" and self.scenario in {"repair", "local-repair"}:
                 leaf = self.order[0]
                 changes[f"src/{module(leaf)}.py"] = implementation(leaf, self.depth, self.fanout, value=0)
         else:
-            assert self.scenario == "repair" and len(self.implemented) == len(self.order), (
+            assert self.scenario in {"repair", "local-repair"} and len(self.implemented) == len(self.order), (
                 "Unexpected implementation call"
             )
             node = self.order[0]
@@ -216,15 +238,15 @@ class CapacityLLM(FakeLLMClient):
     def run_readonly_agent(self, prompt: str, cwd: Path) -> str:
         if "Independently assess the proposed repair authority" in prompt:
             self.renewals += 1
-            fingerprint = re.search(r'"packet_fingerprint": "(sha256:[a-f0-9]+)"', prompt).group(1)
+            packet = json.loads(next(line for line in prompt.splitlines() if line.startswith('{"after":')))
             return self.record(
                 "authority_renewal",
-                "repair",
+                packet["node_id"],
                 prompt,
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "packet_fingerprint": fingerprint,
+                        "packet_fingerprint": packet["packet_fingerprint"],
                         "disposition": "approved",
                         "summary": "Authority preserved.",
                     }
@@ -269,6 +291,8 @@ class CapacityLLM(FakeLLMClient):
             prompt.split("Delivery plan context:\n", 1)[1].split("\n\nDeterministic validation summary:", 1)[0]
         )
         node = context.get("verification_node", {}).get("id", "root")
+        if self.scenario == "local-repair" and children(node, self.depth, self.fanout):
+            assert context.get("checkpoint_composition", {}).get("compact"), "Parent review must use compact authority"
         if "checkpoint_composition" in context:
             assert len(context["units"]) <= 2, "Parent prompt expanded descendant contracts"
             assert len(context["checkpoint_composition"]["children"]) <= self.fanout
@@ -374,6 +398,31 @@ def working_directory(root: Path):
         os.chdir(previous)
 
 
+def assert_local_repair_lifecycle(root: Path, original_plan: dict, fake: CapacityLLM) -> None:
+    """A finalized fallback is not proof of recursive local recovery."""
+    from core.delivery_repair import _read_state
+
+    leaf = fake.order[0]
+    chain = [".".join(leaf.split(".")[:level]) for level in range(fake.depth, 0, -1)] + ["root"]
+    assert fake.interrupted and fake.gaps == 1
+    assert [call["node"] for call in fake.calls if call["stage"] == "authority_renewal"] == chain
+    assert len([call for call in fake.calls if call["stage"] == "repair_author"]) == 1
+    plan = yaml.safe_load((root / ".sikula/delivery/capacity/plan.yaml").read_text())
+    original_ids = {unit["id"] for unit in original_plan["units"]}
+    assert [unit for unit in plan["units"] if unit["id"] in original_ids] == original_plan["units"]
+    repairs = [unit for unit in plan["units"] if unit["id"] not in original_ids]
+    assert len(repairs) == 1 and repairs[0]["repair_node"] == leaf
+    control = _read_state(root, PLAN_ID, leaf)
+    assert control["phase"] == "published" and control["attempts"] == 1
+    assert control["candidate_recovery"]["node_id"] == "root"
+    assert all(_read_state(root, PLAN_ID, ancestor) is None for ancestor in chain[1:])
+    assert plan["final_gate_authority"]
+    assert all(node in plan["composition_authority"] for node in chain[1:-1])
+    repaired_at = max(index for index, call in enumerate(fake.calls) if call["stage"] == "implementation")
+    fresh_reviews = {(call["node"], call["stage"]) for call in fake.calls[repaired_at + 1 :]}
+    assert {(node, role) for node in chain for role in ("semantic", "security")} <= fresh_reviews
+
+
 def run_case(
     root: Path,
     *,
@@ -383,6 +432,8 @@ def run_case(
     prepare_only: bool = False,
     trace_memory: bool = False,
 ) -> dict:
+    if scenario == "local-repair" and depth < 1:
+        raise ValueError("Local repair requires at least one checkpoint level")
     task = create_fixture(root)
     fake = CapacityLLM(root, depth, fanout, scenario, interrupt=not prepare_only)
     operations = []
@@ -500,9 +551,12 @@ def run_case(
                         text=True,
                     ).stdout
                     assert content == implementation(node, depth, fanout)
-                assert len(fake.implemented) == len(fake.order) + (scenario == "repair")
-                if scenario == "repair":
+                assert len(fake.implemented) == len(fake.order) + (scenario in {"repair", "local-repair"})
+                if scenario in {"repair", "local-repair"}:
                     assert fake.gaps
+                if scenario == "local-repair":
+                    assert_local_repair_lifecycle(root, plan, fake)
+                    report["local_repair_lifecycle_verified"] = True
             elif scenario in {"security", "readonly"}:
                 expected = "delivery_verification." + (
                     "human_review_required" if scenario == "security" else "readonly_mutation"
@@ -539,7 +593,9 @@ def main() -> int:
     parser.add_argument("--depths", nargs="+", type=int, default=[1, 2])
     parser.add_argument("--fanout", type=int, default=2)
     parser.add_argument(
-        "--scenario", choices=["happy", "repair", "security", "readonly", "prerequisite"], default="repair"
+        "--scenario",
+        choices=["happy", "repair", "local-repair", "security", "readonly", "prerequisite"],
+        default="repair",
     )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
@@ -550,6 +606,8 @@ def main() -> int:
     args = parser.parse_args()
     if not all(0 <= depth <= 5 for depth in args.depths) or not 1 <= args.fanout <= 8:
         parser.error("Use depths 0..5 and fanout 1..8")
+    if args.scenario == "local-repair" and min(args.depths) < 1:
+        parser.error("Local repair requires at least one checkpoint level")
     root = Path(tempfile.mkdtemp(prefix="sikula-capacity-")).resolve()
     print(f"Private experiment artifacts: {root}", flush=True)
     reports = []

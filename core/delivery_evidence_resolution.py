@@ -1,8 +1,9 @@
 """Operation-local, bounded reads of private verification evidence.
 
-Only parsed artifacts are shared. Callers still validate the expected digest,
-accepted record, scope and candidate on every use. Never retain this context
-across provider calls, publication, lock reacquisition or a new status snapshot.
+Only parsed artifacts and exact-commit Git fingerprints are shared. Callers still
+validate the expected digest, accepted record, scope and candidate on every use.
+Never retain this context across provider calls, publication, lock reacquisition
+or a new status snapshot.
 """
 
 from __future__ import annotations
@@ -95,7 +96,8 @@ class EvidenceResolver:
         self.visits = self.expanded_items = self._integrity_bytes = 0
         self._identities: dict[tuple[Path, Path], tuple[int, ...]] = {}
         self._digests: dict[tuple[Path, Path], str] = {}
-        self._cache: OrderedDict[tuple[Path, Path], tuple[dict[str, Any], int]] = OrderedDict()
+        self._git_keys: set[tuple] = set()
+        self._cache: OrderedDict[tuple, tuple[dict[str, Any], int]] = OrderedDict()
         self._active: set[tuple[str, ...]] = set()
         self._failed = False
         self._changed = False
@@ -122,6 +124,7 @@ class EvidenceResolver:
             self._cache.clear()
             self._identities.clear()
             self._digests.clear()
+            self._git_keys.clear()
             self.cache_bytes = 0
             self._failed = True
 
@@ -141,7 +144,7 @@ class EvidenceResolver:
             raise EvidenceResolutionLimit("Evidence resolution exceeds its resource budget.")
         setattr(self, field, value)
 
-    def materialize(self, value: Any) -> None:
+    def materialize(self, value: Any) -> int:
         """Charge transient expanded authority as well as raw JSON copies."""
         self._check()
         try:
@@ -150,6 +153,7 @@ class EvidenceResolver:
             self._failed = True
             raise
         self._charge("materialized_bytes", size)
+        return size
 
     def expand(self, count: int) -> None:
         self._charge("expanded_items", count)
@@ -184,7 +188,7 @@ class EvidenceResolver:
         if identity is None:
             return None
         if previous is None:
-            if len(self._identities) >= self.limits.artifacts:
+            if len(self._identities) + len(self._git_keys) >= self.limits.artifacts:
                 self._failed = True
                 raise EvidenceResolutionLimit("Evidence graph exceeds its artifact budget.")
             self._identities[key] = identity
@@ -213,13 +217,7 @@ class EvidenceResolver:
                 self._failed = True
                 raise
             self._charge("materialized_bytes", size)
-            if size <= self.limits.cache_bytes:
-                while self.cache_bytes + size > self.limits.cache_bytes:
-                    _, (_, evicted) = self._cache.popitem(last=False)
-                    self.cache_bytes -= evicted
-                self._cache[key] = (value, size)
-                self.cache_bytes += size
-            else:
+            if not self._retain(key, value, size):
                 return value
         else:
             value, size = cached
@@ -227,3 +225,50 @@ class EvidenceResolver:
         # Each caller gets its own object; validation cannot mutate a cached authority.
         self._charge("materialized_bytes", size)
         return deepcopy(value)
+
+    def _retain(self, key: tuple, value: dict, size: int) -> bool:
+        if size > self.limits.cache_bytes:
+            return False
+        while self.cache_bytes + size > self.limits.cache_bytes:
+            _, (_, evicted) = self._cache.popitem(last=False)
+            self.cache_bytes -= evicted
+        self._cache[key] = (value, size)
+        self.cache_bytes += size
+        return True
+
+    def git_read_started(self) -> None:
+        """Count actual Git exchanges, including repository-context checks on hits."""
+        self._charge("reads", 1)
+
+    def git_read_finished(self, stdout: bytes, stderr: bytes) -> None:
+        self._charge("bytes_read", len(stdout) + len(stderr))
+        self.materialize((stdout, stderr))
+        if self.bytes_read + self._integrity_bytes > self.limits.bytes_read:
+            self._failed = True
+            raise EvidenceResolutionLimit("Evidence integrity reads exceed the resource budget.")
+
+    def git_fingerprints(self, identity: tuple, reader: Callable[[], dict[str, str]]) -> dict[str, str]:
+        """Share successful immutable fingerprints, never handoff validation decisions.
+
+        The caller supplies an exact object ID, fresh repository context and all
+        interpretation policies. Git output and copies share the sidecar budgets.
+        """
+        self._charge("reads", 1)
+        key = ("git-fingerprints", *identity)
+        if key not in self._git_keys:
+            if len(self._identities) + len(self._git_keys) >= self.limits.artifacts:
+                self._failed = True
+                raise EvidenceResolutionLimit("Evidence graph exceeds its artifact budget.")
+            self.materialize(key)
+            self._git_keys.add(key)
+        cached = self._cache.get(key)
+        if cached is None:
+            value = reader()
+            # Include retained key storage in the shared LRU allowance.
+            size = self.materialize((key, value))
+            self._retain(key, value, size)
+        else:
+            value, _ = cached
+            self._cache.move_to_end(key)
+        self.materialize(value)
+        return value.copy()
