@@ -21,6 +21,7 @@ from core.delivery_finalize import assemble_delivery_candidate
 from core.llm_client import LLMConfigurationError, LLMReadOnlyViolation
 from core.delivery_plan import DeliveryPlanIssue
 from core.delivery_progress import (
+    _read_delivery_status,
     DeliveryStatusResult,
     DeliveryProgressEvent,
     DeliveryProgressLockError,
@@ -1152,7 +1153,9 @@ def _update_candidate_record(
         ):
             raise ValueError("Candidate review attempt changed.")
         if not boundary:
-            current = verification_node_status(get_delivery_status(status.plan_path, project_root=root), anchor_id)
+            current = verification_node_status(_read_delivery_status(status.plan_path, project_root=root), anchor_id)
+            if not current.valid:
+                raise ValueError("Candidate review authority unavailable.")
             expected = build_delivery_verification_snapshot(current, cfg, candidate_commit=anchor.candidate_commit)
             if expected.identity.gate_id != anchor.gate_id or not _assembly_ref_matches(
                 root, current, anchor.candidate_commit

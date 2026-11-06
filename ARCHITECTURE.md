@@ -1453,6 +1453,13 @@ effective policy are revalidated on every handoff decision. Neither handoff
 verdicts nor Git fingerprints survive the operation.
 Whole-plan handoff checks in status/readiness and finalization traverse checkpoints
 children first, computing each node's historical handoff once per operation.
+Candidate-review persistence reads fresh plan/progress authority without computing
+the whole-plan status projection. Under its existing lock it still checks the
+captured attempt, candidate identity, assembly ref, required child handoffs and
+retained evidence before ordinary writes. This internal read is not scheduling
+readiness: public status, consumer selection and execution retain their checkpoint
+barrier projections and preflight. Terminal persistence keeps its independent path
+so unavailable ordinary authority cannot erase a detected boundary.
 Checkpoint selection uses the same children-first order and checks each visited
 handoff once in a fresh evidence operation, stopping at the first due node.
 Selection integrity or resource failures block both preview and execution before
