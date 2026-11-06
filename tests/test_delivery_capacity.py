@@ -81,30 +81,31 @@ def test_operator_interrupt_is_not_treated_as_injected_resume(tmp_path, monkeypa
     assert not report["calls"] and not report["operations"]
 
 
-def test_local_repair_fixture_prepares_compact_routes_without_changing_limits(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fanout", [1, 2])
+def test_local_repair_fixture_prepares_compact_routes_without_changing_limits(tmp_path: Path, fanout: int) -> None:
     from core.delivery_plan import check_delivery_plan_file
     from core.delivery_composition_scope import delivery_composition_scope
     from core.delivery_review_route import preview_composition_context, review_route
     from core.delivery_verification_scope import DeliveryVerificationScope
     from sikula_cli.config import load_config
-    from tests.delivery_capacity import LOCAL_OUTCOMES, SOURCE
+    from tests.delivery_capacity import LOCAL_OUTCOMES, SOURCE, children
 
     root = tmp_path / "fixture"
-    report = run_case(root, depth=2, fanout=1, scenario="local-repair", prepare_only=True)
+    report = run_case(root, depth=2, fanout=fanout, scenario="local-repair", prepare_only=True)
     assert report["checks_passed"] and not report["completed"]
     assert not report.get("local_repair_lifecycle_verified")
     cfg = load_config(root / ".sikula/config.yaml")
     cfg["project"]["root_path"] = str(root)
     checked = check_delivery_plan_file(root / ".sikula/delivery/capacity/plan.yaml", project_root=root)
     assert checked.valid, checked.errors
-    assert len(checked.plan.obligations) == 3 * len(LOCAL_OUTCOMES)
-    for node in ("g0.g0", "g0", "root"):
+    assert len(checked.plan.obligations) == len(nodes(2, fanout)) * len(LOCAL_OUTCOMES)
+    for node in nodes(2, fanout):
         scope = DeliveryVerificationScope.from_plan(checked.plan, node)
         composition = delivery_composition_scope(checked.plan, scope)
         for role in ("semantic", "security"):
             route = review_route(scope, cfg, root, SOURCE, role, context=preview_composition_context(composition, role))
             assert route.ready and route.full_available
-            assert route.composition_available == (node != "g0.g0")
+            assert route.composition_available == bool(children(node, 2, fanout))
 
 
 def test_local_repair_oracle_rejects_full_parent_review(tmp_path: Path) -> None:
@@ -135,3 +136,34 @@ def test_renewal_oracle_uses_top_level_identity_not_nested_child_identity(tmp_pa
     result = json.loads(fake.run_readonly_agent(prompt, tmp_path))
     assert result["packet_fingerprint"] == packet["packet_fingerprint"]
     assert fake.calls[-1]["node"] == "root" and fake.renewals == 1
+
+
+@pytest.mark.parametrize("changed", ["ownership", "checkpoint_authority", "composition_authority", "admission"])
+def test_branching_oracle_rejects_unrelated_checkpoint_rewrites(changed: str) -> None:
+    from copy import deepcopy
+    from tests.delivery_capacity import assert_unaffected_checkpoints
+
+    before = {
+        "checkpoints": [
+            {"id": "g0", "unit_ids": ["affected"]},
+            {"id": "g1", "unit_ids": ["untouched"]},
+        ],
+        "checkpoint_authority": {"g0": "first", "g1": "second"},
+        "composition_authority": {"g0": "first-parent", "g1": "second-parent"},
+    }
+    progress = {"checkpoint_verifications": {"g0": {"attempt": 1}, "g1": {"attempt": 1}}}
+    after, current = deepcopy(before), deepcopy(progress)
+    # A repaired ancestor changes; unrelated historical evidence must not.
+    after["checkpoints"][0]["unit_ids"].append("repair")
+    after["checkpoint_authority"]["g0"] = "renewed"
+    current["checkpoint_verifications"]["g0"]["attempt"] = 2
+    current["verification"] = {"reverification": {"children": {"g1": {"current_candidate": True}}}}
+    assert_unaffected_checkpoints(before, after, progress, current, {"g0", "root"})
+    if changed == "ownership":
+        after["checkpoints"][1]["unit_ids"].append("repair")
+    elif changed == "admission":
+        current["checkpoint_verifications"]["g1"]["attempt"] = 2
+    else:
+        after[changed]["g1"] = "rewritten"
+    with pytest.raises(AssertionError, match="Unrelated"):
+        assert_unaffected_checkpoints(before, after, progress, current, {"g0", "root"})

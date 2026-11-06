@@ -939,6 +939,22 @@ def get_delivery_status(
     *,
     project_root: Path | None = None,
 ) -> DeliveryStatusResult:
+    """Load current delivery state with complete public/scheduling barriers."""
+    return _read_delivery_status(path, project_root=project_root, project_checkpoints=True)
+
+
+def _read_delivery_status(
+    path: str | Path,
+    *,
+    project_root: Path | None = None,
+    project_checkpoints: bool = False,
+) -> DeliveryStatusResult:
+    """Read fresh plan/progress authority, without granting scheduling readiness.
+
+    The unprojected value is only for verification persistence, whose candidate,
+    attempt and child-evidence checks are explicit. Public output, scheduling and
+    execution must use get_delivery_status instead.
+    """
     check_result = check_delivery_plan_file(path, project_root=project_root)
     errors = list(check_result.errors)
     warnings = list(check_result.warnings)
@@ -1084,7 +1100,7 @@ def get_delivery_status(
         plan_bytes=check_result.plan_bytes,
     )
 
-    if plan.checkpoints:
+    if plan.checkpoints and project_checkpoints:
         from core.delivery_checkpoints import with_checkpoint_barriers
 
         return with_checkpoint_barriers(result)

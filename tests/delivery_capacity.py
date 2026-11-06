@@ -5,6 +5,8 @@ created in the operator checkout; each case uses a fresh temporary repository.
 Use ``--depths 2 --fanout 1 --scenario local-repair`` to require a composed
 final gate, recursive leaf repair and independent authority renewal at every
 affected level. Full parent review cannot satisfy that scenario's assertions.
+Use ``--fanout 2`` for branching recovery, including preservation of unrelated
+checkpoint admission/authority and fresh final applicability of both branches.
 """
 
 from __future__ import annotations
@@ -136,6 +138,7 @@ class CapacityLLM(FakeLLMClient):
         self.interrupted = False
         self.gaps = 0
         self.renewals = 0
+        self.before_repair: dict | None = None
 
     def record(self, stage: str, node: str, prompt: str, output: str = "") -> str:
         self.calls.append(
@@ -253,6 +256,9 @@ class CapacityLLM(FakeLLMClient):
                 ),
             )
         if "Author one small, self-contained delivery repair contract" in prompt:
+            if self.scenario == "local-repair" and self.before_repair is None:
+                progress = self.root / ".sikula/state/delivery/capacity/progress.json"
+                self.before_repair = json.loads(progress.read_text(encoding="utf-8"))
             return self.record(
                 "repair_author",
                 self.order[0],
@@ -350,6 +356,9 @@ class CapacityLLM(FakeLLMClient):
         output = self.record(stage, node, prompt, json.dumps(control))
         self.calls[-1]["composed"] = "checkpoint_composition" in context
         self.calls[-1]["direct_units"] = len(context["units"])
+        self.calls[-1]["checkpoint_outcomes"] = {
+            item["id"]: item["outcome"] for item in control.get("checkpoint_results", [])
+        }
         return output
 
 
@@ -418,9 +427,40 @@ def assert_local_repair_lifecycle(root: Path, original_plan: dict, fake: Capacit
     assert all(_read_state(root, PLAN_ID, ancestor) is None for ancestor in chain[1:])
     assert plan["final_gate_authority"]
     assert all(node in plan["composition_authority"] for node in chain[1:-1])
+    assert fake.before_repair is not None
+    progress = json.loads((root / ".sikula/state/delivery/capacity/progress.json").read_text(encoding="utf-8"))
+    assert [unit for unit in progress["units"] if unit["unit_id"] in original_ids] == fake.before_repair["units"]
+    assert_unaffected_checkpoints(original_plan, plan, fake.before_repair, progress, set(chain))
+    for checkpoint in original_plan.get("checkpoints", []):
+        if checkpoint["id"] not in chain:
+            assert _read_state(root, PLAN_ID, checkpoint["id"]) is None
     repaired_at = max(index for index, call in enumerate(fake.calls) if call["stage"] == "implementation")
     fresh_reviews = {(call["node"], call["stage"]) for call in fake.calls[repaired_at + 1 :]}
     assert {(node, role) for node in chain for role in ("semantic", "security")} <= fresh_reviews
+    for role in ("semantic", "security"):
+        final = next(call for call in reversed(fake.calls) if call["node"] == "root" and call["stage"] == role)
+        assert final["checkpoint_outcomes"] == {
+            node: "applicable" for node in children("root", fake.depth, fake.fanout)
+        }
+
+
+def assert_unaffected_checkpoints(
+    before_plan: dict, after_plan: dict, before_progress: dict, after_progress: dict, repaired_chain: set[str]
+) -> None:
+    """Fresh candidate review must not rewrite unrelated historical admission."""
+    after_nodes = {node["id"]: node for node in after_plan.get("checkpoints", [])}
+    for node in before_plan.get("checkpoints", []):
+        key = node["id"]
+        if key in repaired_chain:
+            continue
+        assert after_nodes[key] == node, "Unrelated checkpoint ownership changed"
+        for field in ("checkpoint_authority", "composition_authority"):
+            assert after_plan.get(field, {}).get(key) == before_plan.get(field, {}).get(key), (
+                "Unrelated checkpoint authority changed"
+            )
+        assert after_progress["checkpoint_verifications"][key] == before_progress["checkpoint_verifications"][key], (
+            "Unrelated historical admission changed"
+        )
 
 
 def run_case(
