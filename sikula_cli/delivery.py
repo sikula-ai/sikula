@@ -437,8 +437,8 @@ def cmd_delivery_check(args: argparse.Namespace, cfg: dict) -> None:
 
 
 def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
-    from core.delivery_progress import get_delivery_status, render_delivery_status, with_delivery_llm_usage
-    from core.delivery_verification import with_delivery_verification_readiness
+    from core.delivery_progress import render_delivery_status, with_delivery_llm_usage
+    from core.delivery_verification import get_delivery_verification_status
 
     overrides = parse_agent_llm_overrides(
         getattr(args, "agent_model", None),
@@ -451,8 +451,7 @@ def cmd_delivery_status(args: argparse.Namespace, cfg: dict) -> None:
         effective_cfg = {
             "agents": {name: {"llm": values} for name, values in overrides.items()},
         }
-    result = get_delivery_status(args.plan_file, project_root=configured_project_root)
-    result = with_delivery_verification_readiness(result, effective_cfg)
+    result = get_delivery_verification_status(args.plan_file, effective_cfg, project_root=configured_project_root)
     project_root = Path(result.project_root).resolve() if result.project_root else None
     task_state_dir = _configured_delivery_task_state_dir(effective_cfg, project_root)
     result = with_delivery_llm_usage(result, task_state_dir=task_state_dir)
@@ -2549,7 +2548,7 @@ def _run_delivery_plan(
         checkpoint_pass_is_usable,
         reconcile_checkpoint_assembly,
     )
-    from core.delivery_verification import with_delivery_verification_readiness
+    from core.delivery_verification import get_delivery_verification_status, with_delivery_verification_readiness
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
         DELIVERY_RUN_ELAPSED_LIMIT_REACHED,
@@ -2644,9 +2643,7 @@ def _run_delivery_plan(
                         )
             if checkpoint_issue is not None:
                 return _delivery_run_result(
-                    status=with_delivery_verification_readiness(
-                        get_delivery_status(args.plan_file, project_root=project_root), cfg
-                    ),
+                    status=get_delivery_verification_status(args.plan_file, cfg, project_root=project_root),
                     max_units=max_units,
                     max_elapsed_minutes=max_elapsed_minutes,
                     started=units_attempted > 0,
@@ -2698,9 +2695,7 @@ def _run_delivery_plan(
                     message=issue.message,
                 )
             if getattr(status.plan, "checkpoints", ()):
-                status = with_delivery_verification_readiness(
-                    get_delivery_status(args.plan_file, project_root=project_root), cfg
-                )
+                status = get_delivery_verification_status(args.plan_file, cfg, project_root=project_root)
             if stop_code is not None:
                 return _delivery_run_result(
                     status=status,
@@ -3521,7 +3516,7 @@ def _run_next_delivery_unit(
         preview_delivery_run_next,
     )
     from core.delivery_write_scope import DeliveryWriteScopeError, resolve_delivery_write_scope
-    from core.delivery_verification import with_delivery_verification_readiness
+    from core.delivery_verification import get_delivery_verification_status
 
     from core.delivery_checkpoints import reconcile_checkpoint_assembly
 
@@ -3539,8 +3534,7 @@ def _run_next_delivery_unit(
         )
     reset_failed = bool(getattr(args, "reset_failed", False))
     preflight = preview_delivery_run_next(args.plan_file, project_root=project_root, reset_failed=reset_failed)
-    status = get_delivery_status(args.plan_file, project_root=project_root)
-    status = with_delivery_verification_readiness(status, cfg)
+    status = get_delivery_verification_status(args.plan_file, cfg, project_root=project_root)
     terminal_result = _execution_result_from_terminal_stop(status)
     if terminal_result is not None:
         return terminal_result
@@ -3605,8 +3599,7 @@ def _run_next_delivery_unit(
         )
 
     with lock:
-        status = get_delivery_status(args.plan_file, project_root=project_root)
-        status = with_delivery_verification_readiness(status, cfg)
+        status = get_delivery_verification_status(args.plan_file, cfg, project_root=project_root)
         errors = list(status.errors)
         from core.delivery_repair import delivery_repair_pending
 

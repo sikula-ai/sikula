@@ -2,9 +2,11 @@
 
 Run with ``python -m tests.delivery_capacity --depths 1 2 3``. Nothing is
 created in the operator checkout; each case uses a fresh temporary repository.
-Use ``--depths 2 --fanout 1 --scenario local-repair`` to require a composed
-final gate, recursive leaf repair and independent authority renewal at every
-affected level. Full parent review cannot satisfy that scenario's assertions.
+Use ``--depths 2 --fanout 1 --scenario local-repair`` to check recursive leaf
+repair and independent authority renewal at every affected level.
+A smaller bounded full parent review is permitted only with
+measured routing evidence. Add ``--require-compact-parents`` to require compact
+parent reviews throughout, without changing production routing or limits.
 Use ``--fanout 2`` for branching recovery, including preservation of unrelated
 checkpoint admission/authority and fresh final applicability of both branches.
 """
@@ -127,7 +129,16 @@ class CapacityInterruption(KeyboardInterrupt):
 class CapacityLLM(FakeLLMClient):
     """Deterministic fault oracle, not a claim about LLM semantic quality."""
 
-    def __init__(self, root: Path, depth: int, fanout: int, scenario: str, interrupt: bool):
+    def __init__(
+        self,
+        root: Path,
+        depth: int,
+        fanout: int,
+        scenario: str,
+        interrupt: bool,
+        *,
+        require_compact_parents: bool = False,
+    ):
         super().__init__()
         self.root = root.resolve()
         self.depth, self.fanout, self.scenario = depth, fanout, scenario
@@ -139,6 +150,27 @@ class CapacityLLM(FakeLLMClient):
         self.gaps = 0
         self.renewals = 0
         self.before_repair: dict | None = None
+        self.require_compact_parents = require_compact_parents
+        self.review_routes: dict[str, dict] = {}
+
+    def parent_review_route(self, prompt: str, context: dict) -> dict:
+        """Require a measured complete route for this exact prompt, not a prior candidate."""
+        from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+
+        route = self.review_routes.pop(sha256(prompt.encode()).hexdigest(), None)
+        assert route is not None, "Parent review has no matching runtime route measurement"
+        full, compact = route["full_packet_bytes"], route["composition_packet_bytes"]
+        if "checkpoint_composition" in context:
+            assert context["checkpoint_composition"].get("compact"), "Parent review must use compact authority"
+            assert compact <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES and compact < full, (
+                "Composition must be bounded and smaller than full review"
+            )
+        else:
+            assert not self.require_compact_parents, "Parent review must use compact authority"
+            assert full <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES and full <= compact, (
+                "Full parent review must be bounded and no larger than composition"
+            )
+        return route
 
     def record(self, stage: str, node: str, prompt: str, output: str = "") -> str:
         self.calls.append(
@@ -297,8 +329,12 @@ class CapacityLLM(FakeLLMClient):
             prompt.split("Delivery plan context:\n", 1)[1].split("\n\nDeterministic validation summary:", 1)[0]
         )
         node = context.get("verification_node", {}).get("id", "root")
+        from core.delivery_verification import MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+
+        assert len(prompt.encode()) <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES, "Review prompt exceeded its limit"
+        route = {}
         if self.scenario == "local-repair" and children(node, self.depth, self.fanout):
-            assert context.get("checkpoint_composition", {}).get("compact"), "Parent review must use compact authority"
+            route = self.parent_review_route(prompt, context)
         if "checkpoint_composition" in context:
             assert len(context["units"]) <= 2, "Parent prompt expanded descendant contracts"
             assert len(context["checkpoint_composition"]["children"]) <= self.fanout
@@ -354,12 +390,57 @@ class CapacityLLM(FakeLLMClient):
                     }
                 ]
         output = self.record(stage, node, prompt, json.dumps(control))
+        self.calls[-1].update(route)
         self.calls[-1]["composed"] = "checkpoint_composition" in context
         self.calls[-1]["direct_units"] = len(context["units"])
         self.calls[-1]["checkpoint_outcomes"] = {
             item["id"]: item["outcome"] for item in control.get("checkpoint_results", [])
         }
         return output
+
+
+@contextmanager
+def observe_review_routes(fake: CapacityLLM):
+    """Observe runtime sizing without replacing its decision or adding Git reads."""
+    from core.delivery_review_route import review_route
+    from core.delivery_verify import _composition_packet_fits
+
+    def measured(context, snapshot, reviewer, worktree, source_task, validation, cfg, role):
+        captured = []
+
+        def capture(*args, **kwargs):
+            result = review_route(*args, **kwargs)
+            captured.append(result)
+            return result
+
+        with patch("core.delivery_review_route.review_route", new=capture):
+            result = _composition_packet_fits(context, snapshot, reviewer, worktree, source_task, validation, cfg, role)
+        assert len(captured) == 1, "Expected one complete runtime route measurement"
+        route = captured[0]
+        for selected, packet in (("full", snapshot.scope.plan_context()), ("composition", context)):
+            prompt = reviewer._prompt(
+                cwd=worktree,
+                review_kind=role,
+                source_task=source_task,
+                plan_context=packet,
+                validation_summary=validation.to_review_dict(
+                    reviewer.project_config,
+                    project_root=worktree,
+                    include_final_checks=snapshot.scope.node_id == "root",
+                ),
+                candidate_commit=snapshot.identity.candidate_commit,
+                candidate_tree=snapshot.identity.candidate_tree,
+                known_obligation_ids=set(snapshot.scope.obligation_ids) if role == "semantic" else set(),
+            )
+            fake.review_routes[sha256(prompt.encode()).hexdigest()] = {
+                "review_route": selected,
+                "full_packet_bytes": route.full_bytes,
+                "composition_packet_bytes": route.composition_bytes,
+            }
+        return result
+
+    with patch("core.delivery_verify._composition_packet_fits", new=measured):
+        yield
 
 
 def create_fixture(root: Path) -> Path:
@@ -408,7 +489,7 @@ def working_directory(root: Path):
 
 
 def assert_local_repair_lifecycle(root: Path, original_plan: dict, fake: CapacityLLM) -> None:
-    """A finalized fallback is not proof of recursive local recovery."""
+    """Finalization alone is not proof of recursive local recovery."""
     from core.delivery_repair import _read_state
 
     leaf = fake.order[0]
@@ -439,9 +520,12 @@ def assert_local_repair_lifecycle(root: Path, original_plan: dict, fake: Capacit
     assert {(node, role) for node in chain for role in ("semantic", "security")} <= fresh_reviews
     for role in ("semantic", "security"):
         final = next(call for call in reversed(fake.calls) if call["node"] == "root" and call["stage"] == role)
-        assert final["checkpoint_outcomes"] == {
-            node: "applicable" for node in children("root", fake.depth, fake.fanout)
-        }
+        if final["composed"]:
+            assert final["checkpoint_outcomes"] == {
+                node: "applicable" for node in children("root", fake.depth, fake.fanout)
+            }
+        else:
+            assert not fake.require_compact_parents and final["review_route"] == "full"
 
 
 def assert_unaffected_checkpoints(
@@ -471,11 +555,16 @@ def run_case(
     scenario: str = "repair",
     prepare_only: bool = False,
     trace_memory: bool = False,
+    require_compact_parents: bool = False,
 ) -> dict:
     if scenario == "local-repair" and depth < 1:
         raise ValueError("Local repair requires at least one checkpoint level")
+    if require_compact_parents and scenario != "local-repair":
+        raise ValueError("Compact parent acceptance requires the local-repair scenario")
     task = create_fixture(root)
-    fake = CapacityLLM(root, depth, fanout, scenario, interrupt=not prepare_only)
+    fake = CapacityLLM(
+        root, depth, fanout, scenario, interrupt=not prepare_only, require_compact_parents=require_compact_parents
+    )
     operations = []
     evidence = {"operations": 0, "reads": 0, "bytes_read": 0, "materialized_bytes": 0, "visits": 0, "expanded_items": 0}
     report = {
@@ -485,6 +574,7 @@ def run_case(
         "scenario": scenario,
         "requested_units": len(fake.order),
         "prepare_only": prepare_only,
+        "require_compact_parents": require_compact_parents,
         "python": platform.python_version(),
         "platform": platform.system(),
         "sikula_version": sikula_version(),
@@ -545,6 +635,7 @@ def run_case(
             working_directory(root),
             patch("core.llm_client.create_llm_client", return_value=fake),
             patch.object(EvidenceResolver, "__exit__", measure_exit),
+            observe_review_routes(fake),
         ):
             prepared = invoke("prepare", "prepare", str(task))
             if not prepared.get("prepared") or not prepared.get("ready"):
@@ -595,8 +686,16 @@ def run_case(
                 if scenario in {"repair", "local-repair"}:
                     assert fake.gaps
                 if scenario == "local-repair":
+                    assert all(
+                        sha256((root / unit["task_path"]).read_bytes()).hexdigest()
+                        == artifacts[root / unit["task_path"]]
+                        for unit in plan["units"]
+                    ), "Original unit contract bytes changed"
                     assert_local_repair_lifecycle(root, plan, fake)
                     report["local_repair_lifecycle_verified"] = True
+                    report["compact_parent_lifecycle_verified"] = not any(
+                        call.get("review_route") == "full" for call in fake.calls
+                    )
             elif scenario in {"security", "readonly"}:
                 expected = "delivery_verification." + (
                     "human_review_required" if scenario == "security" else "readonly_mutation"
@@ -625,6 +724,7 @@ def run_case(
             report["python_peak_bytes"] = tracemalloc.get_traced_memory()[1]
             tracemalloc.stop()
         report["composed_reviews"] = sum(call.get("composed", False) for call in fake.calls)
+        report["full_parent_reviews"] = sum(call.get("review_route") == "full" for call in fake.calls)
         (root / ".capacity/report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
@@ -639,6 +739,11 @@ def main() -> int:
     )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
+        "--require-compact-parents",
+        action="store_true",
+        help="Require compact parent reviews in local-repair acceptance",
+    )
+    parser.add_argument(
         "--trace-memory",
         action="store_true",
         help="Measure Python allocations; adds runtime overhead, excludes subprocess memory",
@@ -648,6 +753,8 @@ def main() -> int:
         parser.error("Use depths 0..5 and fanout 1..8")
     if args.scenario == "local-repair" and min(args.depths) < 1:
         parser.error("Local repair requires at least one checkpoint level")
+    if args.require_compact_parents and args.scenario != "local-repair":
+        parser.error("--require-compact-parents requires --scenario local-repair")
     root = Path(tempfile.mkdtemp(prefix="sikula-capacity-")).resolve()
     print(f"Private experiment artifacts: {root}", flush=True)
     reports = []
@@ -659,6 +766,7 @@ def main() -> int:
             scenario=args.scenario,
             prepare_only=args.prepare_only,
             trace_memory=args.trace_memory,
+            require_compact_parents=args.require_compact_parents,
         )
         reports.append(report)
         print(

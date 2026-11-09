@@ -1451,15 +1451,29 @@ policy. Repository context is read again on each request; symbolic refs and
 abbreviated object IDs are not cached. Candidate refs, checkout plan/contracts and
 effective policy are revalidated on every handoff decision. Neither handoff
 verdicts nor Git fingerprints survive the operation.
+Across distinct exact commits, identical bounded batches of regular-file blobs
+can reuse successful content fingerprints in that same LRU. Each new commit/path
+request still checks repository context and file metadata before reuse. Batch
+identity binds object IDs, sizes, project/repository context and interpretation
+policy; only fully validated batch responses are retained. Link resolution keeps
+its component-level checks without this batch reuse. Eviction or a new operation
+requires reading the payload again.
 Whole-plan handoff checks in status/readiness and finalization traverse checkpoints
 children first, computing each node's historical handoff once per operation.
-Candidate-review persistence reads fresh plan/progress authority without computing
-the whole-plan status projection. Under its existing lock it still checks the
-captured attempt, candidate identity, assembly ref, required child handoffs and
-retained evidence before ordinary writes. This internal read is not scheduling
-readiness: public status, consumer selection and execution retain their checkpoint
-barrier projections and preflight. Terminal persistence keeps its independent path
-so unavailable ordinary authority cannot erase a detected boundary.
+Commands that immediately need configured readiness load fresh plan/progress
+authority and project checkpoint barriers directly with the effective policy,
+without a preliminary configuration-free projection. The result retains the
+complete public status and consumer barriers. Assembly reconciliation and later
+reads across mutation or lock boundaries remain separate fresh operations.
+Candidate-review updates and verification-result persistence read fresh plan/progress
+authority without computing the whole-plan status projection. Under their existing
+locks they still check validity, captured attempt, candidate identity and assembly
+ref. Candidate updates validate required child handoffs and retained control;
+successful completion validates accepted checkpoint or final-gate evidence before
+writing the result. This internal read is not scheduling readiness: public status,
+consumer selection and execution retain their checkpoint barrier projections and
+preflight. Security/read-only boundary persistence keeps its independent path so
+unavailable ordinary authority cannot erase a detected boundary.
 Checkpoint selection uses the same children-first order and checks each visited
 handoff once in a fresh evidence operation, stopping at the first due node.
 Selection integrity or resource failures block both preview and execution before

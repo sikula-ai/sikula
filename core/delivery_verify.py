@@ -2057,7 +2057,9 @@ def _persist_terminal_if_current(
             retain_boundary = delivery_verification_is_boundary_stop(terminal)
             if not retain_boundary:
                 try:
-                    status = verification_node_status(get_delivery_status(path, project_root=root), node_id)
+                    status = verification_node_status(_read_delivery_status(path, project_root=root), node_id)
+                    if not status.valid:
+                        return None
                     current_identity = build_delivery_verification_identity(
                         status,
                         project_config,

@@ -108,12 +108,130 @@ def test_local_repair_fixture_prepares_compact_routes_without_changing_limits(tm
             assert route.composition_available == bool(children(node, 2, fanout))
 
 
-def test_local_repair_oracle_rejects_full_parent_review(tmp_path: Path) -> None:
+def test_local_repair_oracle_rejects_unmeasured_parent_review(tmp_path: Path) -> None:
     fake = CapacityLLM(tmp_path, 2, 1, "local-repair", False)
     prompt = 'Delivery plan context:\n{"units": [], "verification_node": {"id": "g0"}}'
     prompt += "\n\nDeterministic validation summary:\n{}"
-    with pytest.raises(AssertionError, match="compact authority"):
+    with pytest.raises(AssertionError, match="matching runtime route"):
         fake.run_readonly_agent(prompt, tmp_path)
+
+
+@pytest.fixture
+def parent_route(tmp_path):
+    """Use real prepared authority and rendering; no production sizing overrides."""
+    from types import SimpleNamespace
+    from core.delivery_composition_scope import delivery_composition_scope
+    from core.delivery_plan import check_delivery_plan_file
+    from core.delivery_verification_scope import DeliveryVerificationScope
+    from core.delivery_verification_validation import DeliveryVerificationValidationResult
+    from sikula_cli.config import load_config
+
+    root = tmp_path / "fixture"
+    assert run_case(root, depth=2, fanout=1, scenario="local-repair", prepare_only=True)["checks_passed"]
+    cfg = load_config(root / ".sikula/config.yaml")
+    cfg["project"]["root_path"] = str(root)
+    plan = check_delivery_plan_file(root / ".sikula/delivery/capacity/plan.yaml").plan
+    scope = DeliveryVerificationScope.from_plan(plan, "g0")
+    snapshot = SimpleNamespace(
+        scope=scope,
+        identity=SimpleNamespace(candidate_commit="a" * 40, candidate_tree="b" * 40),
+    )
+    return (
+        root,
+        cfg,
+        snapshot,
+        delivery_composition_scope(plan, scope),
+        DeliveryVerificationValidationResult(True, False, True),
+    )
+
+
+def _measure_parent_route(parent_route, role, *, crossover=False, oversized=False):
+    from dataclasses import replace
+    from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
+    from core.delivery_review_route import preview_composition_context, review_route
+    from core import delivery_verify
+    from tests.delivery_capacity import observe_review_routes, SOURCE
+
+    root, cfg, snapshot, composition, validation = parent_route
+    fake = CapacityLLM(root, 2, 1, "local-repair", False)
+    reviewer = DeliveryIntegrationReviewAgent(fake, cfg)
+    context = preview_composition_context(composition, role)
+    summary = validation.to_review_dict(cfg, project_root=root, include_final_checks=False)
+    if oversized:
+        full = snapshot.scope.plan_context()
+        full["units"][0]["description"] = "Complete descendant authority.\n" * 20000
+        snapshot.scope = replace(snapshot.scope, _context_json=json.dumps(full))
+    if crossover:
+        child = context["checkpoint_composition"]["children"][0]
+        child["exact_tree"] = False
+        baseline = review_route(snapshot.scope, cfg, root, SOURCE, role, context=context, validation=summary)
+        assert baseline.composition_available
+        # A larger real textual delta can make small full review cheaper.
+        child["delta"] = "x" * (baseline.full_bytes - baseline.composition_bytes + 113)
+    args = context, snapshot, reviewer, root, SOURCE, validation, cfg, role
+    expected = delivery_verify._composition_packet_fits(*args)
+    with observe_review_routes(fake):
+        assert delivery_verify._composition_packet_fits(*args) == expected
+
+    def render(*, compact, commit=None):
+        return reviewer._prompt(
+            cwd=root,
+            review_kind=role,
+            source_task=SOURCE,
+            plan_context=context if compact else snapshot.scope.plan_context(),
+            validation_summary=summary,
+            candidate_commit=commit or snapshot.identity.candidate_commit,
+            candidate_tree=snapshot.identity.candidate_tree,
+            known_obligation_ids=set(snapshot.scope.obligation_ids) if role == "semantic" else set(),
+        )
+
+    return fake, render, expected
+
+
+@pytest.mark.parametrize("role", ["semantic", "security"])
+def test_capacity_oracle_accepts_measured_smaller_full_parent_review(parent_route, role):
+    fake, render, compact_available = _measure_parent_route(parent_route, role, crossover=True)
+    assert not compact_available
+    result = json.loads(fake.run_readonly_agent(render(compact=False), fake.root))
+    assert result["disposition"] == "approved"
+    call = fake.calls[-1]
+    assert call["review_route"] == "full" and not call["composed"]
+    assert call["composition_packet_bytes"] - call["full_packet_bytes"] == 113
+
+
+@pytest.mark.parametrize("role", ["semantic", "security"])
+def test_capacity_strict_oracle_still_rejects_a_smaller_full_parent_review(parent_route, role):
+    fake, render, _ = _measure_parent_route(parent_route, role, crossover=True)
+    fake.require_compact_parents = True
+    with pytest.raises(AssertionError, match="compact authority"):
+        fake.run_readonly_agent(render(compact=False), fake.root)
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+@pytest.mark.parametrize("role", ["semantic", "security"])
+def test_capacity_oracle_rejects_full_expansion_when_composition_is_required(parent_route, role, oversized):
+    fake, render, compact_available = _measure_parent_route(parent_route, role, oversized=oversized)
+    assert compact_available
+    with pytest.raises(AssertionError, match="no larger than composition|prompt exceeded"):
+        fake.run_readonly_agent(render(compact=False), fake.root)
+    result = json.loads(fake.run_readonly_agent(render(compact=True), fake.root))
+    assert result["disposition"] == "approved"
+    assert fake.calls[-1]["review_route"] == "composition"
+
+
+@pytest.mark.parametrize("role", ["semantic", "security"])
+def test_capacity_oracle_cannot_reuse_sizing_for_another_candidate(parent_route, role):
+    fake, render, _ = _measure_parent_route(parent_route, role, crossover=True)
+    with pytest.raises(AssertionError, match="matching runtime route"):
+        fake.run_readonly_agent(render(compact=False, commit="c" * 40), fake.root)
+    assert not fake.calls
+
+
+def test_compact_parent_mode_rejects_other_scenarios_before_creating_fixture(tmp_path):
+    root = tmp_path / "fixture"
+    with pytest.raises(ValueError, match="local-repair"):
+        run_case(root, depth=1, require_compact_parents=True)
+    assert not root.exists()
 
 
 def test_local_repair_requires_checkpoint_before_creating_fixture(tmp_path: Path) -> None:
