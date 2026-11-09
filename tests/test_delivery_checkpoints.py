@@ -220,7 +220,10 @@ def test_checkpoint_authority_reads_batch_plan_and_source_per_commit(checkpoint_
         assert checkpoint_pass_is_usable(status, checkpoint, cfg)
     tree_reads = [call.args[0] for call in git.call_args_list if "ls-tree" in call.args[0]]
     blob_reads = [call.args[0] for call in git.call_args_list if "cat-file" in call.args[0]]
-    assert len(tree_reads) == len(blob_reads) == 2 * len(commits)
+    assert len(tree_reads) == 2 * len(commits)
+    # Unchanged plan/source blobs are shared across commits; raw contract reads
+    # retain their separate policy and still load one batch per commit.
+    assert len(blob_reads) == 1 + len(commits)
     for commit in commits:
         authority_reads = [command for command in tree_reads if commit in command and "plan.yaml" in command]
         assert len(authority_reads) == 1
