@@ -520,6 +520,18 @@ def _conditional_candidate_route_issue(status, cfg, source: str) -> DeliveryPlan
     return None
 
 
+def get_delivery_verification_status(
+    path: str | Path,
+    project_config: dict[str, Any],
+    *,
+    project_root: Path | None = None,
+) -> DeliveryStatusResult:
+    """Read fresh authority and project readiness once with the effective policy."""
+    from core.delivery_progress import _read_delivery_status
+
+    return with_delivery_verification_readiness(_read_delivery_status(path, project_root=project_root), project_config)
+
+
 def with_delivery_verification_readiness(
     status: DeliveryStatusResult,
     project_config: dict[str, Any],

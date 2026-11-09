@@ -5251,13 +5251,13 @@ def test_cmd_delivery_run_next_rejects_unavailable_metadata_plan_path(
 
     from dataclasses import replace
 
-    orig_get_delivery_status = get_delivery_status
+    from core.delivery_progress import _read_delivery_status
 
     def mock_get_status(*args, **kwargs):
-        status = orig_get_delivery_status(*args, **kwargs)
+        status = _read_delivery_status(*args, **kwargs)
         return replace(status, plan_path="/outside/project/root/plan.yaml")
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", mock_get_status)
+    monkeypatch.setattr("core.delivery_progress._read_delivery_status", mock_get_status)
 
     with pytest.raises(SystemExit) as exc:
         cmd_delivery_run_next(

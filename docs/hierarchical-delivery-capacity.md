@@ -11,6 +11,12 @@ Run from a checkout with the development dependencies installed:
 # Complete small deliveries, including a late defect and its repair.
 TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 1 2 --scenario repair
 
+# Recursive local repair with measured bounded routing for both review roles.
+TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 2 3 --scenario local-repair
+
+# Separate strict acceptance: every parent review must use compact authority.
+TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 2 --fanout 1 --scenario local-repair --require-compact-parents
+
 # Cheap preparation-only growth measurements; this does not execute any units.
 TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 1 2 3 4 --prepare-only
 
@@ -44,6 +50,23 @@ its normal repair, authority renewal where applicable, and fresh verification.
 Small scopes may legitimately choose a cheaper full review and final-gate repair;
 reports retain `composed` per review and `authority_renewals` to distinguish paths.
 Do not count a full-review repair as evidence of recursive candidate recovery.
+The `local-repair` scenario additionally requires repair at the affected leaf,
+independent authority renewal at every affected level, fresh semantic and security
+review, unchanged original units/contracts, and unchanged unrelated checkpoint
+authority and admission. Each parent review must match an observed runtime sizing
+decision for its exact prompt. A small full parent review is allowed only when its
+complete protocol fits and is no larger than the measured composition alternative.
+Composition must remain bounded, smaller than full review, and limited to direct work
+and immediate children. This accommodates a changing delta making full review cheaper
+for a small group without allowing an unexpected unmeasured fallback.
+
+`--require-compact-parents` adds a separate acceptance condition to `local-repair`:
+even a legitimate smaller full parent review fails that experiment. It does not force
+the product to choose composition or change prompt sizes. Choose this mode to prove
+a fully compact lifecycle; ordinary bounded local-repair acceptance must not be
+reported as that stronger result. Runtime sizing is observed without changing its
+return value, policy, limits or provider inputs.
+
 The experiment also interrupts the first checkpoint review and resumes it. Final
 replay must make no provider calls or execute units again. Final committed modules are checked against
 the expected implementation, and the fixture's operator index must remain intact.
@@ -64,6 +87,11 @@ Reports distinguish `prepared` from `completed` and include phase timings, stop
 codes, prompt/response bytes by stage/node, implementation counts, evidence reads
 and charged materialization, source/plan/artifact sizes, and optional Python peak
 memory. These are instrumentation measurements, not token or financial estimates.
+In `local-repair`, parent review records include `review_route`, `full_packet_bytes` and
+`composition_packet_bytes`; sizes include protocol correction headroom. Reports
+count `full_parent_reviews` separately and distinguish `local_repair_lifecycle_verified`
+from `compact_parent_lifecycle_verified`. The latter requires a completed verified
+lifecycle with no full parent reviews, rather than preparation alone.
 `checks_passed` separately records whether the experiment's assertions completed;
 a finalized product result alone cannot hide a failed experiment assertion.
 Compare maximum local prompts at equal local work across shapes and early/late

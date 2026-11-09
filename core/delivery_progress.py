@@ -951,9 +951,9 @@ def _read_delivery_status(
 ) -> DeliveryStatusResult:
     """Read fresh plan/progress authority, without granting scheduling readiness.
 
-    The unprojected value is only for verification persistence, whose candidate,
-    attempt and child-evidence checks are explicit. Public output, scheduling and
-    execution must use get_delivery_status instead.
+    Verification persistence performs explicit candidate, attempt and evidence
+    checks on this value. Public output, scheduling and execution must first
+    project barriers through get_delivery_status or get_delivery_verification_status.
     """
     check_result = check_delivery_plan_file(path, project_root=project_root)
     errors = list(check_result.errors)

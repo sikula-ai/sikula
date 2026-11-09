@@ -459,10 +459,9 @@ def _checkpoint_file_fingerprints(
         # Keep the original uncached reader rather than invent a cache identity.
         return _read_checkpoint_file_fingerprints(root, commit, paths, resolver=resolver, **options)
     prefix, git_dir = lines
+    repository_identity = (str(root.absolute()), git_dir, prefix)
     identity = (
-        str(root.absolute()),
-        git_dir,
-        prefix,
+        *repository_identity,
         commit,
         paths,
         allow_missing,
@@ -473,7 +472,9 @@ def _checkpoint_file_fingerprints(
     )
     return resolver.git_fingerprints(
         identity,
-        lambda: _read_checkpoint_file_fingerprints(root, commit, paths, prefix=prefix, resolver=resolver, **options),
+        lambda: _read_checkpoint_file_fingerprints(
+            root, commit, paths, prefix=prefix, blob_context=repository_identity, resolver=resolver, **options
+        ),
     )
 
 
@@ -487,6 +488,7 @@ def _read_checkpoint_file_fingerprints(
     normalize_contract: bool = False,
     normalize_newlines: bool = False,
     prefix: str | None = None,
+    blob_context: tuple[str, ...] | None = None,
     resolver: EvidenceResolver | None = None,
 ) -> dict[str, str]:
     """Hash authority files in a commit without consulting checkout contents."""
@@ -545,19 +547,8 @@ def _read_checkpoint_file_fingerprints(
                     raise ValueError("Checkpoint authority file exceeds the bounded packet")
                 regular[path] = (oid.decode("ascii"), size_int)
 
-    # Batch and deduplicate blobs within this immutable read.
-    # Each response remains bounded even for many large contracts.
-    pending_blobs = list(dict(regular.values()).items())
-    hashes: dict[str, str] = {}
-    while pending_blobs:
-        batch: list[tuple[str, int]] = []
-        payload_size = 0
-        while pending_blobs and (
-            not batch or payload_size + pending_blobs[0][1] <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES
-        ):
-            oid, size = pending_blobs.pop(0)
-            batch.append((oid, size))
-            payload_size += size
+    def read_blobs(batch: list[tuple[str, int]]) -> dict[str, str]:
+        hashes = {}
         response = BytesIO(git("cat-file", "--batch", input="".join(oid + "\n" for oid, _ in batch).encode("ascii")))
         for oid, size in batch:
             if response.readline().split() != [oid.encode("ascii"), b"blob", str(size).encode("ascii")]:
@@ -568,6 +559,36 @@ def _read_checkpoint_file_fingerprints(
             hashes[oid] = fingerprint(content)
         if response.read(1):
             raise ValueError("Checkpoint authority blob response is invalid")
+        return hashes
+
+    # Distinct commits often retain exactly the same authority blobs. Validate
+    # their paths/types/sizes above, then share successful bounded batch hashes
+    # in the existing operation's LRU. Never retain payloads or approval decisions.
+    pending_blobs = sorted(dict(regular.values()).items())
+    hashes: dict[str, str] = {}
+    while pending_blobs:
+        batch: list[tuple[str, int]] = []
+        payload_size = 0
+        while pending_blobs and (
+            not batch or payload_size + pending_blobs[0][1] <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+        ):
+            oid, size = pending_blobs.pop(0)
+            batch.append((oid, size))
+            payload_size += size
+        if resolver is not None and blob_context is not None:
+            identity = (
+                "blob-batch",
+                *blob_context,
+                tuple(batch),
+                allow_missing,
+                follow_links,
+                normalize_contract,
+                normalize_newlines,
+                MAX_DELIVERY_VERIFICATION_PACKET_BYTES,
+            )
+            hashes.update(resolver.git_fingerprints(identity, lambda: read_blobs(batch)))
+        else:
+            hashes.update(read_blobs(batch))
 
     def blob(oid: str) -> bytes:
         if int(git("cat-file", "-s", oid)) > MAX_DELIVERY_VERIFICATION_PACKET_BYTES:
