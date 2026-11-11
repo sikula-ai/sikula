@@ -3388,8 +3388,10 @@ recorded identity, digest and mode, and its after-snapshot must remain an ordina
 untracked regular file. A replacement inode must not belong to another file in
 the pre-attempt file inventory. A separate descriptor-relative walk inventories
 the actual worktree, including clean tracked files, ignored build artifacts and
-private metadata; content-audit exclusions do not exclude identities. The walk
-reads no file contents and never follows links. Tracked descendants of a directory
+private metadata; content-audit exclusions do not exclude identities. Inventory
+is captured after durable attempt-audit writes and immediately before the provider
+call, so those writes cannot release recorded inodes for reuse by new provider files.
+The walk reads no file contents and never follows links. Tracked descendants of a directory
 replaced by a regular file are absent; linked tracked ancestors remain invalid.
 Missing identity evidence blocks the provider attempt. The refreshed provenance
 binds the new identity, digest and mode; failed or scope-violating writes revoke

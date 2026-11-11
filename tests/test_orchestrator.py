@@ -651,6 +651,42 @@ def _delivery_disposition(disposition: str) -> DeliveryDisposition:
 
 class TestDeliveryProductionScopeAudit:
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize("role", ["implementer", "fixer"])
+    def test_quarantine_inventory_follows_durable_attempt_writes(self, tmp_project, monkeypatch, role):
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])
+        state = _scoped_delivery_state(orch, ["src"])
+        inventory = delivery_scope_audit_module.delivery_scope_file_identities
+        captured = {}
+
+        def capture_inventory(root, git_dir):
+            identities = inventory(root, git_dir)
+            captured.clear()
+            for path in (tmp_project / "state").rglob("*.json"):
+                value = path.stat()
+                captured[path] = (value.st_dev, value.st_ino)
+                assert captured[path] in identities
+            assert captured
+            return identities
+
+        def create():
+            # Atomic audit writes after inventory would free recorded inodes.
+            # Linux can recycle them for a new provider file, falsely making
+            # that file look pre-existing. Check ordering without relying on
+            # a particular filesystem's inode allocator.
+            for path, identity in captured.items():
+                value = path.stat()
+                assert (value.st_dev, value.st_ino) == identity
+            (tmp_project / "src/scratch.py").write_text("created by this attempt\n")
+            return ["src/scratch.py"], "Created scratch."
+
+        monkeypatch.setattr(delivery_scope_audit_module, "delivery_scope_file_identities", capture_inventory)
+        client = ObservedWriteClient(tmp_project, [create, create])
+        orch._agents[role] = ProviderCallingAgent(client)
+        for _ in range(2):
+            assert orch._run_agent(role, state).success
+            assert [record["path"] for record in state.delivery_quarantine_candidates] == ["src/scratch.py"]
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     @pytest.mark.parametrize(
         "case",
         [

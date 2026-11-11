@@ -910,11 +910,6 @@ class DeliveryScopeAudit:
                 git_ref_fingerprint=binding.ref_fingerprint,
                 validate_policy_bindings=True,
             )
-            preexisting_file_identities = (
-                delivery_scope_file_identities(policy.root, binding.git_dir)
-                if self._quarantine_session_id is not None
-                else set()
-            )
             self._store.save_text_snapshot(
                 state.task_id,
                 DELIVERY_SCOPE_ATTEMPT_AUDIT_SNAPSHOT,
@@ -926,6 +921,14 @@ class DeliveryScopeAudit:
                 policy=policy,
                 binding=binding,
                 snapshot_name=DELIVERY_SCOPE_ATTEMPT_AUDIT_SNAPSHOT,
+            )
+            # Persist audit evidence before inventorying inodes. Atomic state
+            # writes can free old inodes for reuse by the provider's new files;
+            # recording those old identities would falsely deny provenance.
+            preexisting_file_identities = (
+                delivery_scope_file_identities(policy.root, binding.git_dir)
+                if self._quarantine_session_id is not None
+                else set()
             )
         except (DeliveryScopeSnapshotError, OSError, TypeError, ValueError) as exc:
             self._record_delivery_scope_snapshot_failure(state, name)
