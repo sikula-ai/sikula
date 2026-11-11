@@ -281,6 +281,7 @@ _DELIVERY_QUARANTINE_CONSTRAINT = """\
   {"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"project/relative/file"}
 - The request is accepted only for a verified agent-created ordinary file inside this exact write
   scope. Sikula moves it outside the worktree and retains its contents until explicit cleanup.
+- Do not empty or stub an obsolete file merely to emulate its removal.
 - Request at most one quarantine operation in this response. Do not request it for tracked files,
   directories, links, pre-existing files, or files outside the active write scope.
 """
@@ -996,14 +997,13 @@ class FixerAgent(BaseAgent):
         agent_cwd = Path(file_tool._root)
         test_origin_validation = _is_test_origin_validation_failure(state, sandbox, agent_cwd)
         uses_test_failure_triage = _uses_test_failure_triage(state, sandbox, agent_cwd)
-        quarantine_enabled = bool(
+        quarantine_available = bool(
             callable(self._quarantine_executor)
             and state.delivery_plan_id
             and state.delivery_unit_id
             and state.delivery_write_scope_schema_version is not None
             and state.worktree_path
             and state.worktree_base
-            and not uses_test_failure_triage
         )
         triage_scope = None
         if test_origin_validation:
@@ -1023,6 +1023,7 @@ class FixerAgent(BaseAgent):
             *,
             allowed_write_paths: list[str],
             test_constraint: str,
+            quarantine_enabled: bool,
             previous_triage: str | None = None,
             scope_recovery: str | None = None,
         ) -> str:
@@ -1071,7 +1072,14 @@ class FixerAgent(BaseAgent):
             previous_triage: str | None = None,
             scope_recovery: str | None = None,
         ) -> tuple[AgentResult | None, list[str], str, dict[str, str | None], dict[str, Any], list[str]]:
+            # Test-only passes can still be rejected and restored after the call.
+            # Only a confirmed production pass can use quarantine during triage;
+            # its request remains bound to that pass's provider audit and scope.
+            quarantine_enabled = quarantine_available and (
+                not uses_test_failure_triage or triage_pass == "production_confirmed"
+            )
             prompt = _prompt(
+                quarantine_enabled=quarantine_enabled,
                 allowed_write_paths=allowed_write_paths,
                 test_constraint=test_constraint,
                 previous_triage=previous_triage,

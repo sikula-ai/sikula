@@ -879,6 +879,7 @@ def test_finalize_delivery_run_delegates_preflight_and_current_checks_to_finaliz
 
 def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
     monkeypatch: pytest.MonkeyPatch,
+    capsys,
 ) -> None:
     status = _status(["done"])
     status.plan.requires_final_verification = True
@@ -886,6 +887,7 @@ def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
     calls: list[str] = []
 
     def verify(args, cfg):
+        assert capsys.readouterr().err == "Final gate: verification started\n"
         calls.append("verify")
         status.verification_status = "passed"
         return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
@@ -922,6 +924,7 @@ def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
         child_task_id=None,
     )
 
+    assert "Final gate: passed (" in capsys.readouterr().err
     assert calls == ["verify"]
     assert result.finalized is True
     assert result.succeeded is True
@@ -1449,3 +1452,67 @@ def test_render_delivery_run_omits_absent_optional_fields_without_project_root()
     assert "Plan status:" not in output
     assert "Progress:" not in output
     assert "[plan.yaml]" in output
+
+
+@pytest.mark.parametrize("node_id", ["root", "storage"])
+@pytest.mark.parametrize("succeeded", [False, True])
+def test_verification_progress_is_visible_before_call_and_preserves_stdout(capsys, monkeypatch, node_id, succeeded):
+    from core.delivery_verify import DeliveryVerifyResult
+    from sikula_cli.delivery import cmd_delivery_verify
+
+    args = _args(json_output=True)
+    args.verification_node = node_id
+    label = "Final gate" if node_id == "root" else "Checkpoint storage"
+    times = iter([10.0, 22.5])
+    monkeypatch.setattr("sikula_cli.delivery.time.perf_counter", lambda: next(times))
+    result = DeliveryVerifyResult(
+        plan_path="plan.yaml",
+        project_root=None,
+        valid=True,
+        ready=True,
+        succeeded=succeeded,
+        status="passed" if succeeded else "blocked",
+        obligation_count=4,
+        obligation_satisfied_count=4 if succeeded else 3,
+        obligation_gap_count=0 if succeeded else 1,
+        stop_code=None if succeeded else "delivery_verification.repair_required",
+    )
+
+    def verify(actual_args, cfg):
+        assert actual_args is args
+        started = capsys.readouterr()
+        assert started.out == ""
+        assert started.err == f"{label}: verification started\n"
+        return result
+
+    context = _context()
+    context = replace(context, verify_plan=verify)
+    if succeeded:
+        cmd_delivery_verify(args, {}, context)
+    else:
+        with pytest.raises(SystemExit) as stopped:
+            cmd_delivery_verify(args, {}, context)
+        assert stopped.value.code == 1
+    output = capsys.readouterr()
+    assert json.loads(output.out) == result.to_dict()
+    outcome = "passed" if succeeded else "did not pass"
+    assert f"{label}: {outcome} (12.5s)" in output.err
+    assert f"{label} obligations: {4 if succeeded else 3}/4 satisfied, {0 if succeeded else 1} gap(s)" in output.err
+    if not succeeded:
+        assert "stop code: delivery_verification.repair_required" in output.err
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, RuntimeError])
+def test_verification_progress_reports_interruption_without_exception_details(capsys, error):
+    from sikula_cli.delivery import _invoke_delivery_verification
+
+    def verify(*_):
+        raise error("private provider details")
+
+    with pytest.raises(error):
+        _invoke_delivery_verification(_args(), {}, verify)
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "private provider details" not in output.err
+    outcome = "interrupted" if error is KeyboardInterrupt else "failed"
+    assert output.err == f"Final gate: verification started\nFinal gate: verification {outcome}\n"

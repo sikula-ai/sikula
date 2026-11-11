@@ -2276,10 +2276,40 @@ def cmd_delivery_verify(
     if context is None or context.verify_plan is None:
         print("delivery verify execution requires the main Sikula command context.")
         sys.exit(2)
-    result = context.verify_plan(args, cfg)
+    result = _invoke_delivery_verification(args, cfg, context.verify_plan)
     _print_delivery_result(result, json_output=args.json, render=render_delivery_verify)
     if not result.succeeded:
         sys.exit(1)
+
+
+def _invoke_delivery_verification(args: argparse.Namespace, cfg: dict, verify_plan: Callable):
+    """Show gate lifecycle on stderr while preserving the stdout result contract."""
+    node_id = getattr(args, "verification_node", "root") or "root"
+    label = "Final gate" if node_id == "root" else f"Checkpoint {project_delivery_public_identity(node_id)}"
+    started = time.perf_counter()
+    print(f"{label}: verification started", file=sys.stderr, flush=True)
+    try:
+        result = verify_plan(args, cfg)
+    except KeyboardInterrupt:
+        print(f"{label}: verification interrupted", file=sys.stderr, flush=True)
+        raise
+    except Exception:
+        print(f"{label}: verification failed", file=sys.stderr, flush=True)
+        raise
+    elapsed = time.perf_counter() - started
+    outcome = "passed" if result.succeeded else "did not pass"
+    stop_code = sanitize_delivery_public_metadata(getattr(result, "stop_code", None))
+    suffix = f"; stop code: {stop_code}" if stop_code else ""
+    print(f"{label}: {outcome} ({elapsed:.1f}s){suffix}", file=sys.stderr, flush=True)
+    count = getattr(result, "obligation_count", 0)
+    if count:
+        print(
+            f"{label} obligations: {result.obligation_satisfied_count}/{count} satisfied, "
+            f"{result.obligation_gap_count} gap(s)",
+            file=sys.stderr,
+            flush=True,
+        )
+    return result
 
 
 def _validate_delivery_run_agent_overrides(args: argparse.Namespace) -> None:
@@ -2624,7 +2654,7 @@ def _run_delivery_plan(
                 else:
                     checkpoint_args = copy.copy(args)
                     checkpoint_args.verification_node = checkpoint_id
-                    verification = context.verify_plan(checkpoint_args, cfg)
+                    verification = _invoke_delivery_verification(checkpoint_args, cfg, context.verify_plan)
                     if verification.succeeded:
                         updated = get_delivery_status(args.plan_file, project_root=project_root)
                         checkpoint = next(item for item in updated.plan.checkpoints if item.id == checkpoint_id)
@@ -2930,7 +2960,7 @@ def _finalize_delivery_run(
                 warnings=status.warnings,
                 message="Delivery units completed, but final verification is unavailable.",
             )
-        verification = context.verify_plan(args, cfg or {})
+        verification = _invoke_delivery_verification(args, cfg or {}, context.verify_plan)
         status = get_delivery_status(args.plan_file, project_root=project_root)
         if not verification.succeeded:
             return _delivery_run_result(

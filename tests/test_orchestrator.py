@@ -651,6 +651,326 @@ def _delivery_disposition(disposition: str) -> DeliveryDisposition:
 
 class TestDeliveryProductionScopeAudit:
     @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "success",
+            "removal_only",
+            "mixed",
+            "retry",
+            "provider_failure",
+            "scope_violation",
+            "stale",
+            "preexisting",
+            "interrupted",
+            "restored",
+        ],
+    )
+    def test_confirmed_triage_quarantine_uses_current_audited_scope(self, tmp_project, monkeypatch, case):
+        scratch_relative = "src/test_scratch.py" if case == "restored" else "src/scratch.py"
+        scratch = tmp_project / scratch_relative
+        replacement = tmp_project / "src" / "replacement.py"
+        original = b"def value(): return 42\n"
+        triage = (
+            "TEST FAILURE TRIAGE:\nclassification: production_defect\n"
+            "contract_affected: architecture boundaries\nchosen_fix: production_code\n"
+        )
+        operation = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/scratch.py"}'
+        ).replace("src/scratch.py", scratch_relative)
+
+        def create():
+            scratch.write_bytes(original)
+            return [scratch_relative], "Created implementation."
+
+        def test_only():
+            assert scratch.exists()
+            if case == "mixed":
+                test = tmp_project / "tests" / "test_architecture.py"
+                test.parent.mkdir(exist_ok=True)
+                test.write_text("assert True\n")
+                test_triage = (
+                    "TEST FAILURE TRIAGE:\nclassification: stale_test\n"
+                    "contract_affected: none\nchosen_fix: test_code\n\n"
+                )
+                return ["tests/test_architecture.py"], test_triage + triage + "\n" + operation
+            # Even an unsolicited request must not run before production confirmation.
+            return [], triage + "\n" + operation
+
+        def bad_test_only():
+            if case == "restored":
+                scratch.write_bytes(b"temporary test change\n")
+                return [scratch_relative], triage + "\n" + operation
+            test = tmp_project / "tests" / "test_architecture.py"
+            test.parent.mkdir(exist_ok=True)
+            test.write_text("assert False\n")
+            return ["tests/test_architecture.py"], triage + "\n" + operation
+
+        def confirmed():
+            assert scratch.exists()
+            assert not state.delivery_quarantine_records
+            if case == "removal_only":
+                return [], operation
+            replacement.write_bytes(original)
+            if case == "provider_failure":
+                raise RuntimeError("provider failed after writing")
+            if case == "scope_violation":
+                (tmp_project / "outside.py").write_bytes(b"outside\n")
+            return ["src/replacement.py"], operation
+
+        actions = (
+            ([] if case == "preexisting" else [create])
+            + ([bad_test_only] if case in {"retry", "restored"} else [])
+            + [test_only, confirmed]
+        )
+        if case == "preexisting":
+            scratch.write_bytes(original)
+        client = ObservedWriteClient(tmp_project, actions)
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {
+                    "allowed_write_paths": ["src"],
+                    "allowed_test_write_paths": ["src"] if case == "restored" else ["tests"],
+                },
+            },
+        )
+        if case == "restored":
+            orch._tools["build"].is_test_only_change = lambda *_: False
+        orch._agents["implementer"] = ProviderCallingAgent(client)
+        orch._agents["fixer"] = FixerAgent(
+            client, orch._tools, orch._agent_project_config, quarantine_executor=orch._execute_fixer_quarantine
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = state.worktree_base = str(tmp_project)
+        if case != "preexisting":
+            assert orch._run_agent("implementer", state).success
+            assert len(state.delivery_quarantine_candidates) == 1
+        if case == "stale":
+            scratch.write_bytes(b"external change\n")
+        state.files_changed = [scratch_relative]
+        state.test_errors = ["architecture test failed"]
+        state.review_approved = state.security_approved = state.tests_up_to_date = True
+        if case == "interrupted":
+
+            def interrupt(*_):
+                raise KeyboardInterrupt()
+
+            monkeypatch.setattr(delivery_quarantine_tool_module, "_create_private_directory", interrupt)
+            with pytest.raises(KeyboardInterrupt):
+                orch._run_agent("fixer", state)
+            persisted = orch._store.load(state.task_id)
+            assert persisted.delivery_quarantine_records[-1]["status"] == "moving"
+            provider_calls = client.provider_calls
+            persisted.failed = False
+            orch._store.save(persisted)
+            resumed = orch.run(task_id=state.task_id)
+            assert resumed.failed
+            assert client.provider_calls == provider_calls
+            assert any(event["action"] == "delivery_quarantine_cleanup_required" for event in resumed.history)
+            assert scratch.read_bytes() == original
+            return
+        result = orch._run_agent("fixer", state)
+        assert state.fix_cycle_records[-1]["triage_pass"] == "production_confirmed"
+        assert all("file_quarantined" not in record for record in state.fix_cycle_records[:-1])
+        if case in {"success", "retry", "removal_only", "mixed"}:
+            assert result.success, result
+            assert not scratch.exists()
+            if case == "removal_only":
+                assert not replacement.exists()
+                assert state.files_changed == []
+            else:
+                assert replacement.read_bytes() == original
+                expected = {"src/replacement.py"}
+                if case == "mixed":
+                    assert (tmp_project / "tests/test_architecture.py").read_text() == "assert True\n"
+                    assert "test_only_scope_violation" not in state.fix_cycle_records[0]
+                    expected.add("tests/test_architecture.py")
+                assert set(state.files_changed) == expected
+            assert not state.review_approved and not state.security_approved and not state.tests_up_to_date
+            assert state.delivery_scope_audit_pending is None
+            assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+            assert task_quarantine_summary(tmp_project, state.task_id) == (1, len(original))
+            if case == "retry":
+                assert not (tmp_project / "tests/test_architecture.py").exists()
+                assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+                    "test_only",
+                    "test_only_retry",
+                    "production_confirmed",
+                ]
+        else:
+            assert not result.success
+            assert scratch.exists()
+            assert not state.delivery_quarantine_records
+            assert task_quarantine_summary(tmp_project, state.task_id) == (0, 0)
+            if case == "scope_violation":
+                assert state.delivery_stop_code == "unit_scope_violation"
+            if case == "restored":
+                assert scratch.read_bytes() == original
+                assert state.fix_cycle_records[0]["test_only_scope_violation"]["restored_files"] == [scratch_relative]
+            if case in {"stale", "preexisting", "restored"}:
+                assert result.data["file_operation_error"] == (
+                    "delivery_quarantine.provenance_changed"
+                    if case in {"stale", "restored"}
+                    else "delivery_quarantine.provenance_missing"
+                )
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize("owned", [False, True])
+    @pytest.mark.parametrize("restore_source", [False, True])
+    @pytest.mark.parametrize("source_kind", ["tracked", "ignored_build"])
+    def test_quarantine_rejects_preexisting_inode_moved_to_scratch(
+        self, tmp_project: Path, owned: bool, restore_source: bool, source_kind: str
+    ):
+        tracked = tmp_project / "src" / "main.py"
+        if source_kind == "ignored_build":
+            (tmp_project / ".gitignore").write_text("__pycache__/\n")
+            tracked = tmp_project / "src" / "__pycache__" / "foreign.pyc"
+            tracked.parent.mkdir()
+            tracked.write_bytes(b"preexisting ignored artifact\n")
+        original = tracked.read_bytes()
+        scratch = tmp_project / "src" / "scratch.py"
+
+        def create_scratch():
+            scratch.write_bytes(b"scratch\n")
+            return ["src/scratch.py"], "Created scratch file."
+
+        def move_tracked():
+            tracked.replace(scratch)
+            if restore_source:
+                tracked.write_bytes(original)
+            return ["src/scratch.py", tracked.relative_to(tmp_project).as_posix()], (
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/scratch.py"}'
+            )
+
+        client = ObservedWriteClient(tmp_project, ([create_scratch] if owned else []) + [move_tracked])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={"project": {"build_tool": "python"}, "sandbox": {"allowed_write_paths": ["src"]}},
+        )
+        if source_kind == "ignored_build":
+            orch._tools["build"].ephemeral_build_components.add("__pycache__")
+        orch._agents["implementer"] = ProviderCallingAgent(client)
+        orch._agents["fixer"] = FixerAgent(
+            client, orch._tools, orch._agent_project_config, quarantine_executor=orch._execute_fixer_quarantine
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = state.worktree_base = str(tmp_project)
+        if owned:
+            assert orch._run_agent("implementer", state).success
+            assert len(state.delivery_quarantine_candidates) == 1
+        state.errors = ["Remove the scratch file"]
+        result = orch._run_agent("fixer", state)
+        assert not result.success
+        assert result.data["file_operation_error"] == "delivery_quarantine.provenance_missing"
+        assert state.delivery_quarantine_candidates == []
+        assert state.delivery_quarantine_records == []
+        assert scratch.read_bytes() == original
+        assert task_quarantine_summary(tmp_project, state.task_id) == (0, 0)
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    def test_provider_can_continue_after_replacing_tracked_directory_with_file(self, tmp_project: Path):
+        directory = tmp_project / "src" / "package"
+        directory.mkdir()
+        descendant = directory / "module.py"
+        descendant.write_bytes(b"old module\n")
+        subprocess.run(["git", "add", "src/package"], cwd=tmp_project, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "track package"], cwd=tmp_project, check=True, capture_output=True)
+
+        def replace_directory():
+            descendant.unlink()
+            directory.rmdir()
+            directory.write_bytes(b"replacement\n")
+            return ["src/package", "src/package/module.py"], "Replaced directory."
+
+        def next_attempt():
+            directory.write_bytes(b"updated replacement\n")
+            return ["src/package"], "Updated replacement."
+
+        client = ObservedWriteClient(tmp_project, [replace_directory, next_attempt])
+        orch, _, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])
+        orch._agents["implementer"] = ProviderCallingAgent(client)
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = state.worktree_base = str(tmp_project)
+        assert orch._run_agent("implementer", state).success
+        assert orch._run_agent("implementer", state).success
+        assert client.provider_calls == 2
+        assert directory.read_bytes() == b"updated replacement\n"
+        assert state.delivery_stop_code is None
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize("creator", ["implementer", "fixer"])
+    @pytest.mark.parametrize("rewrite", ["empty", "same_content", "provider_failure", "scope_violation"])
+    def test_quarantine_provenance_across_atomic_provider_rewrites(self, tmp_project: Path, creator: str, rewrite: str):
+        scratch = tmp_project / "src" / "scratch.py"
+
+        def create() -> tuple[list[str], str]:
+            scratch.write_bytes(b"original = True\n")
+            return ["src/scratch.py"], "Created scratch file."
+
+        def replace_file() -> tuple[list[str], str]:
+            original_inode = scratch.stat().st_ino
+            temporary = scratch.with_name("replacement.tmp")
+            temporary.write_bytes(scratch.read_bytes() if rewrite == "same_content" else b"")
+            temporary.replace(scratch)
+            assert scratch.stat().st_ino != original_inode
+            if rewrite == "provider_failure":
+                raise RuntimeError("provider failed after replacement")
+            if rewrite == "scope_violation":
+                (tmp_project / "outside.py").write_bytes(b"outside = True\n")
+            return ["src/scratch.py"], "Replaced scratch file."
+
+        def request_quarantine() -> tuple[list[str], str]:
+            return [], (
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/scratch.py"}'
+            )
+
+        client = ObservedWriteClient(tmp_project, [create, replace_file, request_quarantine])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={
+                "project": {"build_tool": "python"},
+                "sandbox": {"allowed_write_paths": ["src"]},
+            },
+        )
+        orch._agents["implementer"] = ProviderCallingAgent(client)
+        orch._agents["fixer"] = FixerAgent(
+            client, orch._tools, orch._agent_project_config, quarantine_executor=orch._execute_fixer_quarantine
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = str(tmp_project)
+        state.worktree_base = str(tmp_project)
+        state.errors = ["Remove the redundant scratch file"]
+        assert orch._run_agent(creator, state).success
+        original = dict(state.delivery_quarantine_candidates[0])
+
+        state.errors = ["Replace the scratch file"]
+        result = orch._run_agent("fixer", state)
+        if rewrite in {"provider_failure", "scope_violation"}:
+            assert not result.success
+            assert state.delivery_quarantine_candidates == []
+            assert scratch.exists()
+            assert state.delivery_quarantine_records == []
+            return
+
+        assert result.success
+        candidate = state.delivery_quarantine_candidates[0]
+        assert candidate["identity"] != original["identity"]
+        assert candidate["identity"] == [scratch.stat().st_dev, scratch.stat().st_ino]
+        assert (candidate["digest"] == original["digest"]) == (rewrite == "same_content")
+        retained_size = scratch.stat().st_size
+        state.errors = ["Remove the redundant scratch file"]
+        assert orch._run_agent("fixer", state).success
+        assert not scratch.exists()
+        assert state.delivery_quarantine_candidates == []
+        assert state.delivery_quarantine_records[-1]["status"] == "quarantined"
+        assert task_quarantine_summary(tmp_project, state.task_id) == (1, retained_size)
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
     def test_delivery_fixer_quarantines_agent_created_untracked_file(self, tmp_project: Path, monkeypatch):
         scratch = tmp_project / "src" / "Scratch.kt"
 
@@ -1074,6 +1394,118 @@ class TestDeliveryProductionScopeAudit:
         assert scratch.exists()
         assert state.delivery_quarantine_records[-1]["status"] == "aborted"
         assert state.history[-1]["action"] == "file_operation_failed"
+
+    @pytest.mark.skipif(not delivery_quarantine_supported(), reason="reversible quarantine is unavailable")
+    @pytest.mark.parametrize(
+        "failure",
+        ["before_rename", "restored", "persistent", "changed", "unknown", "interrupted_retry", "changed_before_retry"],
+    )
+    def test_delivery_quarantine_retries_only_revalidated_move_failures(
+        self, tmp_project: Path, monkeypatch, failure: str
+    ):
+        scratch = tmp_project / "src" / "scratch.py"
+
+        def create_and_request() -> tuple[list[str], str]:
+            scratch.write_bytes(b"original\n")
+            return ["src/scratch.py"], (
+                '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/scratch.py"}'
+            )
+
+        client = ObservedWriteClient(tmp_project, [create_and_request])
+        orch, _, _ = _make_orchestrator(
+            tmp_project,
+            allowed_write_paths=["src"],
+            project_config={"project": {"build_tool": "python"}, "sandbox": {"allowed_write_paths": ["src"]}},
+        )
+        orch._agents["fixer"] = FixerAgent(
+            client, orch._tools, orch._agent_project_config, quarantine_executor=orch._execute_fixer_quarantine
+        )
+        state = _scoped_delivery_state(orch, ["src"])
+        state.worktree_path = state.worktree_base = str(tmp_project)
+        state.errors = ["Remove the redundant scratch file"]
+        target = (
+            "_inspect_quarantine_entry"
+            if failure == "restored"
+            else "_move_to_quarantine"
+            if failure == "unknown"
+            else "_create_private_directory"
+        )
+        original = getattr(delivery_quarantine_tool_module, target)
+        calls = 0
+
+        def fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2 and failure == "interrupted_retry":
+                raise KeyboardInterrupt
+            if calls == 1 or failure == "persistent":
+                if failure == "changed":
+                    scratch.write_bytes(b"changed\n")
+                if failure == "unknown":
+                    from core.delivery_quarantine import DeliveryQuarantineError
+
+                    raise DeliveryQuarantineError("delivery_quarantine.move_failed", "unknown outcome")
+                raise OSError("temporary storage failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(delivery_quarantine_tool_module, target, fail)
+        if failure == "interrupted_retry":
+            with pytest.raises(KeyboardInterrupt):
+                orch._run_agent("fixer", state)
+            saved = orch._store.load(state.task_id)
+            assert [record["status"] for record in saved.delivery_quarantine_records] == ["aborted", "moving"]
+            assert saved.delivery_quarantine_candidates == []
+            assert scratch.read_bytes() == b"original\n"
+            monkeypatch.setattr(orch, "_loop", lambda _state: pytest.fail("Interrupted move must block the pipeline"))
+            resumed = orch.run(task_id=state.task_id)
+            assert resumed.failed
+            assert resumed.history[-1]["action"] == "delivery_quarantine_cleanup_required"
+            assert calls == 2 and client.provider_calls == 1
+            return
+        if failure == "changed_before_retry":
+            save = orch._store.save
+
+            def change_after_revalidation(current):
+                save(current)
+                if current.history and current.history[-1]["action"] == "file_quarantine_authority_restored":
+                    scratch.write_bytes(b"changed after revalidation\n")
+
+            monkeypatch.setattr(orch._store, "save", change_after_revalidation)
+        result = orch._run_agent("fixer", state)
+        assert client.provider_calls == 1
+        saved = orch._store.load(state.task_id)
+        assert saved.delivery_quarantine_records == state.delivery_quarantine_records
+        assert saved.delivery_quarantine_candidates == state.delivery_quarantine_candidates
+        records = state.delivery_quarantine_records
+        retry_events = [event for event in state.history if event["action"] == "file_quarantine_retry"]
+        if failure == "changed_before_retry":
+            assert not result.success
+            assert result.data["file_operation_error"] == "delivery_quarantine.provenance_changed"
+            assert calls == 1 and len(retry_events) == 1
+            assert [record["status"] for record in records] == ["aborted"]
+            assert scratch.read_bytes() == b"changed after revalidation\n"
+            return
+        if failure in {"changed", "unknown"}:
+            assert not result.success
+            assert calls == 1 and not retry_events
+            assert state.delivery_quarantine_candidates == []
+            assert [record["status"] for record in records] == ["moving" if failure == "unknown" else "aborted"]
+            assert scratch.exists()
+        else:
+            assert calls == 2 and len(retry_events) == 1
+            assert len({record["quarantine_id"] for record in records}) == 2
+            assert records[0]["status"] == "aborted"
+            if failure == "persistent":
+                assert not result.success
+                assert records[1]["status"] == "aborted"
+                assert len(state.delivery_quarantine_candidates) == 1
+                assert scratch.read_bytes() == b"original\n"
+            else:
+                assert result.success, result
+                assert records[1]["status"] == "quarantined"
+                assert state.delivery_quarantine_candidates == []
+                assert not scratch.exists()
+                assert task_quarantine_summary(tmp_project, state.task_id) == (1, len(b"original\n"))
 
     def test_resume_blocks_on_interrupted_quarantine_move(self, tmp_project: Path, monkeypatch) -> None:
         orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src"])
@@ -1558,10 +1990,21 @@ class TestDeliveryProductionScopeAudit:
         assert [record["status"] for record in attempt_audits] == ["passed", "passed"]
         assert [record["metadata"]["provider_attempt"] for record in attempt_audits] == [1, 2]
 
+    @pytest.mark.parametrize(
+        "boundary",
+        [
+            "snapshot",
+            pytest.param(
+                "file_identities",
+                marks=pytest.mark.skipif(not delivery_quarantine_supported(), reason="quarantine unavailable"),
+            ),
+        ],
+    )
     def test_provider_attempt_snapshot_failure_blocks_provider_execution(
         self,
         tmp_project: Path,
         monkeypatch: pytest.MonkeyPatch,
+        boundary: str,
     ):
         (tmp_project / "src" / "allowed").mkdir()
         orch, stubs, _ = _make_orchestrator(tmp_project, allowed_write_paths=["src/allowed"])
@@ -1580,7 +2023,14 @@ class TestDeliveryProductionScopeAudit:
                 raise DeliveryScopeSnapshotError("unavailable")
             return original_snapshot(*args, **kwargs)
 
-        monkeypatch.setattr(delivery_scope_audit_module, "snapshot_delivery_scope_files", fail_attempt_baseline)
+        if boundary == "snapshot":
+            monkeypatch.setattr(delivery_scope_audit_module, "snapshot_delivery_scope_files", fail_attempt_baseline)
+        else:
+
+            def fail_identity_capture(*_args, **_kwargs):
+                raise DeliveryScopeSnapshotError("file identities unavailable")
+
+            monkeypatch.setattr(delivery_scope_audit_module, "delivery_scope_file_identities", fail_identity_capture)
 
         result = orch._run_agent("implementer", state)
 

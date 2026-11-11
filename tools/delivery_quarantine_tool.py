@@ -159,8 +159,28 @@ def quarantine_agent_created_file(
             quarantine_id,
             candidate,
         )
-    except DeliveryQuarantineError:
-        raise
+    except DeliveryQuarantineError as exc:
+        retry_safe = False
+        if exc.code == "delivery_quarantine.move_failed" and exc.move_not_started:
+            # A known-unmoved or restored source can retain its authority only
+            # after fresh checks. Never retry unknown move outcomes or state
+            # persistence failures, and never adopt a changed file or Git state.
+            try:
+                if delivery_scope_git_binding(repository_root) == binding:
+                    _require_ordinary_untracked(repository_root, Path(binding.git_dir), git_path)
+                    retry_safe = (
+                        _inspect_candidate(root, normalized_path) == candidate
+                        and delivery_scope_git_binding(repository_root) == binding
+                    )
+            except (DeliveryQuarantineError, DeliveryScopeSnapshotError, OSError, RuntimeError):
+                pass
+        raise DeliveryQuarantineError(
+            exc.code,
+            str(exc),
+            quarantine_id=exc.quarantine_id,
+            move_not_started=exc.move_not_started,
+            retry_safe=retry_safe,
+        ) from exc
     except (OSError, RuntimeError) as exc:
         raise DeliveryQuarantineError(
             "delivery_quarantine.move_failed",

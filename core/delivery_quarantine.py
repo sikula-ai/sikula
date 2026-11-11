@@ -24,10 +24,14 @@ class DeliveryQuarantineError(RuntimeError):
         *,
         quarantine_id: str | None = None,
         move_not_started: bool = False,
+        retry_safe: bool = False,
     ) -> None:
         self.code = code
         self.quarantine_id = quarantine_id
         self.move_not_started = move_not_started
+        # Only the filesystem tool can attest fresh source and Git checks.
+        # Knowing that a move did not complete is not sufficient on its own.
+        self.retry_safe = retry_safe
         super().__init__(message)
 
 

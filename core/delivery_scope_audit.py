@@ -18,6 +18,7 @@ from core.validation_artifacts import (
     DeliveryScopeGitBinding,
     DeliveryScopeSnapshotError,
     delivery_scope_git_binding,
+    delivery_scope_file_identities,
     deserialize_delivery_scope_snapshot,
     detect_validation_artifacts,
     serialize_delivery_scope_snapshot,
@@ -831,6 +832,7 @@ class DeliveryScopeAudit:
         git_ref_fingerprint: str | None = None,
         provider_attempt: dict[str, object] | None = None,
         provider_succeeded: bool = False,
+        preexisting_file_identities: set[tuple[int, int]] | None = None,
         tool_phase: str | None = None,
     ) -> bool:
         if before is None:
@@ -877,6 +879,7 @@ class DeliveryScopeAudit:
                 policy=policy,
                 provider_attempt=provider_attempt,
                 provider_succeeded=provider_succeeded,
+                preexisting_file_identities=preexisting_file_identities,
                 tool_phase=tool_phase,
             )
         except DeliveryScopeSnapshotError:
@@ -906,6 +909,11 @@ class DeliveryScopeAudit:
                 git_ignore_fingerprint=binding.ignore_fingerprint,
                 git_ref_fingerprint=binding.ref_fingerprint,
                 validate_policy_bindings=True,
+            )
+            preexisting_file_identities = (
+                delivery_scope_file_identities(policy.root, binding.git_dir)
+                if self._quarantine_session_id is not None
+                else set()
             )
             self._store.save_text_snapshot(
                 state.task_id,
@@ -940,6 +948,7 @@ class DeliveryScopeAudit:
                 git_ref_fingerprint=binding.ref_fingerprint,
                 provider_attempt=attempt,
                 provider_succeeded=False,
+                preexisting_file_identities=preexisting_file_identities,
             )
             self._store.save(state)
             self._restore_delivery_scope_outer_pending(state, previous_pending)
@@ -959,6 +968,7 @@ class DeliveryScopeAudit:
                 git_ref_fingerprint=binding.ref_fingerprint,
                 provider_attempt=attempt,
                 provider_succeeded=True,
+                preexisting_file_identities=preexisting_file_identities,
             )
             self._store.save(state)
             self._restore_delivery_scope_outer_pending(state, previous_pending)
@@ -1339,6 +1349,7 @@ class DeliveryScopeAudit:
         resume_recovery: bool = False,
         provider_attempt: dict[str, object] | None = None,
         provider_succeeded: bool = False,
+        preexisting_file_identities: set[tuple[int, int]] | None = None,
         tool_phase: str | None = None,
     ) -> bool:
         project_paths: list[tuple[str, str]] = []
@@ -1380,6 +1391,7 @@ class DeliveryScopeAudit:
                 before=before,
                 after=after,
                 trusted=provider_succeeded and not violation_count,
+                preexisting_file_identities=preexisting_file_identities,
             )
         reconciled_paths: list[str] = []
         if resume_recovery and not violation_count and name == "implementer":
@@ -1473,6 +1485,7 @@ class DeliveryScopeAudit:
         before: dict,
         after: dict,
         trusted: bool,
+        preexisting_file_identities: set[tuple[int, int]] | None = None,
     ) -> list[str]:
         if not self._quarantine_session_id:
             state.delivery_quarantine_candidates = []
@@ -1489,6 +1502,7 @@ class DeliveryScopeAudit:
             for snapshot in before.values()
             if snapshot is not None and snapshot.exists and snapshot.identity is not None
         }
+        preexisting_identities.update(preexisting_file_identities or ())
         created: list[str] = []
         for audit_path, project_path in project_paths:
             before_snapshot = before.get(audit_path)
@@ -1509,13 +1523,31 @@ class DeliveryScopeAudit:
             if not valid_after:
                 owned.pop(project_path, None)
                 continue
-            retained = project_path in owned and bool(
+            provenance = owned.get(project_path, {})
+            # Carry authority across an audited atomic rewrite only when the
+            # attempt started from our exact last observation. A rename of a
+            # different pre-existing file must not acquire this authority.
+            retained = bool(provenance) and bool(
                 before_snapshot is not None
+                and before_snapshot.exists
                 and before_snapshot.status == "untracked"
-                and before_snapshot.identity == after_snapshot.identity
+                and before_snapshot.symlink_target is None
+                and before_snapshot.identity is not None
+                and list(before_snapshot.identity) == provenance.get("identity")
+                and before_snapshot.digest == provenance.get("digest")
+                and before_snapshot.mode == provenance.get("mode")
+                and (
+                    before_snapshot.identity == after_snapshot.identity
+                    or (
+                        preexisting_file_identities is not None
+                        and after_snapshot.identity not in preexisting_identities
+                    )
+                )
             )
             created_now = bool(
-                (before_snapshot is None or before_snapshot.status != "untracked")
+                not provenance
+                and preexisting_file_identities is not None
+                and (before_snapshot is None or before_snapshot.status != "untracked")
                 and after_snapshot.identity not in preexisting_identities
             )
             if not (retained or created_now):

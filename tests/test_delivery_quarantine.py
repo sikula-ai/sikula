@@ -216,6 +216,7 @@ def test_quarantine_checkpoint_failure_keeps_source(tmp_path: Path) -> None:
         )
 
     assert exc_info.value.code == "delivery_quarantine.checkpoint_failed"
+    assert exc_info.value.retry_safe is False
     assert source.exists()
 
 
@@ -244,6 +245,7 @@ def test_quarantine_marks_storage_failure_before_rename(tmp_path: Path, monkeypa
 
     assert exc_info.value.code == "delivery_quarantine.move_failed"
     assert exc_info.value.move_not_started is True
+    assert exc_info.value.retry_safe is True
     assert source.exists()
 
 
@@ -275,5 +277,129 @@ def test_quarantine_marks_successfully_restored_post_rename_failure_not_started(
 
     assert exc_info.value.code == "delivery_quarantine.move_failed"
     assert exc_info.value.move_not_started is True
+    assert exc_info.value.retry_safe is True
     assert source.read_text(encoding="utf-8") == "scratch\n"
     assert task_quarantine_summary(tmp_path, "task-a") == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "contents",
+        "identity",
+        "mode",
+        "missing",
+        "indexed",
+        "git_state",
+        "unreadable",
+        "symlink",
+        "hardlink",
+        "directory",
+    ],
+)
+def test_failed_move_cannot_restore_authority_without_unchanged_evidence(tmp_path: Path, monkeypatch, change: str):
+    _init_repo(tmp_path)
+    source = tmp_path / "scratch.py"
+    source.write_bytes(b"original\n")
+    provenance = _provenance(source, "scratch.py", "session")
+
+    def fail_before_rename(*_args, **_kwargs):
+        if change == "contents":
+            source.write_bytes(b"changed\n")
+        elif change == "identity":
+            replacement = tmp_path / "replacement.py"
+            replacement.write_bytes(source.read_bytes())
+            replacement.replace(source)
+        elif change == "mode":
+            source.chmod(0o600 if provenance["mode"] != 0o600 else 0o644)
+        elif change == "missing":
+            source.unlink()
+        elif change == "symlink":
+            source.unlink()
+            source.symlink_to("tracked.txt")
+        elif change == "hardlink":
+            os.link(source, tmp_path / "alias.py")
+        elif change == "directory":
+            source.unlink()
+            source.mkdir()
+        elif change == "indexed":
+            subprocess.run(["git", "add", "scratch.py"], cwd=tmp_path, check=True, capture_output=True)
+        elif change == "git_state":
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "advance"], cwd=tmp_path, check=True, capture_output=True
+            )
+        else:
+
+            def unavailable(*_args, **_kwargs):
+                raise OSError("source inspection unavailable")
+
+            monkeypatch.setattr(delivery_quarantine_tool_module, "_inspect_candidate", unavailable)
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(delivery_quarantine_tool_module, "_create_private_directory", fail_before_rename)
+    with pytest.raises(DeliveryQuarantineError) as exc_info:
+        quarantine_agent_created_file(
+            tmp_path,
+            "task",
+            "scratch.py",
+            provenance,
+            session_id="session",
+            active_write_paths=["."],
+            exact_file_paths=[],
+            before_move=lambda _intent: None,
+            after_move=lambda _result: None,
+        )
+    assert exc_info.value.move_not_started is True
+    assert exc_info.value.retry_safe is False
+
+
+def test_unknown_move_outcome_cannot_restore_authority(tmp_path: Path, monkeypatch):
+    _init_repo(tmp_path)
+    source = tmp_path / "scratch.py"
+    source.write_bytes(b"original\n")
+
+    def unknown_move(*_args, **_kwargs):
+        raise DeliveryQuarantineError("delivery_quarantine.move_failed", "unknown move outcome")
+
+    monkeypatch.setattr(delivery_quarantine_tool_module, "_move_to_quarantine", unknown_move)
+    with pytest.raises(DeliveryQuarantineError) as exc_info:
+        quarantine_agent_created_file(
+            tmp_path,
+            "task",
+            "scratch.py",
+            _provenance(source, "scratch.py", "session"),
+            session_id="session",
+            active_write_paths=["."],
+            exact_file_paths=[],
+            before_move=lambda _intent: None,
+            after_move=lambda _result: None,
+        )
+    assert exc_info.value.move_not_started is False
+    assert exc_info.value.retry_safe is False
+
+
+def test_completion_persistence_failure_does_not_retry_a_completed_move(tmp_path: Path):
+    _init_repo(tmp_path)
+    source = tmp_path / "scratch.py"
+    source.write_bytes(b"original\n")
+
+    def fail_completion(_result):
+        raise OSError("state unavailable")
+
+    with pytest.raises(DeliveryQuarantineError) as exc_info:
+        quarantine_agent_created_file(
+            tmp_path,
+            "task",
+            "scratch.py",
+            _provenance(source, "scratch.py", "session"),
+            session_id="session",
+            active_write_paths=["."],
+            exact_file_paths=[],
+            before_move=lambda _intent: None,
+            after_move=fail_completion,
+        )
+    assert exc_info.value.code == "delivery_quarantine.completion_failed"
+    assert exc_info.value.move_not_started is False
+    assert exc_info.value.retry_safe is False
+    assert not source.exists()
+    assert task_quarantine_summary(tmp_path, "task") == (1, len(b"original\n"))

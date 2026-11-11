@@ -689,6 +689,70 @@ def snapshot_delivery_scope_files(
     return snapshot
 
 
+def delivery_scope_file_identities(root: Path, git_dir: str | Path) -> set[tuple[int, int]]:
+    """Inventory worktree inodes independently of content-audit exclusions.
+
+    Include ignored, ephemeral and private entries without reading file contents.
+    Links are inventoried but never followed. An incomplete scan is not evidence
+    that an inode was created by the next provider attempt.
+    """
+    paths = _git_paths_z(
+        root, ["ls-files", "--cached", "-z"], env=_delivery_scope_git_env(root=root, git_dir=Path(git_dir))
+    )
+    if paths is None:
+        raise DeliveryScopeSnapshotError("Quarantine authority could not enumerate tracked paths.")
+    tracked_paths = {_validated_delivery_scope_git_path(value) for value in paths}
+    identities: set[tuple[int, int]] = set()
+    linked_paths: set[str] = set()
+    # Keep only the current ancestry open, rather than every directory visited.
+    stack = []
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def enter(
+        name: str | Path, relative: str, *, parent: int | None = None, expected: os.stat_result | None = None
+    ) -> None:
+        descriptor = os.open(name, flags, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            if expected is not None and (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+                raise DeliveryScopeSnapshotError("Quarantine identity directory changed during inspection.")
+            entries = os.scandir(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        stack.append((descriptor, entries, relative))
+
+    try:
+        enter(root, "")
+        while stack:
+            descriptor, entries, relative = stack[-1]
+            entry = next(entries, None)
+            if entry is None:
+                stack.pop()
+                entries.close()
+                os.close(descriptor)
+                continue
+            path = f"{relative}/{entry.name}" if relative else entry.name
+            value = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+            identities.add((value.st_dev, value.st_ino))
+            if stat.S_ISDIR(value.st_mode):
+                enter(entry.name, path, parent=descriptor, expected=value)
+            elif stat.S_ISLNK(value.st_mode):
+                linked_paths.add(path)
+        # A cached descendant under a regular-file replacement is simply absent.
+        # A linked ancestor must not redirect tracked authority outside this scan.
+        for path in tracked_paths:
+            if any(parent.as_posix() in linked_paths for parent in Path(path).parents):
+                raise DeliveryScopeSnapshotError("Quarantine tracked path has a linked ancestor.")
+    except OSError as exc:
+        raise DeliveryScopeSnapshotError("Quarantine authority could not inspect worktree file identities.") from exc
+    finally:
+        for descriptor, entries, _ in reversed(stack):
+            entries.close()
+            os.close(descriptor)
+    return identities
+
+
 def delivery_scope_git_binding(root: Path) -> DeliveryScopeGitBinding:
     """Capture the Git authority used for one delivery mutation audit."""
     try:
