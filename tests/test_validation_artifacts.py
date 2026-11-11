@@ -587,6 +587,100 @@ def test_delivery_scope_snapshot_hashes_only_git_candidates(
     assert sum(Path(path).name == tracked.name for path in hashed) == 1
 
 
+@pytest.mark.skipif(
+    not validation_artifacts_module._delivery_scope_descriptor_traversal_supported(),
+    reason="descriptor traversal unavailable",
+)
+def test_delivery_scope_file_identities_include_excluded_files_without_reading_contents(tmp_path: Path, monkeypatch):
+    tracked = tmp_path / "nested" / "file.py"
+    tracked.parent.mkdir()
+    tracked.write_bytes(b"private contents\n")
+    deleted = tmp_path / "deleted.py"
+    deleted.write_bytes(b"deleted\n")
+    link = tmp_path / "alias.py"
+    link.symlink_to("nested/file.py")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "tracked files"], cwd=tmp_path, check=True, capture_output=True)
+    deleted.unlink()
+    (tmp_path / "untracked.py").write_bytes(b"untracked\n")
+    (tmp_path / ".gitignore").write_text("build/\n.sikula/\n")
+    excluded = [tmp_path / "build/cache/artifact", tmp_path / ".sikula/state/private.json"]
+    for path in excluded:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"excluded private contents\n")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    external = outside / "external"
+    external.write_bytes(b"outside\n")
+    (tmp_path / "outside-link").symlink_to(outside, target_is_directory=True)
+    binding = validation_artifacts_module.delivery_scope_git_binding(tmp_path)
+    assert "nested/file.py" not in snapshot_delivery_scope_files(tmp_path)
+
+    def no_content_reads(*_args, **_kwargs):
+        pytest.fail("Identity capture must not read file contents")
+
+    monkeypatch.setattr(validation_artifacts_module, "_snapshot_delivery_scope_regular_file", no_content_reads)
+    # An inherited index must not hide tracked authority.
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "missing-index"))
+    original_open = os.open
+
+    def directories_only(path, flags, *args, **kwargs):
+        assert flags & os.O_DIRECTORY
+        assert flags & os.O_NOFOLLOW
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", directories_only)
+    identities = validation_artifacts_module.delivery_scope_file_identities(tmp_path, binding.git_dir)
+    assert (external.stat().st_dev, external.stat().st_ino) not in identities
+    for path in [*excluded, tmp_path / "untracked.py"]:
+        assert (path.stat().st_dev, path.stat().st_ino) in identities
+    assert (tracked.stat().st_dev, tracked.stat().st_ino) in identities
+    assert (link.lstat().st_dev, link.lstat().st_ino) in identities
+
+
+@pytest.mark.skipif(
+    not validation_artifacts_module._delivery_scope_descriptor_traversal_supported(),
+    reason="descriptor traversal unavailable",
+)
+@pytest.mark.parametrize("failure", ["query", "stat", "symlink_parent", "unreadable_ignored", "directory_race"])
+def test_delivery_scope_file_identity_failures_are_closed(tmp_path: Path, monkeypatch, failure: str):
+    directory = tmp_path / "nested"
+    directory.mkdir()
+    (directory / "file.py").write_bytes(b"tracked\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "tracked file"], cwd=tmp_path, check=True, capture_output=True)
+    binding = validation_artifacts_module.delivery_scope_git_binding(tmp_path)
+    if failure == "query":
+        monkeypatch.setattr(validation_artifacts_module, "_git_paths_z", lambda *_args, **_kwargs: None)
+    elif failure == "stat":
+        original_stat = os.stat
+
+        def fail_stat(path, **kwargs):
+            if path == "file.py" and kwargs.get("dir_fd") is not None:
+                raise OSError("metadata unavailable")
+            return original_stat(path, **kwargs)
+
+        monkeypatch.setattr(os, "stat", fail_stat)
+    elif failure == "symlink_parent":
+        directory.rename(tmp_path / "other")
+        directory.symlink_to("other", target_is_directory=True)
+    else:
+        (tmp_path / ".gitignore").write_text("nested/\n")
+        original_open = os.open
+
+        def fail_open(path, flags, *args, **kwargs):
+            if path == "nested" and kwargs.get("dir_fd") is not None:
+                if failure == "unreadable_ignored":
+                    raise PermissionError("excluded tree unavailable")
+                directory.rename(tmp_path / "other")
+                directory.mkdir()
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(DeliveryScopeSnapshotError):
+        validation_artifacts_module.delivery_scope_file_identities(tmp_path, binding.git_dir)
+
+
 def test_delivery_scope_snapshot_prunes_ephemeral_ignored_roots_before_opening(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

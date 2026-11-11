@@ -1150,6 +1150,14 @@ forwarded to implementation agents.
 `reviewer` overrides also govern independent repair-authority renewal when the
 existing hierarchy supports it.
 
+While `delivery run` checks a checkpoint or the final gate, it prints a start
+message and then the result, elapsed time and available obligation counts to
+stderr. `delivery verify` uses the same progress output. Interruptions and
+unexpected failures are reported without exposing provider exception details.
+These messages describe the verification invocation, which can reuse current
+evidence; they do not imply a fresh provider call. With `--json`, stdout remains
+a single JSON result. Dry runs do not invoke verification.
+
 The `delivery run` summary reports the separate `Final gate` status, its recorded
 gate ID, and, when an assessment exists, its satisfied/total obligation counts and gaps.
 Failed assessments include their final-gate stop code. Its JSON `verification`
@@ -1507,15 +1515,20 @@ continue to use the separate test-write policy; snapshot content is retained onl
 bounded, non-binary files whose platform-specific mixed source/test classification needs
 it.
 
-On supported POSIX systems, a non-triage Fixer may ask Sikula to quarantine one
-ordinary-untracked file that a successful audited agent attempt created in the current
-process. Sikula verifies the file identity and exact active write scope, then moves the
+On supported POSIX systems, a Fixer in an ordinary pass or a production-confirmed
+pass after test-failure triage may ask Sikula to quarantine one ordinary-untracked
+file that a successful audited agent attempt created in the current process.
+Sikula verifies the file identity and exact active write scope, then moves the
 file out of the child worktree without deleting its contents. Tracked, staged, ignored,
 linked, pre-existing, stale, private, or cross-session files are rejected. The retained
 copy is outside the assembled Git tree and remains available until an explicit
 `sikula cleanup <task-id> --force` or `sikula delete <task-id> --force`; the corresponding
 dry run reports its count and size. The capability is not advertised on Windows,
-non-isolated runs, or Fixer test-triage subpasses.
+non-isolated runs, or the Fixer `test_only` and `test_only_retry` subpasses.
+A `production_confirmed` pass can edit production files and request quarantine
+in the same response. The move happens only after that pass's successful scope
+audit and before the next validation cycle, with no request deferred from an
+earlier triage pass. The same rule applies to triage of test-origin build/check failures.
 If a process is interrupted while a quarantine move is recorded, run
 `sikula cleanup <task-id> --quarantine-only --force` to remove only retained quarantine
 storage while preserving the child worktree, followed by

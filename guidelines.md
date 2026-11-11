@@ -553,9 +553,12 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
 - **Delivery Fixer quarantine** is the only supported removal path for ordinary-untracked
   files created by a successful, provider-independent audited attempt in the current
   process. It is offered only to modern isolated delivery children on platforms with
-  descriptor-relative no-follow filesystem operations, and not during Fixer's internal
-  test-triage subpasses. The agent may request one canonical project-relative file within
-  the exact audited write scope; tracked, staged, ignored, linked, non-regular,
+  descriptor-relative no-follow filesystem operations. It is also available in Fixer's
+  `production_confirmed` pass after test-failure or test-origin validation triage,
+  bound to that pass's successful provider audit. It remains unavailable in
+  `test_only` and `test_only_retry` passes, whose writes may still be restored.
+  The agent may request one canonical project-relative file within the exact audited
+  write scope; tracked, staged, ignored, linked, non-regular,
   pre-existing, private-metadata, stale-identity, or cross-session candidates fail closed.
   The orchestrator owns authorization and durable state transitions; the injected tool
   owns Git/filesystem checks and moves the verified inode into an owner-only task

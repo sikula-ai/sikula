@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+import pytest
+
 from agents.base_agent import AGENT_SECURITY_PREFIX
 from agents.fixer_agent import (
     FixerAgent,
@@ -189,6 +191,94 @@ class TestFixerAgentGuards:
         assert calls == [("src/Scratch.kt", ["src/"])]
         assert "reversible quarantine" in stub_llm.agent_calls[0]
         assert state.fix_cycle_records[0]["file_quarantined"]["path"] == "src/Scratch.kt"
+
+    @pytest.mark.parametrize("origin", ["tests", "build", "checks"])
+    @pytest.mark.parametrize("executor_available", [False, True])
+    def test_quarantine_is_available_only_in_confirmed_production_pass(self, file_tool, origin, executor_available):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 1
+        state.worktree_path = state.worktree_base = str(file_tool._root)
+        if origin == "tests":
+            state.test_errors = ["architecture assertion failed"]
+        elif origin == "build":
+            state.errors = ["tests/ArchitectureTest.py:10: compilation failed"]
+        else:
+            state.check_errors = ["tests/ArchitectureTest.py:10: check failed"]
+        triage = (
+            "TEST FAILURE TRIAGE:\nclassification: production_defect\n"
+            "contract_affected: architecture boundaries\nchosen_fix: production_code\n"
+        )
+        operation = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"src/Scratch.py"}'
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({}, [], triage + "\n" + operation),
+                ({"src/replacement.py": "# replacement\n"}, ["src/replacement.py"], operation),
+            ]
+        )
+        calls = []
+
+        def quarantine(current, path, roots):
+            assert current.fix_cycle_records[-1]["triage_pass"] == "production_confirmed"
+            calls.append((path, roots))
+            return DeliveryQuarantineResult(path, "1" * 32, "sha256:" + "2" * 64, 0o644, 0)
+
+        agent = _make_agent(
+            llm,
+            file_tool=file_tool,
+            project_config={"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}},
+            quarantine_executor=quarantine if executor_available else None,
+        )
+        result = agent.run(state)
+        assert result.success
+        assert calls == ([("src/Scratch.py", ["src/", "tests/"])] if executor_available else [])
+        assert "reversible quarantine" not in llm.agent_calls[0]
+        assert ("reversible quarantine" in llm.agent_calls[1]) == executor_available
+        assert "file_quarantined" not in state.fix_cycle_records[0]
+
+    def test_test_only_retry_never_executes_or_defers_quarantine(self, file_tool, tmp_project):
+        state = _make_state()
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 1
+        state.worktree_path = state.worktree_base = str(file_tool._root)
+        state.test_errors = ["architecture assertion failed"]
+        triage = (
+            "TEST FAILURE TRIAGE:\nclassification: production_defect\n"
+            "contract_affected: architecture boundaries\nchosen_fix: production_code\n"
+        )
+        operation = (
+            '{"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked",'
+            '"path":"tests/ScratchTest.py"}'
+        )
+        llm = _WritingSequentialStubLLMClient(
+            [
+                ({"tests/ScratchTest.py": "assert False\n"}, ["tests/ScratchTest.py"], triage + "\n" + operation),
+                ({}, [], triage + "\n" + operation),
+                ({"src/main.py": "# fixed\n"}, ["src/main.py"], "Fixed the defect."),
+            ]
+        )
+
+        def forbidden(*_):
+            pytest.fail("Requests from test-only passes must not execute or carry forward")
+
+        result = _make_agent(
+            llm,
+            file_tool=file_tool,
+            project_config={"sandbox": {"allowed_write_paths": ["src/"], "allowed_test_write_paths": ["tests/"]}},
+            quarantine_executor=forbidden,
+        ).run(state)
+        assert result.success
+        assert not (tmp_project / "tests/ScratchTest.py").exists()
+        assert [record["triage_pass"] for record in state.fix_cycle_records] == [
+            "test_only",
+            "test_only_retry",
+            "production_confirmed",
+        ]
+        assert all("reversible quarantine" not in prompt for prompt in llm.agent_calls[:2])
+        assert "reversible quarantine" in llm.agent_calls[2]
+        assert all("file_quarantined" not in record for record in state.fix_cycle_records)
 
     def test_standard_fixer_does_not_parse_quarantine_protocol(self, stub_llm: StubLLMClient, file_tool):
         state = _make_state()

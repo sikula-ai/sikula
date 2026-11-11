@@ -2994,33 +2994,41 @@ class Orchestrator:
             state.record("fixer", "file_quarantined", result.path)
             self._store.save(state)
 
-        try:
-            return self._delivery_quarantine_tool.quarantine(
-                state.task_id,
-                path,
-                provenance,
-                session_id=self._delivery_quarantine_session_id,
-                active_write_paths=resolved_roots,
-                exact_file_paths=exact_roots,
-                git_root=policy.root,
-                before_move=before_move,
-                after_move=after_move,
-            )
-        except DeliveryQuarantineError as exc:
-            if exc.move_not_started and exc.quarantine_id:
-                for record in reversed(state.delivery_quarantine_records):
-                    if (
-                        isinstance(record, dict)
-                        and record.get("quarantine_id") == exc.quarantine_id
-                        and record.get("status") == "moving"
-                    ):
-                        record["status"] = "aborted"
-                        record["failure_code"] = exc.code
-                        record["aborted_at"] = datetime.now(timezone.utc).isoformat()
-                        state.record("fixer", "file_quarantine_aborted", path)
-                        self._store.save(state)
-                        break
-            raise
+        for attempt in range(2):
+            try:
+                return self._delivery_quarantine_tool.quarantine(
+                    state.task_id,
+                    path,
+                    provenance,
+                    session_id=self._delivery_quarantine_session_id,
+                    active_write_paths=resolved_roots,
+                    exact_file_paths=exact_roots,
+                    git_root=policy.root,
+                    before_move=before_move,
+                    after_move=after_move,
+                )
+            except DeliveryQuarantineError as exc:
+                authority_restored = False
+                if exc.move_not_started and exc.quarantine_id:
+                    for record in reversed(state.delivery_quarantine_records):
+                        if (
+                            isinstance(record, dict)
+                            and record.get("quarantine_id") == exc.quarantine_id
+                            and record.get("status") == "moving"
+                        ):
+                            record["status"] = "aborted"
+                            record["failure_code"] = exc.code
+                            record["aborted_at"] = datetime.now(timezone.utc).isoformat()
+                            state.record("fixer", "file_quarantine_aborted", path)
+                            if exc.retry_safe and provenance.get("session_id") == self._delivery_quarantine_session_id:
+                                state.delivery_quarantine_candidates.append(dict(provenance))
+                                authority_restored = True
+                                state.record("fixer", "file_quarantine_authority_restored", path)
+                            self._store.save(state)
+                            break
+                if not authority_restored or attempt == 1:
+                    raise
+                state.record("fixer", "file_quarantine_retry", path)
 
     def _run_delivery_review_agent(self, name: str, state: TaskState):
         """Retry one malformed delivery review without consuming a fix attempt."""

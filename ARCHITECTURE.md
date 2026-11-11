@@ -3376,20 +3376,48 @@ Build, test, sync, and check error blobs are diagnostic excerpts, not plain tail
 preserves failure-marker blocks from long command output so the fixer still sees the concrete
 compiler diagnostic, failing test, assertion, panic, traceback, or tool error even when the
 build tool prints many lines after the failure.
-For modern isolated delivery children on supported POSIX filesystems, a non-triage Fixer
-may request one `quarantine_untracked` operation in its structured output. The provider call
+For modern isolated delivery children on supported POSIX filesystems, a Fixer
+in an ordinary pass or a `production_confirmed` triage pass may request one
+`quarantine_untracked` operation in its structured output. The provider call
 does not execute the mutation. After that call passes the provider-independent scope audit,
 the orchestrator consumes its exact captured write policy and current-process provenance;
 `DeliveryQuarantineTool` then moves the matching ordinary-untracked, single-link regular
-file outside the worktree. The intent is persisted before the move and completion is
+file outside the worktree. A successful audited Implementer or Fixer attempt may
+retain ownership through an atomic rewrite: its before-snapshot must match the
+recorded identity, digest and mode, and its after-snapshot must remain an ordinary
+untracked regular file. A replacement inode must not belong to another file in
+the pre-attempt file inventory. A separate descriptor-relative walk inventories
+the actual worktree, including clean tracked files, ignored build artifacts and
+private metadata; content-audit exclusions do not exclude identities. Inventory
+is captured after durable attempt-audit writes and immediately before the provider
+call, so those writes cannot release recorded inodes for reuse by new provider files.
+The walk reads no file contents and never follows links. Tracked descendants of a directory
+replaced by a regular file are absent; linked tracked ancestors remain invalid.
+Missing identity evidence blocks the provider attempt. The refreshed provenance
+binds the new identity, digest and mode; failed or scope-violating writes revoke
+the affected file's authority.
+Changes before the attempt cannot renew stale provenance, and a new process
+still clears prior quarantine authority rather than adopting existing files.
+If a filesystem move fails with the source known to be unmoved or restored,
+the tool rechecks its exact identity, contents, mode, ordinary-untracked status
+and unchanged Git binding. Only a successful recheck permits the orchestrator
+to restore current-process provenance alongside the durable `aborted` record
+and retry the move once without another provider call. Each move has its own
+intent and audit record. Repeated failure stops the Fixer; uncertain moves,
+changed evidence and intent/completion persistence failures do not grant a retry.
+The intent is persisted before the move and completion is
 persisted immediately afterward, invalidating build sync and semantic gates like any other
 Fixer change. Clean quarantined paths are removed from the net `files_changed` projection;
 their audit remains in `delivery_quarantine_records`. An interrupted `moving` record blocks
 resume until explicit cleanup confirms that the retained entry exists. Standard,
-non-isolated, Windows, and internal test-triage Fixer runs never receive or parse this
-protocol. Quarantined bytes are not unlinked by the pipeline. A delivery child or current
-planner step whose only changes were quarantined cannot complete unless its Implementer
-supplied the existing parser-validated `already_satisfied` outcome.
+non-isolated and Windows Fixer runs never receive or parse this protocol.
+The `test_only` and `test_only_retry` triage passes also never advertise or execute
+quarantine: their writes may still be rejected and restored. A subsequent
+`production_confirmed` pass uses its own freshly audited write scope; requests
+from preceding passes are never carried forward. Quarantined bytes are not unlinked
+by the pipeline. A delivery child or current planner step whose only changes were
+quarantined cannot complete unless its Implementer supplied the existing
+parser-validated `already_satisfied` outcome.
 For test failures, and for build/check failures whose diagnostics reference only test files
 or recognized test targets, the fixer is explicitly told to decide whether the failure is
 caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
