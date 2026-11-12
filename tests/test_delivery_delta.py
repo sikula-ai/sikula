@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import io
 import sys
 import tracemalloc
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -236,7 +237,8 @@ def test_git_process_is_reaped_and_stream_closed_on_every_exit(tmp_path, monkeyp
     timer.join.assert_called_once()
 
 
-def test_blocked_git_pipe_is_killed_on_deadline(tmp_path, monkeypatch):
+@pytest.mark.parametrize("clock_reaches_deadline", [True, False])
+def test_blocked_git_pipe_is_killed_on_deadline(tmp_path, monkeypatch, clock_reaches_deadline):
     popen = delta.subprocess.Popen
     children = []
 
@@ -247,6 +249,10 @@ def test_blocked_git_pipe_is_killed_on_deadline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(delta.subprocess, "Popen", blocked)
     monkeypatch.setattr(delta, "METADATA_TIMEOUT_SECONDS", 0.2)
+    if not clock_reaches_deadline:
+        # A watchdog can fire before the sampled clock reports the deadline.
+        # Its own termination must still be classified as a timeout.
+        monkeypatch.setattr(delta, "time", SimpleNamespace(monotonic=lambda: 0.0))
     with pytest.raises(ValueError, match="timed out"):
         with delta._git_records(tmp_path, DIFF, delta._ScanBudget()) as records:
             list(records)

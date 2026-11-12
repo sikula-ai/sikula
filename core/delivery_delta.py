@@ -8,7 +8,7 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
-from threading import Timer
+from threading import Event, Timer
 import time
 from typing import BinaryIO, Callable, Iterator
 
@@ -28,10 +28,11 @@ _RAW_ENTRY = re.compile(
 class _ScanBudget:
     remaining: int = field(default_factory=lambda: MAX_METADATA_BYTES)
     deadline: float = field(default_factory=lambda: time.monotonic() + METADATA_TIMEOUT_SECONDS)
+    timed_out: Event = field(default_factory=Event)
 
     def seconds_left(self) -> float:
         remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
+        if self.timed_out.is_set() or remaining <= 0:
             raise ValueError("Composition metadata inspection timed out.")
         return remaining
 
@@ -71,7 +72,14 @@ def _git_records(root: Path, args: list[str], budget: _ScanBudget) -> Iterator[I
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     ) as process:
-        timer = Timer(timeout, process.kill)
+
+        def expire():
+            # The watchdog and sampled clock need not observe the deadline at
+            # exactly the same instant. Preserve why we terminate the process.
+            budget.timed_out.set()
+            process.kill()
+
+        timer = Timer(timeout, expire)
         timer.start()
         records = _nul_records(process.stdout, budget)
         try:
