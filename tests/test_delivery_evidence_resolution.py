@@ -106,6 +106,25 @@ def test_lru_eviction_retains_change_detection_and_charges_rereads(tmp_path):
     assert resolver.bytes_read == 7 * paths[0].stat().st_size
 
 
+def test_cached_blob_batches_keep_read_and_materialization_limits():
+    batch = [(str(index), 1) for index in range(3)]
+    expected = {oid: "sha256:" + "a" * 64 for oid, _ in batch}
+    reader = Mock(return_value=expected)
+    resolver = EvidenceResolver(replace(EvidenceResolutionLimits(), reads=2))
+    with pytest.raises(EvidenceResolutionLimit):
+        with resolver:
+            assert resolver.git_blob_fingerprints(("repository",), batch, reader) == expected
+            first_memory = resolver.materialized_bytes
+            assert resolver.git_blob_fingerprints(("repository",), batch, reader) == expected
+            assert resolver.reads == 2
+            assert resolver.materialized_bytes > first_memory
+            assert reader.call_count == 1
+            resolver.git_blob_fingerprints(("repository",), batch, reader)
+    assert reader.call_count == 1
+    with pytest.raises(EvidenceResolutionLimit):
+        resolver.git_blob_fingerprints(("repository",), batch, reader)
+
+
 def test_cycle_depth_and_expansion_budgets():
     with EvidenceResolver() as resolver:
         with resolver.visit("node"):

@@ -680,10 +680,7 @@ def build_delivery_verification_snapshot(
     if status.plan is None or status.plan.source_task is None or status.project_root is None:
         raise ValueError("delivery verification identity requires a valid authoritative plan")
     root = Path(status.project_root).resolve()
-    candidate_tree = _git_object(root, f"{candidate_commit}^{{tree}}")
-    resolved_commit = _git_object(root, f"{candidate_commit}^{{commit}}")
-    if candidate_tree is None or resolved_commit is None:
-        raise ValueError("delivery verification candidate cannot be resolved")
+    resolved_commit, candidate_tree = _git_candidate_objects(root, candidate_commit)
 
     if status.plan_fingerprint is None:
         raise ValueError("delivery verification identity requires bound plan bytes")
@@ -930,6 +927,35 @@ def _verification_record_matches_identity(
             "policy_fingerprint",
         )
     )
+
+
+def _git_candidate_objects(root: Path, ref: str) -> tuple[str, str]:
+    """Resolve a candidate and its tree in one fresh, strictly framed exchange."""
+    error = "delivery verification candidate cannot be resolved"
+    if not ref or any(character in ref for character in "\r\n\0"):
+        raise ValueError(error)
+    result = subprocess.run(
+        ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input=f"{ref}^{{commit}}\n{ref}^{{tree}}\n".encode("utf-8"),
+        cwd=root,
+        capture_output=True,
+        env=delivery_verification_git_env(),
+    )
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 2:
+        raise ValueError(error)
+    objects = []
+    for line, kind in zip(lines, (b"commit", b"tree")):
+        fields = line.split()
+        if (
+            len(fields) != 2
+            or fields[1] != kind
+            or len(fields[0]) not in {40, 64}
+            or any(character not in b"0123456789abcdef" for character in fields[0])
+        ):
+            raise ValueError(error)
+        objects.append(fields[0].decode("ascii"))
+    return objects[0], objects[1]
 
 
 def _git_object(root: Path, ref: str) -> str | None:

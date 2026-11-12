@@ -1445,19 +1445,29 @@ common regular-file and newline-normalization policy; raw contract and reviewer-
 fingerprints retain their own policies. Checkout plan bytes are still checked
 against the captured status before comparing candidate content.
 Symlink and missing-path checks retain component-level validation. Within one
-read-only evidence operation, checkpoint handoffs share plan/source fingerprints
+read-only evidence operation, checkpoint handoffs share authority-file fingerprints
 for the same exact commit, project and repository context, paths and interpretation
 policy. Repository context is read again on each request; symbolic refs and
 abbreviated object IDs are not cached. Candidate refs, checkout plan/contracts and
 effective policy are revalidated on every handoff decision. Neither handoff
 verdicts nor Git fingerprints survive the operation.
-Across distinct exact commits, identical bounded batches of regular-file blobs
-can reuse successful content fingerprints in that same LRU. Each new commit/path
-request still checks repository context and file metadata before reuse. Batch
-identity binds object IDs, sizes, project/repository context and interpretation
-policy; only fully validated batch responses are retained. Link resolution keeps
-its component-level checks without this batch reuse. Eviction or a new operation
-requires reading the payload again.
+Overlapping scopes and distinct exact commits can reuse individual regular-file
+blob fingerprints in that same LRU. Each new commit/path request still checks
+repository context and file metadata before reuse. Blob identity binds the object
+ID, size, project/repository context and interpretation policy; only missing
+payloads are requested, in bounded batches, and nothing from a batch is retained
+until its full response validates. Read accounting charges each fingerprint request,
+blob batch and actual Git exchange; individual in-memory blob lookups consume no
+additional reads. Distinct blob keys and materialized results remain subject to
+the shared artifact and memory limits. Link resolution keeps its component-level
+checks without this blob reuse. Eviction or a new operation requires reading the
+payload again. Candidate commit and tree identities use one fresh Git metadata
+exchange, with both object types validated before constructing the snapshot.
+Each historical handoff checks the live assembly branch and reviewed-commit
+ancestry in one fresh ref query. Acceptance requires the exact local branch,
+captured assembly commit and commit object type; a tag or similarly named child
+ref cannot stand in for a missing branch. The query is never cached, ignores Git
+replacement history and shares the evidence operation's read/output budgets.
 Whole-plan handoff checks in status/readiness and finalization traverse checkpoints
 children first, computing each node's historical handoff once per operation.
 Commands that immediately need configured readiness load fresh plan/progress
@@ -1891,7 +1901,7 @@ Global plan limits remain unchanged; full review is conditional on packet capaci
 **Shared private evidence resolution:** `core/delivery_evidence_resolution.py`
 provides an explicit read context for one deterministic operation. Recursive
 checkpoint/final-gate closure, composition, candidate-control and full-result
-readers share parsed artifact JSON within that context. Checkpoint plan/source
+readers share parsed artifact JSON within that context. Checkpoint authority-file
 Git fingerprints use the same bounded LRU and resource accounting. Each use still
 validates the expected digest, accepted attempt, node, scope and candidate bindings; the
 cache stores neither approval decisions nor expanded descendant closures.

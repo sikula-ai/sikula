@@ -272,7 +272,6 @@ def _checkpoint_local_pass_is_usable(
     """Validate this node's complete authority; the traversal checks child handoffs."""
     from core.delivery_verification import build_delivery_verification_identity
     from core.delivery_verification_model import delivery_verification_covers_obligations
-    from core.delivery_assembly import delivery_branch_commit
 
     record = status.checkpoint_verifications.get(checkpoint.id)
     if (
@@ -325,7 +324,7 @@ def _checkpoint_local_pass_is_usable(
         if commit == status.assembled_commit and authority[plan_path] != plan_fingerprint:
             return False
         if (
-            checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints)
+            checkpoint_review_rule_fingerprints(root, commit, record.review_rule_fingerprints, resolver=resolver)
             != record.review_rule_fingerprints
         ):
             return False
@@ -337,10 +336,10 @@ def _checkpoint_local_pass_is_usable(
     # Checkout contracts bind the policy identity, but cannot attest to
     # downstream changes that exist only in the assembled candidate.
     reviewed_contracts = _checkpoint_file_fingerprints(
-        root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False
+        root, record.candidate_commit, contract_paths, allow_missing=True, follow_links=False, resolver=resolver
     )
     if record.candidate_commit != status.assembled_commit and reviewed_contracts != _checkpoint_file_fingerprints(
-        root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False
+        root, status.assembled_commit, contract_paths, allow_missing=True, follow_links=False, resolver=resolver
     ):
         return False
     identity = build_delivery_verification_identity(node, cfg or {}, candidate_commit=record.candidate_commit)
@@ -349,27 +348,44 @@ def _checkpoint_local_pass_is_usable(
         return False
     if cfg is not None and record.config_fingerprint != identity.config_fingerprint:
         return False
-    if (
-        status.assembly_status != "ready"
-        or delivery_branch_commit(root, status.plan.final_branch) != status.assembled_commit
-    ):
+    if status.assembly_status != "ready":
         return False
     # A receipt is a historical group handoff, not approval of later commits.
-    return (
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", record.candidate_commit, status.assembled_commit],
-            cwd=root,
-            env=delivery_verification_git_env(),
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
+    return _checkpoint_assembly_matches(
+        root, status.plan.final_branch, status.assembled_commit, record.candidate_commit, resolver=resolver
     )
 
 
-def checkpoint_review_rule_fingerprints(root: Path, commit: str, paths: Collection[str]) -> dict[str, str]:
+def _checkpoint_assembly_matches(
+    root: Path,
+    branch: str,
+    assembled_commit: str,
+    reviewed_commit: str,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> bool:
+    """Check the live assembly ref and historical ancestry in one fresh query."""
+    ref = f"refs/heads/{branch}"
+    output = _checkpoint_git(
+        root,
+        "for-each-ref",
+        "--count=1",
+        "--format=%(refname)%00%(objectname)%00%(objecttype)",
+        f"--contains={reviewed_commit}",
+        "--",
+        ref,
+        resolver=resolver,
+    )
+    # Patterns can also match descendants of a missing ref. Require the exact
+    # local branch, captured commit and object type, not just a nonempty result.
+    return output.splitlines() == [f"{ref}\0{assembled_commit}\0commit".encode("utf-8")]
+
+
+def checkpoint_review_rule_fingerprints(
+    root: Path, commit: str, paths: Collection[str], *, resolver: EvidenceResolver | None = None
+) -> dict[str, str]:
     """Hash candidate rule contents, resolving only bounded, project-internal links."""
-    return _checkpoint_file_fingerprints(root, commit, paths)
+    return _checkpoint_file_fingerprints(root, commit, paths, resolver=resolver)
 
 
 def checkpoint_plan_fingerprint(status: DeliveryStatusResult, commit: str) -> str:
@@ -561,8 +577,8 @@ def _read_checkpoint_file_fingerprints(
             raise ValueError("Checkpoint authority blob response is invalid")
         return hashes
 
-    # Distinct commits often retain exactly the same authority blobs. Validate
-    # their paths/types/sizes above, then share successful bounded batch hashes
+    # Overlapping scopes and distinct commits often retain authority blobs. Validate
+    # their paths/types/sizes above, then share successful individual blob hashes
     # in the existing operation's LRU. Never retain payloads or approval decisions.
     pending_blobs = sorted(dict(regular.values()).items())
     hashes: dict[str, str] = {}
@@ -577,16 +593,14 @@ def _read_checkpoint_file_fingerprints(
             payload_size += size
         if resolver is not None and blob_context is not None:
             identity = (
-                "blob-batch",
                 *blob_context,
-                tuple(batch),
                 allow_missing,
                 follow_links,
                 normalize_contract,
                 normalize_newlines,
                 MAX_DELIVERY_VERIFICATION_PACKET_BYTES,
             )
-            hashes.update(resolver.git_fingerprints(identity, lambda: read_blobs(batch)))
+            hashes.update(resolver.git_blob_fingerprints(identity, batch, read_blobs))
         else:
             hashes.update(read_blobs(batch))
 

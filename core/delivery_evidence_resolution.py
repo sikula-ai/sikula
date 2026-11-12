@@ -247,13 +247,8 @@ class EvidenceResolver:
             self._failed = True
             raise EvidenceResolutionLimit("Evidence integrity reads exceed the resource budget.")
 
-    def git_fingerprints(self, identity: tuple, reader: Callable[[], dict[str, str]]) -> dict[str, str]:
-        """Share successful immutable fingerprints, never handoff validation decisions.
-
-        The caller supplies an exact object ID, fresh repository context and all
-        interpretation policies. Git output and copies share the sidecar budgets.
-        """
-        self._charge("reads", 1)
+    def _git_key(self, identity: tuple) -> tuple:
+        self._check()
         key = ("git-fingerprints", *identity)
         if key not in self._git_keys:
             if len(self._identities) + len(self._git_keys) >= self.limits.artifacts:
@@ -261,6 +256,55 @@ class EvidenceResolver:
                 raise EvidenceResolutionLimit("Evidence graph exceeds its artifact budget.")
             self.materialize(key)
             self._git_keys.add(key)
+        return key
+
+    def git_blob_fingerprints(
+        self,
+        identity: tuple,
+        batch: list[tuple[str, int]],
+        reader: Callable[[list[tuple[str, int]]], dict[str, str]],
+    ) -> dict[str, str]:
+        """Reuse individual immutable blobs after the caller validates path metadata.
+
+        Only missing blobs reach the bounded reader. Nothing from that exchange
+        is retained until the reader has validated its complete response.
+        """
+        # Charge the logical batch once, not each in-memory blob lookup.
+        # Individual keys still consume artifact/materialization allowances;
+        # actual Git exchanges are charged separately by git_read_started().
+        self._charge("reads", 1)
+        hashes: dict[str, str] = {}
+        missing: list[tuple[str, int]] = []
+        keys: dict[str, tuple] = {}
+        for oid, size in batch:
+            key = self._git_key(("blob", *identity, oid, size))
+            cached = self._cache.get(key)
+            if cached is None:
+                missing.append((oid, size))
+                keys[oid] = key
+            else:
+                value, _ = cached
+                hashes.update(value)
+                self._cache.move_to_end(key)
+        self.materialize((missing, keys, hashes))
+        if missing:
+            values = reader(missing)
+            for oid, _ in missing:
+                value = {oid: values[oid]}
+                key = keys[oid]
+                self._retain(key, value, self.materialize((key, value)))
+            hashes.update(values)
+        self.materialize(hashes)
+        return hashes
+
+    def git_fingerprints(self, identity: tuple, reader: Callable[[], dict[str, str]]) -> dict[str, str]:
+        """Share successful immutable fingerprints, never handoff validation decisions.
+
+        The caller supplies an exact object ID, fresh repository context and all
+        interpretation policies. Git output and copies share the sidecar budgets.
+        """
+        self._charge("reads", 1)
+        key = self._git_key(identity)
         cached = self._cache.get(key)
         if cached is None:
             value = reader()

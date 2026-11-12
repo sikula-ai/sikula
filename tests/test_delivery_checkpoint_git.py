@@ -386,7 +386,9 @@ def test_invalid_blob_batches_are_not_cached(candidate, corruption):
             assert read(root, commit, contents, resolver=resolver) == {
                 name: "sha256:" + sha256(content).hexdigest() for name, content in contents.items()
             }
-        assert sum("--batch" in c.args[0] for c in git.call_args_list) == 2
+        inputs = [c.kwargs["input"] for c in git.call_args_list if "--batch" in c.args[0]]
+        assert len(inputs) == 2
+        assert inputs[0] == inputs[1]  # No prefix of a rejected batch may be reused.
 
 
 @pytest.mark.parametrize("cache_bytes", [0, 5000])
@@ -411,3 +413,254 @@ def test_shared_blob_eviction_charges_new_payload_reads(candidate, cache_bytes):
             assert resolver.materialized_bytes > memory_before
             assert resolver.cache_bytes <= cache_bytes
         assert sum("--batch" in c.args[0] for c in git.call_args_list) == 2
+
+
+def test_overlapping_authority_batches_read_only_missing_blobs(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, commit, contents = candidate
+    (root / "space name.md").write_bytes(b"changed\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "one changed authority file")
+    later = _git(root, "rev-parse", "HEAD")
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as git:
+        with EvidenceResolver() as resolver:
+            first = read(root, commit, ["one.md", "space name.md"], resolver=resolver)
+            # An ancestor includes a new path, a duplicate blob, and a shared path.
+            second = read(root, commit, ["copy.md", "space name.md", "[literal].md"], resolver=resolver)
+            assert second["copy.md"] == first["one.md"]
+            assert second["space name.md"] == first["space name.md"]
+            changed = read(root, later, contents, resolver=resolver)
+            assert changed == {
+                name: "sha256:" + sha256(b"changed\n" if name == "space name.md" else content).hexdigest()
+                for name, content in contents.items()
+            }
+        batches = [call.kwargs["input"].splitlines() for call in git.call_args_list if "--batch" in call.args[0]]
+        assert [len(batch) for batch in batches] == [2, 1, 1]
+        assert len(set(oid for batch in batches for oid in batch)) == 4
+        assert sum("ls-tree" in call.args[0] for call in git.call_args_list) == 3
+
+
+def test_wide_overlapping_authority_reads_keep_payload_work_local(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, _, _ = candidate
+    paths = [f"unit-{index}.md" for index in range(64)]
+    for path in paths:
+        (root / path).write_bytes(path.encode("ascii"))
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "wide authority")
+    commit = _git(root, "rev-parse", "HEAD")
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as git:
+        with EvidenceResolver() as resolver:
+            for count in (16, 32, 64):
+                assert read(root, commit, paths[:count], resolver=resolver) == {
+                    path: "sha256:" + sha256(path.encode("ascii")).hexdigest() for path in paths[:count]
+                }
+            for offset in range(0, 64, 8):
+                read(root, commit, paths[offset : offset + 8], resolver=resolver)
+        batches = [call.kwargs["input"].splitlines() for call in git.call_args_list if "--batch" in call.args[0]]
+        assert [len(batch) for batch in batches] == [16, 16, 32]
+        assert sum("ls-tree" in call.args[0] for call in git.call_args_list) == 11
+
+
+def test_progressively_overlapping_scopes_fit_default_evidence_limits(candidate):
+    from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, _, _ = candidate
+    paths = [f"contract-{index}.md" for index in range(200)]
+    expected = {}
+    for path in paths:
+        content = path.encode("ascii")
+        (root / path).write_bytes(content)
+        expected[path] = "sha256:" + sha256(content).hexdigest()
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "overlapping checkpoint contracts")
+    commit = _git(root, "rev-parse", "HEAD")
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as git:
+        with EvidenceResolver() as resolver:
+            for count in range(1, len(paths) + 1):
+                scope = paths[:count]
+                assert read(root, commit, scope, resolver=resolver) == {path: expected[path] for path in scope}
+            # Each scope charges its request and blob batch, plus three actual
+            # Git exchanges (context, metadata, and its one new blob).
+            assert resolver.reads == 5 * len(paths)
+        batches = [call.kwargs["input"].splitlines() for call in git.call_args_list if "--batch" in call.args[0]]
+        assert len(batches) == len(paths)
+        assert all(len(batch) == 1 for batch in batches)
+        assert len({batch[0] for batch in batches}) == len(paths)
+        assert sum("ls-tree" in call.args[0] for call in git.call_args_list) == len(paths)
+
+
+def test_candidate_identity_resolves_commit_and_tree_in_one_fresh_exchange(candidate):
+    from core.delivery_verification import _git_candidate_objects
+
+    root, commit, _ = candidate
+    tree = _git(root, "rev-parse", f"{commit}^{{tree}}")
+    _git(root, "tag", "-a", "candidate", "-m", "annotated candidate")
+    with patch("core.delivery_verification.subprocess.run", wraps=subprocess.run) as git:
+        assert _git_candidate_objects(root, "candidate") == (commit, tree)
+        assert git.call_count == 1
+    (root / "one.md").write_bytes(b"new candidate\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "advance candidate")
+    assert _git_candidate_objects(root, "HEAD") == (
+        _git(root, "rev-parse", "HEAD"),
+        _git(root, "rev-parse", "HEAD^{tree}"),
+    )
+    assert _git_candidate_objects(root, commit) == (commit, tree)
+    with pytest.raises(ValueError, match="cannot be resolved"):
+        _git_candidate_objects(root, tree)
+
+
+@pytest.mark.parametrize("ref", ["", "missing-ref", "HEAD\nHEAD", "HEAD\rHEAD", "HEAD\0", "--help"])
+def test_candidate_identity_rejects_invalid_refs(candidate, ref):
+    from core.delivery_verification import _git_candidate_objects
+
+    root, _, _ = candidate
+    with pytest.raises(ValueError, match="cannot be resolved"):
+        _git_candidate_objects(root, ref)
+
+
+@pytest.mark.parametrize("corruption", ["wrong_type", "wrong_oid", "missing", "extra", "failed"])
+def test_candidate_identity_rejects_invalid_batch_metadata(candidate, corruption):
+    from core.delivery_verification import _git_candidate_objects
+
+    root, commit, _ = candidate
+    original = subprocess.run
+
+    def run(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if corruption == "wrong_type":
+            result.stdout = result.stdout.replace(b"commit", b"blob")
+        elif corruption == "wrong_oid":
+            result.stdout = b"z" + result.stdout[1:]
+        elif corruption == "missing":
+            result.stdout = result.stdout.splitlines()[0] + b"\n"
+        elif corruption == "extra":
+            result.stdout += b"unexpected\n"
+        else:
+            result.returncode = 1
+        return result
+
+    with patch("core.delivery_verification.subprocess.run", side_effect=run):
+        with pytest.raises(ValueError, match="cannot be resolved"):
+            _git_candidate_objects(root, commit)
+
+
+@pytest.mark.parametrize(
+    "change", ["same", "descendant", "rewound", "advanced", "unrelated", "missing", "prefix", "tag"]
+)
+def test_assembly_query_binds_exact_local_ref_and_ancestry(candidate, change):
+    from core.delivery_checkpoints import _checkpoint_assembly_matches
+
+    root, reviewed, _ = candidate
+    tree = _git(root, "rev-parse", f"{reviewed}^{{tree}}")
+    assembled = _git(root, "commit-tree", tree, "-p", reviewed, "-m", "assembled")
+    branch = "delivery/assembly"
+    current = assembled
+    if change == "same":
+        current = assembled = reviewed
+    elif change == "rewound":
+        current = reviewed
+    elif change == "advanced":
+        current = _git(root, "commit-tree", tree, "-p", assembled, "-m", "later assembly")
+    elif change == "unrelated":
+        # The ref matches, but the same tree on an independent history is not a handoff.
+        current = assembled = _git(root, "commit-tree", tree, "-m", "unrelated history")
+    if change == "prefix":
+        _git(root, "update-ref", f"refs/heads/{branch}/child", current)
+    elif change == "tag":
+        _git(root, "update-ref", f"refs/tags/{branch}", current)
+    elif change != "missing":
+        _git(root, "update-ref", f"refs/heads/{branch}", current)
+    with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as run:
+        assert _checkpoint_assembly_matches(root, branch, assembled, reviewed) == (change in {"same", "descendant"})
+    assert run.call_count == 1
+    assert "for-each-ref" in run.call_args.args[0]
+
+
+def test_assembly_query_rechecks_packed_unicode_ref_within_one_operation(candidate):
+    from core.delivery_checkpoints import _checkpoint_assembly_matches
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, reviewed, _ = candidate
+    branch = "delivery/příprava"
+    ref = f"refs/heads/{branch}"
+    _git(root, "update-ref", ref, reviewed)
+    _git(root, "pack-refs", "--all", "--prune")
+    with EvidenceResolver() as resolver:
+        assert _checkpoint_assembly_matches(root, branch, reviewed, reviewed, resolver=resolver)
+        before = resolver.reads, resolver.bytes_read
+        tree = _git(root, "rev-parse", f"{reviewed}^{{tree}}")
+        later = _git(root, "commit-tree", tree, "-p", reviewed, "-m", "advance packed ref")
+        _git(root, "update-ref", ref, later)
+        assert not _checkpoint_assembly_matches(root, branch, reviewed, reviewed, resolver=resolver)
+        assert resolver.reads > before[0] and resolver.bytes_read > before[1]
+        assert _checkpoint_assembly_matches(root, branch, later, reviewed, resolver=resolver)
+        _git(root, "update-ref", "-d", ref)
+        assert not _checkpoint_assembly_matches(root, branch, later, reviewed, resolver=resolver)
+
+
+def test_assembly_query_ignores_replacement_history(candidate):
+    from core.delivery_checkpoints import _checkpoint_assembly_matches
+
+    root, reviewed, _ = candidate
+    tree = _git(root, "rev-parse", f"{reviewed}^{{tree}}")
+    assembled = _git(root, "commit-tree", tree, "-m", "independent assembly")
+    replacement = _git(root, "commit-tree", tree, "-p", reviewed, "-m", "fake ancestor")
+    _git(root, "update-ref", "refs/heads/assembly", assembled)
+    _git(root, "replace", assembled, replacement)
+    assert not _checkpoint_assembly_matches(root, "assembly", assembled, reviewed)
+
+
+@pytest.mark.parametrize("failure", ["extra", "wrong_type", "failed", "missing_object"])
+def test_assembly_query_rejects_unavailable_or_invalid_evidence(candidate, failure):
+    from core.delivery_checkpoints import _checkpoint_assembly_matches
+    from core.delivery_evidence_resolution import EvidenceResolver
+
+    root, reviewed, _ = candidate
+    _git(root, "update-ref", "refs/heads/assembly", reviewed)
+    original = subprocess.run
+
+    def run(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if failure == "extra":
+            result.stdout += result.stdout
+        elif failure == "wrong_type":
+            result.stdout = result.stdout.replace(b"commit", b"tag")
+        elif failure == "failed":
+            result.returncode = 1
+        return result
+
+    with (
+        EvidenceResolver() as resolver,
+        patch("core.delivery_checkpoints.subprocess.run", side_effect=run),
+    ):
+        if failure in {"failed", "missing_object"}:
+            with pytest.raises(ValueError):
+                _checkpoint_assembly_matches(
+                    root, "assembly", reviewed, "0" * 40 if failure == "missing_object" else reviewed, resolver=resolver
+                )
+        else:
+            assert not _checkpoint_assembly_matches(root, "assembly", reviewed, reviewed, resolver=resolver)
+
+
+def test_assembly_query_read_budget_is_terminal_before_git(candidate):
+    from dataclasses import replace
+    from core.delivery_checkpoints import _checkpoint_assembly_matches
+    from core.delivery_evidence_resolution import EvidenceResolver, EvidenceResolutionLimits, EvidenceResolutionLimit
+
+    root, reviewed, _ = candidate
+    with pytest.raises(EvidenceResolutionLimit):
+        with (
+            EvidenceResolver(replace(EvidenceResolutionLimits(), reads=0)) as resolver,
+            patch("core.delivery_checkpoints.subprocess.run") as git,
+        ):
+            for _ in range(2):
+                with pytest.raises(EvidenceResolutionLimit):
+                    _checkpoint_assembly_matches(root, "assembly", reviewed, reviewed, resolver=resolver)
+            assert not git.called
