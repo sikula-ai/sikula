@@ -1494,6 +1494,18 @@ unusable handoffs, within that one read operation. Unaccepted parents and failin
 children retain short-circuit behavior; unrelated later subtrees are not inspected
 before returning an earlier blocker. Global terminal boundaries still preempt the
 traversal, and artifact integrity is checked even on an early return.
+Verification admission combines that barrier traversal with the immediate-child
+handoff requirement in one fresh evidence operation. A due node may enter review,
+but its children must pass; visited subtrees are not validated a second time for
+this requirement. Admission before locking, under the capture lock and after
+assembly remain separate decisions. Public status projections are not reused as
+admission authority.
+Checkpoint recovery preflight shares immutable evidence reads between its barrier
+traversal and later immediate-child checks. It rechecks mutable authority and
+handoff decisions after the intervening configured readiness projection; that
+projection and retained-result recovery checks keep their earlier error precedence.
+The enclosing evidence operation checks integrity even when recovery returns early;
+the next preflight starts with fresh reads and no retained fingerprints or decisions.
 Recursive closure bindings and artifact integrity still require validation.
 A failed child prevents
 its ancestors from admitting consumers while independent siblings remain checkable.
