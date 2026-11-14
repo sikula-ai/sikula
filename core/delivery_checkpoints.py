@@ -730,6 +730,44 @@ def checkpoint_barrier_issue(
         )
 
 
+def checkpoint_verification_issue(
+    status: DeliveryStatusResult, cfg: dict[str, Any] | None = None
+) -> DeliveryPlanIssue | None:
+    """Check global barriers and immediate children in one fresh admission decision.
+
+    A due checkpoint may enter review, but its children must already have usable
+    handoffs. Share only this traversal's results, never a status projection or a
+    decision captured before a lock, assembly change or provider call.
+    """
+    boundary = checkpoint_boundary_issue(status)
+    if boundary is not None:
+        return boundary
+    if not status.valid or status.plan is None:
+        return None
+    try:
+        with EvidenceResolver() as resolver:
+            resolved: dict[str, bool] = {}
+            issue = _checkpoint_barrier_issue(status, cfg, resolver=resolver, resolved=resolved)
+            if issue is not None and issue.code != "delivery_checkpoint.required":
+                return issue
+            if any(
+                not _checkpoint_pass_is_usable(status, child, cfg, resolver=resolver, resolved=resolved)
+                for child in checkpoint_children(status.plan.checkpoints, status.verification_node)
+            ):
+                return DeliveryPlanIssue(
+                    "error",
+                    "delivery_checkpoint.required",
+                    "Immediate child checkpoints must pass before their parent.",
+                )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return DeliveryPlanIssue(
+            "error",
+            evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+            evidence_failure_message(exc, "Checkpoint evidence resolution could not complete safely."),
+        )
+    return None
+
+
 @evidence_operation
 def _checkpoint_barrier_issue(
     status: DeliveryStatusResult,
@@ -737,10 +775,12 @@ def _checkpoint_barrier_issue(
     *,
     unit_id: str | None = None,
     resolver: EvidenceResolver | None = None,
+    resolved: dict[str, bool] | None = None,
 ) -> DeliveryPlanIssue | None:
     if not status.valid or status.plan is None:
         return None
-    resolved: dict[str, bool] = {}
+    if resolved is None:
+        resolved = {}
     for checkpoint in getattr(status.plan, "checkpoints", ()):
         if _checkpoint_pass_is_usable(status, checkpoint, cfg, resolver=resolver, resolved=resolved):
             continue
@@ -809,6 +849,24 @@ def checkpoint_preflight_issue(
     status: DeliveryStatusResult, cfg: dict[str, Any], state_store: StateStore | None = None
 ) -> DeliveryPlanIssue | None:
     """Read-only prerequisites shared by dry-run, direct verification and run."""
+    try:
+        return _checkpoint_preflight_issue(status, cfg, state_store)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return DeliveryPlanIssue(
+            "error",
+            evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
+            evidence_failure_message(exc, "Checkpoint evidence resolution could not complete safely."),
+        )
+
+
+@evidence_operation
+def _checkpoint_preflight_issue(
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any],
+    state_store: StateStore | None,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> DeliveryPlanIssue | None:
     from core.delivery_handoff import load_delivery_dependency_handoffs
     from core.delivery_verification import check_delivery_verification_readiness
 
@@ -831,7 +889,9 @@ def checkpoint_preflight_issue(
             "delivery_checkpoint.unit_not_complete",
             "An active child must be resolved before checkpoint review.",
         )
-    barrier = checkpoint_barrier_issue(status, cfg)
+    # Share immutable evidence reads with the later child checks, not handoff
+    # decisions: configured readiness may observe changes to mutable authority.
+    barrier = checkpoint_boundary_issue(status) or _checkpoint_barrier_issue(status, cfg, resolver=resolver)
     if barrier is not None and barrier.code != "delivery_checkpoint.required":
         return barrier
     from core.delivery_verification import with_delivery_verification_readiness
@@ -879,7 +939,7 @@ def checkpoint_preflight_issue(
         ):
             return DeliveryPlanIssue("error", record.stop_code, "Checkpoint retains a required recovery boundary.")
     if any(
-        not checkpoint_pass_is_usable(status, child, cfg)
+        not _checkpoint_pass_is_usable(status, child, cfg, resolver=resolver)
         for child in checkpoint_children(status.plan.checkpoints, status.verification_node)
     ):
         return DeliveryPlanIssue(

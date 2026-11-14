@@ -45,6 +45,10 @@ def test_preparation_measurement_is_not_reported_as_completed_delivery(tmp_path)
     assert report["implementations"] == 0
     assert report["operations"][-1]["phase"] == "prepare_replay"
     assert report["operations"][-1]["calls"] == 0
+    counts = report["host_work_totals"]
+    assert counts["git_subprocess_run_calls"] > 0
+    assert counts["checkpoint_handoff_checks"] == 0
+    assert counts == {key: sum(operation["host_work"][key] for operation in report["operations"]) for key in counts}
     assert json.loads((root / ".capacity/report.json").read_text()) == report
 
 
@@ -67,9 +71,23 @@ def test_capacity_limit_is_reported_without_execution_or_raised_guards(tmp_path)
 
 
 def test_operator_interrupt_is_not_treated_as_injected_resume(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    from core import delivery_checkpoints
     from tests import delivery_capacity
 
+    original_run = subprocess.run
+    original_check = delivery_checkpoints._checkpoint_local_pass_is_usable
+
     def cancel():
+        # Count attempted work even when Git fails and the CLI is interrupted.
+        # The instrumentation must preserve both exceptions and return values.
+        with pytest.raises(subprocess.CalledProcessError):
+            subprocess.run(["git", "rev-parse", "--verify", "refs/heads/nonexistent"], check=True, capture_output=True)
+        assert not delivery_checkpoints._checkpoint_local_pass_is_usable(
+            SimpleNamespace(valid=False, checkpoint_verifications={}), SimpleNamespace(id="absent"), {}, resolver=None
+        )
         raise KeyboardInterrupt()
 
     monkeypatch.setattr(delivery_capacity, "sikula_main", cancel)
@@ -79,6 +97,9 @@ def test_operator_interrupt_is_not_treated_as_injected_resume(tmp_path, monkeypa
     report = json.loads((root / ".capacity/report.json").read_text())
     assert not report["completed"] and not report["checks_passed"]
     assert not report["calls"] and not report["operations"]
+    assert report["host_work_totals"] == {"git_subprocess_run_calls": 1, "checkpoint_handoff_checks": 1}
+    assert subprocess.run is original_run
+    assert delivery_checkpoints._checkpoint_local_pass_is_usable is original_check
 
 
 @pytest.mark.parametrize("fanout", [1, 2])

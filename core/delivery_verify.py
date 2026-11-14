@@ -2220,8 +2220,7 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
             warnings=tuple(readiness.warnings),
         )
     if readiness.required and status.plan and status.plan.checkpoints:
-        from core.delivery_checkpoints import checkpoint_barrier_issue, checkpoint_pass_is_usable
-        from core.delivery_checkpoint_model import checkpoint_children
+        from core.delivery_checkpoints import checkpoint_verification_issue
         from core.delivery_handoff import load_delivery_dependency_handoffs
 
         if status.verification and delivery_verification_is_boundary_stop(status.verification):
@@ -2239,14 +2238,11 @@ def _preflight_result(status, readiness, project_config: dict[str, Any] | None =
                         boundary = child
                         break
             return _blocked_result(status, boundary.stop_code or "delivery_verification.security_rejected")
-        issue = checkpoint_barrier_issue(status, project_config)
-        if issue is not None and issue.code != "delivery_checkpoint.required":
+        issue = checkpoint_verification_issue(status, project_config)
+        if issue is not None:
+            if issue.code == "delivery_checkpoint.required":
+                return _blocked_result(status, issue.code)
             return _blocked_result(status, issue.code, [issue])
-        if any(
-            not checkpoint_pass_is_usable(status, checkpoint, project_config)
-            for checkpoint in checkpoint_children(status.plan.checkpoints, status.verification_node)
-        ):
-            return _blocked_result(status, "delivery_checkpoint.required")
         scope = DeliveryVerificationScope.from_plan(status.plan, status.verification_node)
         _, issues = load_delivery_dependency_handoffs(status, list(scope.unit_ids), Path(status.project_root))
         if issues:

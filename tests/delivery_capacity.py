@@ -9,6 +9,10 @@ measured routing evidence. Add ``--require-compact-parents`` to require compact
 parent reviews throughout, without changing production routing or limits.
 Use ``--fanout 2`` for branching recovery, including preservation of unrelated
 checkpoint admission/authority and fresh final applicability of both branches.
+Reports count direct Git subprocess.run calls and local checkpoint handoff checks,
+both per CLI phase and in total. Counts exclude fixture setup, direct Popen calls
+and subprocesses launched by validation commands; they are not elapsed-time claims.
+Totals also include plan publication and final-tree assertions between CLI phases.
 """
 
 from __future__ import annotations
@@ -567,6 +571,7 @@ def run_case(
     )
     operations = []
     evidence = {"operations": 0, "reads": 0, "bytes_read": 0, "materialized_bytes": 0, "visits": 0, "expanded_items": 0}
+    host_work = {"git_subprocess_run_calls": 0, "checkpoint_handoff_checks": 0}
     report = {
         "schema_version": 1,
         "depth": depth,
@@ -584,9 +589,24 @@ def run_case(
         "operations": operations,
         "calls": fake.calls,
         "evidence_totals": evidence,
+        "host_work_totals": host_work,
         "source_bytes": len(SOURCE.encode()),
     }
     original_exit = EvidenceResolver.__exit__
+    original_run = subprocess.run
+    from core import delivery_checkpoints
+
+    original_handoff_check = delivery_checkpoints._checkpoint_local_pass_is_usable
+
+    def measure_run(*args, **kwargs):
+        command = args[0] if args else kwargs.get("args")
+        if isinstance(command, (list, tuple)) and command and command[0] == "git":
+            host_work["git_subprocess_run_calls"] += 1
+        return original_run(*args, **kwargs)
+
+    def measure_handoff(*args, **kwargs):
+        host_work["checkpoint_handoff_checks"] += 1
+        return original_handoff_check(*args, **kwargs)
 
     def measure_exit(resolver, *args):
         try:
@@ -598,6 +618,7 @@ def run_case(
 
     def invoke(label: str, *args: str) -> dict:
         before, start = len(fake.calls), time.perf_counter()
+        before_host_work = dict(host_work)
         output, errors = io.StringIO(), io.StringIO()
         code, interrupted = 0, False
         with (
@@ -623,6 +644,7 @@ def run_case(
                 "calls": len(fake.calls) - before,
                 "stop_code": payload.get("stop_code"),
                 "error_codes": [item["code"] for item in payload.get("errors", [])],
+                "host_work": {key: value - before_host_work[key] for key, value in host_work.items()},
             }
         )
         return payload
@@ -635,6 +657,8 @@ def run_case(
             working_directory(root),
             patch("core.llm_client.create_llm_client", return_value=fake),
             patch.object(EvidenceResolver, "__exit__", measure_exit),
+            patch("subprocess.run", new=measure_run),
+            patch.object(delivery_checkpoints, "_checkpoint_local_pass_is_usable", new=measure_handoff),
             observe_review_routes(fake),
         ):
             prepared = invoke("prepare", "prepare", str(task))

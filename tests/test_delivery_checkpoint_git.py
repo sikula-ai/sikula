@@ -466,7 +466,10 @@ def test_wide_overlapping_authority_reads_keep_payload_work_local(candidate):
         assert sum("ls-tree" in call.args[0] for call in git.call_args_list) == 11
 
 
-def test_progressively_overlapping_scopes_fit_default_evidence_limits(candidate):
+@pytest.mark.parametrize("admission", [False, True])
+def test_progressively_overlapping_scopes_fit_default_evidence_limits(
+    candidate: tuple[Path, str, dict[str, bytes]], admission: bool
+) -> None:
     from core.delivery_checkpoints import _checkpoint_file_fingerprints as read
     from core.delivery_evidence_resolution import EvidenceResolver
 
@@ -481,13 +484,39 @@ def test_progressively_overlapping_scopes_fit_default_evidence_limits(candidate)
     _git(root, "commit", "-m", "overlapping checkpoint contracts")
     commit = _git(root, "rev-parse", "HEAD")
     with patch("core.delivery_checkpoints.subprocess.run", wraps=subprocess.run) as git:
-        with EvidenceResolver() as resolver:
-            for count in range(1, len(paths) + 1):
-                scope = paths[:count]
-                assert read(root, commit, scope, resolver=resolver) == {path: expected[path] for path in scope}
-            # Each scope charges its request and blob batch, plus three actual
-            # Git exchanges (context, metadata, and its one new blob).
-            assert resolver.reads == 5 * len(paths)
+        if admission:
+            from core.delivery_checkpoint_model import DeliveryCheckpoint
+            from core.delivery_checkpoints import checkpoint_verification_issue
+            from tests.test_delivery_checkpoint_barriers import _status
+
+            nodes = [
+                DeliveryCheckpoint(
+                    str(index),
+                    tuple(paths[: index + 1]),
+                    (),
+                    parent_id=str(index + 1) if index < len(paths) - 1 else "root",
+                )
+                for index in range(len(paths))
+            ]
+            counts = []
+
+            def check(status: object, node: DeliveryCheckpoint, cfg: dict, *, resolver: EvidenceResolver) -> bool:
+                actual = read(root, commit, node.unit_ids, resolver=resolver)
+                counts.append(resolver.reads)
+                return actual == {path: expected[path] for path in node.unit_ids}
+
+            with patch("core.delivery_checkpoints._checkpoint_local_pass_is_usable", side_effect=check):
+                assert checkpoint_verification_issue(_status(nodes), {}) is None
+            assert len(counts) == len(nodes)
+            assert counts[-1] == 5 * len(paths)
+        else:
+            with EvidenceResolver() as resolver:
+                for count in range(1, len(paths) + 1):
+                    scope = paths[:count]
+                    assert read(root, commit, scope, resolver=resolver) == {path: expected[path] for path in scope}
+                # Each scope charges its request and blob batch, plus three actual
+                # Git exchanges (context, metadata, and its one new blob).
+                assert resolver.reads == 5 * len(paths)
         batches = [call.kwargs["input"].splitlines() for call in git.call_args_list if "--batch" in call.args[0]]
         assert len(batches) == len(paths)
         assert all(len(batch) == 1 for batch in batches)

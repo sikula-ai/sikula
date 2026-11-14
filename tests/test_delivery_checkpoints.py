@@ -15,10 +15,11 @@ import yaml
 from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
 from core.delivery_checkpoint_model import DeliveryCheckpointError, parse_delivery_checkpoints
 from core.delivery_checkpoints import checkpoint_pass_is_usable, due_delivery_checkpoint, verification_node_status
-from core.delivery_plan import DeliveryPlanUnit, check_delivery_plan_file
+from core.delivery_plan import DeliveryPlanIssue, DeliveryPlanUnit, check_delivery_plan_file
 from core.delivery_obligations import DeliveryObligation, delivery_authority_fragments
 from core.delivery_progress import (
     DeliveryProgress,
+    DeliveryStatusResult,
     delivery_progress_path,
     get_delivery_status,
     make_delivery_unit_progress,
@@ -200,6 +201,84 @@ def test_checkpoint_pass_releases_consumer_and_survives_downstream_commits(check
     status = get_delivery_status(path)
     assert due_delivery_checkpoint(status, cfg) is None
     assert checkpoint_pass_is_usable(status, status.plan.checkpoints[0], cfg)
+
+
+def test_gate_preflight_checks_each_handoff_once_per_capture(checkpoint_plan: tuple[Path, dict]) -> None:
+    import core.delivery_checkpoints as checkpoints
+
+    path, cfg = checkpoint_plan
+    assert _verify_node(path, cfg)[0].succeeded
+    _complete(path, "consumer")
+    original = checkpoints.checkpoint_verification_issue
+    decisions = []
+
+    def admission(status: DeliveryStatusResult, config: dict) -> DeliveryPlanIssue | None:
+        with patch(
+            "core.delivery_checkpoints._checkpoint_local_pass_is_usable",
+            wraps=checkpoints._checkpoint_local_pass_is_usable,
+        ) as check:
+            issue = original(status, config)
+        assert issue is None
+        assert [call.args[1].id for call in check.call_args_list] == ["storage"]
+        decisions.append(check.call_args.kwargs["resolver"])
+        return issue
+
+    with patch("core.delivery_checkpoints.checkpoint_verification_issue", side_effect=admission):
+        result, llm = _verify_node(path, cfg, node_id="root")
+    assert result.succeeded, result
+    assert llm.calls
+    # Before locking, under the lock, and after assembly are separate decisions.
+    assert len(decisions) == len({id(resolver) for resolver in decisions}) == 3
+
+
+@pytest.mark.parametrize("change", ["policy", "contract", "rules", "ref", "evidence", "attempt"])
+def test_gate_admission_revalidates_authority_after_an_accepted_decision(
+    checkpoint_plan: tuple[Path, dict], change: str
+) -> None:
+    from core.delivery_checkpoint_evidence import checkpoint_evidence_path
+    from core.delivery_checkpoints import checkpoint_verification_issue
+
+    path, cfg = checkpoint_plan
+    root = path.parent
+    rules = root / "review.md"
+    rules.write_bytes(b"Check storage invariants.\n")
+    cfg["reviewer"] = {"extra_rules": "review.md"}
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "review policy")
+    progress_path = delivery_progress_path(root, "cache")
+    progress, _ = read_delivery_progress(progress_path, plan_id="cache")
+    commit = _git(root, "rev-parse", "HEAD")
+    write_delivery_progress(
+        progress_path,
+        replace(progress, assembly_base_commit=commit, units=[replace(unit, commit=commit) for unit in progress.units]),
+    )
+    assert _verify_node(path, cfg)[0].succeeded
+    status = get_delivery_status(path)
+    assert checkpoint_verification_issue(status, cfg) is None
+    assert status.checkpoint_handoffs == frozenset({"storage"})
+    if change == "policy":
+        cfg = {**cfg, "agents": {"reviewer": {"llm": {"model": "changed"}}}}
+    elif change == "contract":
+        (root / status.plan.units[0].task_path).write_text(_CONTRACT + "\nChanged contract.\n")
+    elif change == "rules":
+        _git(root, "checkout", status.plan.final_branch)
+        rules.write_bytes(b"Changed review policy.\n")
+        # Rules are bound to the candidate, not the operator's working copy.
+        assert checkpoint_verification_issue(status, cfg) is None
+        _git(root, "add", "review.md")
+        _git(root, "commit", "-m", "changed candidate review policy")
+        status = replace(status, assembled_commit=_git(root, "rev-parse", "HEAD"))
+    elif change == "ref":
+        _git(root, "update-ref", "-d", "refs/heads/" + status.plan.final_branch)
+    elif change == "evidence":
+        checkpoint_evidence_path(progress_path.parent, status.checkpoint_verifications["storage"]).unlink()
+    else:
+        status = replace(
+            status,
+            checkpoint_verifications={"storage": replace(status.checkpoint_verifications["storage"], attempt=2)},
+        )
+    # Reusing the same status cannot reuse an admission decision or its projection.
+    assert checkpoint_verification_issue(status, cfg).code == "delivery_checkpoint.required"
 
 
 @pytest.mark.parametrize("advanced", [False, True])
