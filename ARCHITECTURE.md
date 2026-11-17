@@ -1475,6 +1475,16 @@ authority and project checkpoint barriers directly with the effective policy,
 without a preliminary configuration-free projection. The result retains the
 complete public status and consumer barriers. Assembly reconciliation and later
 reads across mutation or lock boundaries remain separate fresh operations.
+The bounded run coordinator reads raw plan/progress for its invocation unit bound
+and durable-progress comparison. After assembly reconciliation, configured
+readiness and checkpoint selection share one short-lived evidence resolver;
+selection still rechecks mutable authority and handoff decisions. Integrity is
+checked before leaving this read phase, and failures preempt provider or child
+work. No resolver survives into recovery, verification admission or finalization.
+Finalization's current-result checks load fresh raw authority before their own
+configured handoff validation, including after acquiring the progress lock;
+they do not first compute a public scheduling projection. Public result snapshots
+after mutations retain their complete checkpoint projection.
 Candidate-review updates and verification-result persistence read fresh plan/progress
 authority without computing the whole-plan status projection. Under their existing
 locks they still check validity, captured attempt, candidate identity and assembly

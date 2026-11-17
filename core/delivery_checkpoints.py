@@ -1063,7 +1063,12 @@ def checkpoint_boundary_issue(status: DeliveryStatusResult) -> DeliveryPlanIssue
     return None
 
 
-def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] | None = None) -> DeliveryStatusResult:
+def with_checkpoint_barriers(
+    status: DeliveryStatusResult,
+    cfg: dict[str, Any] | None = None,
+    *,
+    resolver: EvidenceResolver | None = None,
+) -> DeliveryStatusResult:
     if status.plan and checkpoint_boundary_issue(status) is not None:
         return replace(
             status,
@@ -1072,7 +1077,7 @@ def with_checkpoint_barriers(status: DeliveryStatusResult, cfg: dict[str, Any] |
             checkpoint_candidate_evidence={node.id: "unavailable" for node in status.plan.checkpoints},
         )
     try:
-        return _with_checkpoint_barriers(status, cfg)
+        return _with_checkpoint_barriers(status, cfg, resolver=resolver)
     except (OSError, RuntimeError, ValueError) as exc:
         return replace(
             status,

@@ -26,6 +26,7 @@ from core.delivery_progress import (
     delivery_events_path,
     delivery_progress_path,
     get_delivery_status,
+    _read_delivery_status,
     mark_delivery_assembly,
     make_delivery_progress_event,
     mark_delivery_finalized,
@@ -108,7 +109,9 @@ def finalize_delivery_plan(
     project_root: Path | None = None,
     project_config: dict[str, Any] | None = None,
 ) -> DeliveryFinalizeResult:
-    current_status = get_delivery_status(path, project_root=project_root)
+    # Finalization validates handoffs itself with the effective policy. A public
+    # scheduling projection here would repeat that traversal without authorizing it.
+    current_status = _read_delivery_status(path, project_root=project_root)
     if delivery_finalization_is_current(current_status, project_config=project_config):
         initial_result = _current_finalization_result(current_status)
         assert current_status.plan is not None
@@ -150,7 +153,7 @@ def finalize_delivery_plan(
         )
 
     with lock:
-        current_status = get_delivery_status(path, project_root=project_root)
+        current_status = _read_delivery_status(path, project_root=project_root)
         if delivery_finalization_is_current(current_status, project_config=project_config):
             _repair_finalization_event(events_path, current_status)
             return _current_finalization_result(current_status)

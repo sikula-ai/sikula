@@ -356,11 +356,13 @@ def test_finalize_delivery_plan_rechecks_current_finalization_under_lock(
     first_progress = progress_path.read_text(encoding="utf-8")
     first_events = events_path.read_text(encoding="utf-8")
 
-    get_status = delivery_finalize_module.get_delivery_status
+    get_status = delivery_finalize_module._read_delivery_status
     current_status = get_status(plan_path, project_root=tmp_path)
     statuses = iter([replace(current_status, finalized_at=None)])
+    reads = []
 
     def status_with_stale_initial_snapshot(*args, **kwargs):
+        reads.append(True)
         try:
             return next(statuses)
         except StopIteration:
@@ -368,13 +370,14 @@ def test_finalize_delivery_plan_rechecks_current_finalization_under_lock(
 
     monkeypatch.setattr(
         delivery_finalize_module,
-        "get_delivery_status",
+        "_read_delivery_status",
         status_with_stale_initial_snapshot,
     )
 
     second = finalize_delivery_plan(plan_path, project_root=tmp_path, project_config=_cfg(tmp_path))
 
     assert second.finalized is True
+    assert len(reads) == 2  # Fresh raw authority again after acquiring the lock.
     assert progress_path.read_text(encoding="utf-8") == first_progress
     assert events_path.read_text(encoding="utf-8") == first_events
 

@@ -99,6 +99,12 @@ def _status(unit_statuses: list[str], *, final_commit: str | None = None) -> Sim
     )
 
 
+def _mock_delivery_status(monkeypatch, reader):
+    """Supply the same persisted state to raw reads and public projections."""
+    monkeypatch.setattr("core.delivery_progress._read_delivery_status", reader)
+    monkeypatch.setattr("core.delivery_progress.get_delivery_status", reader)
+
+
 def _verification_record(**changes) -> DeliveryVerificationRecord:
     record = DeliveryVerificationRecord(
         schema_version=1,
@@ -290,7 +296,7 @@ def test_preview_delivery_run_handles_completed_plan(
             pytest.fail("current finalization must bypass mutating finalize preview")
         return final_preview
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr("core.delivery_finalize.preview_delivery_finalize", preview_finalize)
     if expected_completed:
         monkeypatch.setattr(
@@ -326,7 +332,7 @@ def test_preview_delivery_run_keeps_finalize_blocker_when_recorded_branch_diverg
         message=issue.message,
     )
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr("core.delivery_finalize.preview_delivery_finalize", lambda *args, **kwargs: final_preview)
     monkeypatch.setattr(
         "core.delivery_finalize.delivery_assembly_branch_is_symbolic",
@@ -355,10 +361,10 @@ def test_preview_delivery_run_preflights_schema_v2_assembly(
         "Delivery unit unit-1 conflicts with the assembled branch.",
     )
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, config: current,
+        lambda current, config, **kwargs: current,
     )
     monkeypatch.setattr(
         "core.delivery_finalize.preview_delivery_assembly_issue",
@@ -379,10 +385,10 @@ def test_preview_delivery_run_does_not_offer_actionable_verification_retry(
     status.plan.requires_final_verification = True
     status.verification_status = "failed"
     status.verification = _verification_record(stop_code="delivery_verification.scope_amendment_required")
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, config: current,
+        lambda current, config, **kwargs: current,
     )
 
     result = _preview_delivery_run(_args(dry_run=True), {}, project_root=Path("/project"))
@@ -433,7 +439,7 @@ def test_preview_delivery_run_projects_next_unit(
         warnings=[],
         message="Next unit preview.",
     )
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
 
     def preview_run_next(*args, **kwargs):
         seen["preview"] = kwargs["reset_failed"]
@@ -473,7 +479,7 @@ def test_delivery_run_stops_successfully_at_unit_limit(monkeypatch: pytest.Monke
         state["done"] += 1
         return result
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", current_status)
+    _mock_delivery_status(monkeypatch, current_status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
 
     args = _args(max_units=1)
@@ -517,7 +523,7 @@ def test_delivery_run_soft_elapsed_limit_is_checked_between_units(monkeypatch: p
         return result
 
     monotonic_values = iter([0.0, 61.0])
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", current_status)
+    _mock_delivery_status(monkeypatch, current_status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
     monkeypatch.setattr("sikula_cli.delivery.time.monotonic", lambda: next(monotonic_values))
 
@@ -559,7 +565,7 @@ def test_delivery_run_keeps_absolute_plan_path_after_child_changes_cwd(
         monkeypatch.chdir(target_root)
         return _unit_result(_status(["pending", "pending"]))
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", current_status)
+    _mock_delivery_status(monkeypatch, current_status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
 
     result = _run_delivery_plan(args, {}, _context(), project_root=target_root)
@@ -580,7 +586,7 @@ def test_delivery_run_stops_after_failed_unit(monkeypatch: pytest.MonkeyPatch) -
         calls += 1
         return _unit_result(status, succeeded=False)
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
 
     result = _run_delivery_plan(_args(), {}, _context(), project_root=Path("/project"))
@@ -593,7 +599,7 @@ def test_delivery_run_stops_after_failed_unit(monkeypatch: pytest.MonkeyPatch) -
 
 def test_delivery_run_projects_preflight_failure_as_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _status(["pending"])
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "sikula_cli.delivery._run_next_delivery_unit",
         lambda *args, **kwargs: _unit_result(status, succeeded=False, ran=False),
@@ -635,7 +641,7 @@ def test_delivery_run_reset_failed_is_consumed_after_one_success(
         )
 
     completed_result = _run_result(completed=True, finalized=True)
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", current_status)
+    _mock_delivery_status(monkeypatch, current_status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
     monkeypatch.setattr("sikula_cli.delivery._finalize_delivery_run", lambda *args, **kwargs: completed_result)
 
@@ -689,7 +695,7 @@ def test_delivery_run_stops_before_unit_added_after_initial_snapshot(
             message="Completed.",
         )
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", current_status)
+    _mock_delivery_status(monkeypatch, current_status)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_next)
 
     result = _run_delivery_plan(_args(), {}, _context(), project_root=Path("/project"))
@@ -704,7 +710,7 @@ def test_delivery_run_stops_before_unit_added_after_initial_snapshot(
 
 def test_delivery_run_detects_success_without_durable_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _status(["pending"])
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "sikula_cli.delivery._run_next_delivery_unit",
         lambda *args, **kwargs: _unit_result(status),
@@ -723,7 +729,7 @@ def test_delivery_run_stops_when_status_becomes_invalid(monkeypatch: pytest.Monk
     invalid.valid = False
     invalid.errors = [DeliveryPlanIssue("error", "delivery.invalid", "Invalid.")]
     statuses = iter([valid, invalid])
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: next(statuses))
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: next(statuses))
 
     result = _run_delivery_plan(_args(), {}, _context(), project_root=Path("/project"))
 
@@ -738,8 +744,10 @@ def test_checkpoint_selection_failure_blocks_run_before_provider_work(monkeypatc
     from core.delivery_evidence_resolution import EvidenceResolutionLimit
 
     status = _status(["pending"])
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
-    monkeypatch.setattr("core.delivery_verification.with_delivery_verification_readiness", lambda status, cfg: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
+    monkeypatch.setattr(
+        "core.delivery_verification.with_delivery_verification_readiness", lambda status, cfg, **kwargs: status
+    )
     error_type = EvidenceResolutionLimit if failure == "budget" else ValueError
 
     def selection(*args, **kwargs):
@@ -796,7 +804,7 @@ def test_repair_blocker_takes_precedence_over_resumable_limit(
         checks.append(kwargs["dry_run"])
         return DeliveryRepairResult(ready=issue is None, issue=issue)
 
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr("core.delivery_repair.delivery_repair_pending", lambda *args, **kwargs: False)
     monkeypatch.setattr("core.delivery_repair.coordinate_delivery_repair", check_repair)
     monkeypatch.setattr("sikula_cli.delivery._run_next_delivery_unit", run_unit)
@@ -856,7 +864,7 @@ def test_finalize_delivery_run_delegates_preflight_and_current_checks_to_finaliz
         return status
 
     monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", finalize)
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", refreshed)
+    _mock_delivery_status(monkeypatch, refreshed)
 
     result = _finalize_delivery_run(
         _args(),
@@ -895,9 +903,9 @@ def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
     context = SimpleNamespace(verify_plan=verify)
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, cfg: current,
+        lambda current, cfg, **kwargs: current,
     )
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
@@ -955,7 +963,7 @@ def test_finalize_delivery_run_does_not_retry_actionable_verification_failure(
 
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, cfg: current,
+        lambda current, cfg, **kwargs: current,
     )
     result = _finalize_delivery_run(
         _args(),
@@ -986,7 +994,7 @@ def test_finalize_delivery_run_does_not_retry_blocked_config_drift(monkeypatch: 
 
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, cfg: current,
+        lambda current, cfg, **kwargs: current,
     )
     result = _finalize_delivery_run(
         _args(),
@@ -1023,9 +1031,9 @@ def test_finalize_delivery_run_retries_technical_verification_failure(
 
     monkeypatch.setattr(
         "core.delivery_verification.with_delivery_verification_readiness",
-        lambda current, cfg: current,
+        lambda current, cfg, **kwargs: current,
     )
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
@@ -1077,7 +1085,7 @@ def test_finalize_delivery_run_reverifies_projected_stale_record(
         return SimpleNamespace(succeeded=True, stop_code=None, errors=[], warnings=[])
 
     monkeypatch.setattr("core.delivery_verification.with_delivery_verification_readiness", project)
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
     monkeypatch.setattr(
         "core.delivery_finalize.finalize_delivery_plan",
         lambda *args, **kwargs: SimpleNamespace(
@@ -1121,7 +1129,7 @@ def test_finalize_delivery_run_stops_on_blocked_preflight(monkeypatch: pytest.Mo
         message="Finalization preflight is blocked.",
     )
     monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", lambda *args, **kwargs: blocked)
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
 
     result = _finalize_delivery_run(
         _args(),
@@ -1156,7 +1164,7 @@ def test_finalize_delivery_run_projects_mutating_result(
     )
     updated_status = _status(["done"], final_commit="b" * 40) if finalized else status
     monkeypatch.setattr("core.delivery_finalize.finalize_delivery_plan", lambda *args, **kwargs: final_result)
-    monkeypatch.setattr("core.delivery_progress.get_delivery_status", lambda *args, **kwargs: updated_status)
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: updated_status)
 
     result = _finalize_delivery_run(
         _args(),
