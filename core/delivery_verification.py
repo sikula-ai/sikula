@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code
+from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code, EvidenceResolver
 from core.delivery_authority import verification_authority_fragments
 from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
@@ -535,13 +535,15 @@ def get_delivery_verification_status(
 def with_delivery_verification_readiness(
     status: DeliveryStatusResult,
     project_config: dict[str, Any],
+    *,
+    resolver: EvidenceResolver | None = None,
 ) -> DeliveryStatusResult:
     if not status.valid:
         return status
     if status.plan and getattr(status.plan, "checkpoints", ()):
         from core.delivery_checkpoints import checkpoint_boundary_issue, with_checkpoint_barriers
 
-        status = with_checkpoint_barriers(status, project_config)
+        status = with_checkpoint_barriers(status, project_config, resolver=resolver)
         if not status.valid or checkpoint_boundary_issue(status) is not None:
             return status
     readiness = check_delivery_verification_readiness(status, project_config)

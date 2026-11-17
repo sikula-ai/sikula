@@ -54,6 +54,7 @@ from sikula_cli.agent_overrides import (
 from sikula_cli.config import _resolve_contract_report_dir, _resolve_state_dir
 
 if TYPE_CHECKING:
+    from core.delivery_progress import DeliveryStatusResult
     from core.delivery_run_next import DeliveryBudgetSplitPreparationResult, DeliveryRunNextExecutionResult
 
 _DELIVERY_PLAN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -2321,6 +2322,24 @@ def _validate_delivery_run_agent_overrides(args: argparse.Namespace) -> None:
     )
 
 
+def _delivery_run_readiness(
+    status: DeliveryStatusResult, cfg: dict[str, Any]
+) -> tuple[DeliveryStatusResult, str | None]:
+    """Project readiness and select work in one read phase, never grant admission.
+
+    Only immutable evidence reads are shared. Selection rechecks handoffs, and
+    the resolver closes before recovery, provider work or finalization starts.
+    """
+    from core.delivery_checkpoints import due_delivery_checkpoint
+    from core.delivery_evidence_resolution import EvidenceResolver
+    from core.delivery_verification import with_delivery_verification_readiness
+
+    with EvidenceResolver() as resolver:
+        status = with_delivery_verification_readiness(status, cfg, resolver=resolver)
+        checkpoint_id = due_delivery_checkpoint(status, cfg, resolver=resolver)
+    return status, checkpoint_id
+
+
 def _preview_delivery_run(
     args: argparse.Namespace,
     cfg: dict,
@@ -2329,7 +2348,7 @@ def _preview_delivery_run(
     project_root: Path | None,
 ):
     from core.delivery_finalize import preview_delivery_assembly_issue, preview_delivery_finalize
-    from core.delivery_progress import get_delivery_status
+    from core.delivery_progress import _read_delivery_status
     from core.delivery_repair import coordinate_delivery_repair, delivery_repair_pending
     from core.delivery_run import (
         DELIVERY_RUN_BLOCKED,
@@ -2341,14 +2360,19 @@ def _preview_delivery_run(
 
     from core.delivery_checkpoints import reconcile_checkpoint_assembly
 
-    status = reconcile_checkpoint_assembly(get_delivery_status(args.plan_file, project_root=project_root))
-    status = with_delivery_verification_readiness(status, cfg)
+    status = reconcile_checkpoint_assembly(_read_delivery_status(args.plan_file, project_root=project_root))
     max_units = _delivery_run_unit_limit(args, status)
-    from core.delivery_checkpoints import checkpoint_preflight_issue, due_delivery_checkpoint, verification_node_status
+    from core.delivery_checkpoints import checkpoint_preflight_issue, verification_node_status
 
     try:
-        checkpoint_id = due_delivery_checkpoint(status, cfg)
+        status, checkpoint_id = _delivery_run_readiness(status, cfg)
     except (OSError, RuntimeError, ValueError) as exc:
+        if status.plan and getattr(status.plan, "checkpoints", ()):
+            status = replace(
+                status,
+                checkpoint_handoffs=frozenset(),
+                checkpoint_candidate_evidence={node.id: "unavailable" for node in status.plan.checkpoints},
+            )
         issue = DeliveryPlanIssue(
             "error",
             evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
@@ -2569,7 +2593,7 @@ def _run_delivery_plan(
     project_root: Path | None,
 ):
     from core.delivery_plan import DeliveryPlanIssue
-    from core.delivery_progress import get_delivery_status
+    from core.delivery_progress import _read_delivery_status, get_delivery_status
     from core.delivery_repair import coordinate_delivery_repair, pending_delivery_repair_node
     from core.delivery_checkpoints import (
         checkpoint_preflight_issue,
@@ -2593,7 +2617,8 @@ def _run_delivery_plan(
     if not plan_path.is_absolute():
         plan_path = Path.cwd() / plan_path
     args.plan_file = str(plan_path.resolve())
-    status = get_delivery_status(args.plan_file, project_root=project_root)
+    # The invocation bound needs unit identities, not a scheduling projection.
+    status = _read_delivery_status(args.plan_file, project_root=project_root)
     max_units = _delivery_run_unit_limit(args, status)
     initial_unit_ids = frozenset(unit.id for unit in status.units if unit.status not in {"done", "superseded"})
     max_elapsed_minutes = getattr(args, "max_elapsed_minutes", None)
@@ -2608,14 +2633,20 @@ def _run_delivery_plan(
 
     while True:
         status = reconcile_checkpoint_assembly(
-            get_delivery_status(args.plan_file, project_root=project_root), persist=True
+            _read_delivery_status(args.plan_file, project_root=project_root), persist=True
         )
-        if getattr(status.plan, "checkpoints", ()):
-            status = with_delivery_verification_readiness(status, cfg)
-        pending_repair = pending_delivery_repair_node(status)
         try:
-            checkpoint_id = due_delivery_checkpoint(status, cfg)
+            if getattr(status.plan, "checkpoints", ()):
+                status, checkpoint_id = _delivery_run_readiness(status, cfg)
+            else:
+                checkpoint_id = due_delivery_checkpoint(status, cfg)
         except (OSError, RuntimeError, ValueError) as exc:
+            if status.plan and getattr(status.plan, "checkpoints", ()):
+                status = replace(
+                    status,
+                    checkpoint_handoffs=frozenset(),
+                    checkpoint_candidate_evidence={node.id: "unavailable" for node in status.plan.checkpoints},
+                )
             issue = DeliveryPlanIssue(
                 "error",
                 evidence_failure_code(exc, "delivery_checkpoint.evidence_unavailable"),
@@ -2634,6 +2665,7 @@ def _run_delivery_plan(
                 errors=[issue],
                 message=issue.message,
             )
+        pending_repair = pending_delivery_repair_node(status)
         if checkpoint_id is not None and repair_requested is None and pending_repair is None:
             node = with_delivery_verification_readiness(verification_node_status(status, checkpoint_id), cfg)
             checkpoint_issue = checkpoint_preflight_issue(node, cfg, context.state_store if context else None)
@@ -2867,7 +2899,8 @@ def _run_delivery_plan(
             )
         reset_failed_pending = False
 
-        updated_status = get_delivery_status(args.plan_file, project_root=project_root)
+        # Compare durable progress only; the next loop projects fresh readiness.
+        updated_status = _read_delivery_status(args.plan_file, project_root=project_root)
         if updated_status.status != "done" and _delivery_run_status_signature(updated_status) == before:
             issue = DeliveryPlanIssue(
                 "error",
@@ -2875,7 +2908,7 @@ def _run_delivery_plan(
                 "Delivery run-next reported success without changing durable delivery progress.",
             )
             return _delivery_run_result(
-                status=updated_status,
+                status=get_delivery_status(args.plan_file, project_root=project_root),
                 max_units=max_units,
                 max_elapsed_minutes=max_elapsed_minutes,
                 started=True,
