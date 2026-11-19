@@ -158,6 +158,42 @@ def test_tree_prepares_checked_plan_and_reuses_all_accepted_work(setup):
     assert len(plan["checkpoint_authority"]) == 6
 
 
+@pytest.mark.parametrize("case", ["total_limit", "total_overflow", "local_overflow"])
+def test_hierarchy_enforces_separate_local_and_total_outcome_limits(setup, case):
+    def many_outcomes(stage, packet):
+        if stage != "author":
+            return None
+        data = proposal(
+            packet["node_id"], [f["id"] for f in packet["source_fragments"]], branch=packet["node_id"] == "root"
+        )
+        example = data["obligations"][0]
+        local_count = 257 if case == "local_overflow" else 171
+        if case == "total_limit" and packet["node_id"] == "root":
+            local_count -= 1
+        data["obligations"] = [{**example, "id": f"outcome-{i}"} for i in range(local_count)]
+        for record in data["source_accounting"]:
+            record["obligation_ids"] = [item["id"] for item in data["obligations"]]
+        return json.dumps(data)
+
+    llm = TreeLLM(depth=1, hook=many_outcomes)
+    if case == "total_limit":
+        draft = prepare(setup, llm)
+        assert len(draft.obligations) == 512
+        before = len(llm.calls)
+        assert prepare(setup, llm) == draft and len(llm.calls) == before
+        return
+    with pytest.raises(DeliveryAuthoringParseError) as caught:
+        prepare(setup, llm)
+    assert caught.value.code == (
+        "delivery_prepare.hierarchy_required" if case == "total_overflow" else "delivery_authoring.obligations_too_many"
+    )
+    assert sum(stage == "author" for stage, _ in llm.calls) == (3 if case == "total_overflow" else 1)
+    before = len(llm.calls)
+    with pytest.raises(DeliveryAuthoringParseError):
+        prepare(setup, llm)
+    assert len(llm.calls) == before
+
+
 def test_short_prompt_references_preserve_exact_published_source_authority(setup):
     from core.delivery_obligations import delivery_authority_fragment_map
 

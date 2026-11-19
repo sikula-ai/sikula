@@ -248,6 +248,22 @@ def test_capacity_oracle_cannot_reuse_sizing_for_another_candidate(parent_route,
     assert not fake.calls
 
 
+@pytest.mark.parametrize("strict,oversized", [(False, False), (True, False), (False, True)])
+def test_capacity_fallback_requires_bounds_and_preserves_strict_mode(parent_route, strict, oversized):
+    from hashlib import sha256
+
+    fake, render, _ = _measure_parent_route(parent_route, "semantic", oversized=oversized)
+    prompt = render(compact=False)
+    fake.review_routes[sha256(prompt.encode()).hexdigest()]["reserved_fallback"] = True
+    fake.require_compact_parents = strict
+    if strict or oversized:
+        with pytest.raises(AssertionError, match="compact authority|prompt exceeded"):
+            fake.run_readonly_agent(prompt, fake.root)
+    else:
+        assert json.loads(fake.run_readonly_agent(prompt, fake.root))["disposition"] == "approved"
+        assert fake.calls[-1]["reserved_fallback"]
+
+
 def test_compact_parent_mode_rejects_other_scenarios_before_creating_fixture(tmp_path):
     root = tmp_path / "fixture"
     with pytest.raises(ValueError, match="local-repair"):

@@ -29,6 +29,7 @@ from core.delivery_plan import (
 from core.delivery_obligations import (
     MAX_DELIVERY_AUTHORITY_FRAGMENTS,
     MAX_DELIVERY_OBLIGATIONS,
+    MAX_DELIVERY_LOCAL_OBLIGATIONS,
     MAX_DELIVERY_OBLIGATION_SOURCE_REFS,
     MAX_DELIVERY_OBLIGATION_UNIT_IDS,
     delivery_authority_fragment_map,
@@ -573,7 +574,14 @@ def parse_delivery_authoring_output(
     source_task_description: str | None = None,
     require_obligations: bool = False,
     require_source_accounting: bool = False,
+    assembled_hierarchy: bool = False,
 ) -> DeliveryAuthoringDraft:
+    """Parse one provider draft, or the host assembly of independently checked nodes.
+
+    Only assemble_preparation selects assembled_hierarchy. It changes the total
+    cardinality bound, not identity, provenance, ownership or receipt validation.
+    Provider JSON cannot select this mode.
+    """
     root = _resolve_project_root(project_root)
     selected_plan_id = _expected_plan_id(expected_plan_id, output_dir=output_dir, project_root=root)
     data = _parse_output_object(output, schema_keys=_AUTHORING_SCHEMA_KEYS)
@@ -608,6 +616,7 @@ def parse_delivery_authoring_output(
             unit_ids={unit.id for unit in units},
             source_task_description=source_task_description,
             required=require_obligations,
+            max_obligations=MAX_DELIVERY_OBLIGATIONS if assembled_hierarchy else MAX_DELIVERY_LOCAL_OBLIGATIONS,
         )
     )
 
@@ -1038,7 +1047,7 @@ def parse_delivery_amendment_authoring_output(
 
 
 def parse_obligation_assignments(value: Any, unit_ids: set[str]) -> dict[str, list[str]]:
-    if not isinstance(value, dict) or len(value) > MAX_DELIVERY_OBLIGATIONS:
+    if not isinstance(value, dict) or len(value) > MAX_DELIVERY_LOCAL_OBLIGATIONS:
         raise DeliveryAuthoringParseError(
             "delivery_amend.obligation_assignments_invalid", "Obligation assignments must be a bounded mapping."
         )
@@ -1397,6 +1406,7 @@ def _parse_obligations(
     required: bool,
     known_source_fragment_ids: set[str] | None = None,
     protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
+    max_obligations: int = MAX_DELIVERY_LOCAL_OBLIGATIONS,
 ) -> list[DeliveryAuthoringObligationDraft]:
     if value is None and not required:
         return []
@@ -1407,7 +1417,7 @@ def _parse_obligations(
         )
     if not value:
         return []
-    if len(value) > MAX_DELIVERY_OBLIGATIONS:
+    if len(value) > max_obligations:
         raise DeliveryAuthoringParseError(
             "delivery_authoring.obligations_too_many",
             "obligations contains too many source outcomes.",
@@ -1627,7 +1637,7 @@ def _parse_obligation_gaps(
     known_source_fragment_ids: set[str] | None = None,
     protocol_errors: list[DeliveryAuthoringProtocolError] | None = None,
 ) -> list[DeliveryObligationGap]:
-    if not isinstance(value, list) or len(value) > MAX_DELIVERY_OBLIGATIONS:
+    if not isinstance(value, list) or len(value) > MAX_DELIVERY_LOCAL_OBLIGATIONS:
         raise DeliveryAuthoringParseError(
             "delivery_obligation_verification.gaps_invalid",
             "obligation_gaps must be a bounded list.",

@@ -130,6 +130,61 @@ def test_completed_run_avoids_preliminary_whole_plan_projections(checkpoint_plan
     ) as checks:
         result = _run_delivery_plan(_args(path), cfg, _context(path.parent), project_root=path.parent)
     assert result.finalized and result.units_attempted == 0
-    # Previously eight full traversals even though the finalized plan was unchanged.
-    assert checks.call_count <= 5
+    # Readiness, fresh selection, finalizer admission and public result projection.
+    # Finalizer routing must not add a fifth hierarchy projection.
+    assert checks.call_count <= 4
     assert result.to_dict()["checkpoints"][0]["status"] == "accepted_handoff"
+
+
+@pytest.mark.parametrize("change", ["branch", "evidence", "security_stop"])
+def test_finalizer_rechecks_authority_after_coordinator_readiness(checkpoint_plan, monkeypatch, change):
+    from core.delivery_progress import read_delivery_progress, write_delivery_progress
+    from sikula_cli import delivery
+
+    path, cfg = checkpoint_plan
+    assert _verify_node(path, cfg)[0].succeeded
+    _complete(path, "consumer")
+    assert _verify_node(path, cfg, node_id="root")[0].succeeded
+    assert finalize_delivery_plan(path, project_root=path.parent, project_config=cfg).finalized
+    original = delivery._finalize_delivery_run
+    reached = []
+
+    def finalize(*args, **kwargs):
+        assert kwargs["readiness_checked"]
+        status = kwargs["status"]
+        assert status.verification_status == "passed"
+        reached.append(True)
+        progress_path = delivery_progress_path(path.parent, status.plan.plan_id)
+        if change == "branch":
+            _git(path.parent, "update-ref", f"refs/heads/{status.plan.final_branch}", status.assembled_commit + "^")
+        elif change == "evidence":
+            evidence = checkpoint_evidence_path(progress_path.parent, status.checkpoint_verifications["storage"])
+            evidence.write_bytes(b"{")
+        else:
+            progress, errors = read_delivery_progress(progress_path, plan_id=status.plan.plan_id)
+            assert progress is not None and not errors
+            write_delivery_progress(
+                progress_path,
+                replace(
+                    progress,
+                    checkpoint_verifications={
+                        **progress.checkpoint_verifications,
+                        "storage": replace(
+                            progress.checkpoint_verifications["storage"],
+                            status="blocked",
+                            security_status="rejected",
+                            stop_code="delivery_verification.security_rejected",
+                        ),
+                    },
+                ),
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(delivery, "_finalize_delivery_run", finalize)
+    result = _run_delivery_plan(_args(path), cfg, _context(path.parent), project_root=path.parent)
+    assert reached == [True]
+    assert not result.finalized and not result.succeeded and result.units_attempted == 0
+    assert result.stop_code == "delivery.run.finalize_failed"
+    assert result.errors
+    if change == "security_stop":
+        assert "delivery_verification.security_rejected" in {issue.code for issue in result.errors}

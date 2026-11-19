@@ -2635,9 +2635,11 @@ def _run_delivery_plan(
         status = reconcile_checkpoint_assembly(
             _read_delivery_status(args.plan_file, project_root=project_root), persist=True
         )
+        readiness_status = None
         try:
             if getattr(status.plan, "checkpoints", ()):
                 status, checkpoint_id = _delivery_run_readiness(status, cfg)
+                readiness_status = status
             else:
                 checkpoint_id = due_delivery_checkpoint(status, cfg)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -2718,6 +2720,9 @@ def _run_delivery_plan(
                     message=checkpoint_issue.message,
                 )
         if repair_requested is not None or pending_repair is not None:
+            # Recovery can publish new authority. Never reuse its earlier routing
+            # projection, even if a caller returns the same status object.
+            readiness_status = None
             stop_code = None
             if units_succeeded >= max_units:
                 stop_code = DELIVERY_RUN_UNIT_LIMIT_REACHED
@@ -2798,6 +2803,7 @@ def _run_delivery_plan(
                 cfg=cfg,
                 context=context,
                 status=status,
+                readiness_checked=status is readiness_status,
                 project_root=project_root,
                 max_units=max_units,
                 max_elapsed_minutes=max_elapsed_minutes,
@@ -2937,13 +2943,17 @@ def _finalize_delivery_run(
     child_task_id: str | None,
     cfg: dict | None = None,
     context: DeliveryRunNextContext | None = None,
+    readiness_checked: bool = False,
 ):
     from core.delivery_finalize import finalize_delivery_plan
     from core.delivery_progress import get_delivery_status
     from core.delivery_run import DELIVERY_RUN_COMPLETED, DELIVERY_RUN_FINALIZE_FAILED
     from core.delivery_verification import with_delivery_verification_readiness
 
-    if status.plan and getattr(status.plan, "requires_final_verification", False):
+    # The coordinator may already have projected this exact status in its current
+    # read phase. This only selects verification vs finalization; both operations
+    # retain their own fresh admission checks, with no resolver carried over.
+    if not readiness_checked and status.plan and getattr(status.plan, "requires_final_verification", False):
         status = with_delivery_verification_readiness(status, cfg or {})
 
     if (

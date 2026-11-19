@@ -17,6 +17,7 @@ from core.delivery_verification_scope import DeliveryVerificationScope
 
 
 if TYPE_CHECKING:
+    from core.delivery_plan import DeliveryPlan
     from core.delivery_verification import DeliveryVerificationSnapshot
     from core.delivery_verification_review import DeliveryIntegrationAssessment
     from core.delivery_composition import CompositionResult
@@ -33,6 +34,37 @@ class CandidateReviewBoundsError(ValueError):
 
 def new_reverification() -> dict[str, Any]:
     return {"children": {}, "reassessments": {}, "fallbacks": {}}
+
+
+def full_review_child_request(
+    scope: DeliveryCompositionScope | None, assessment: DeliveryIntegrationAssessment, plan: DeliveryPlan
+) -> str | None:
+    """A complete rejection may request confirmation, never delegate repair authority."""
+    if (
+        scope is None
+        or not scope.retained_authority_json
+        or assessment.disposition != "repair_required"
+        or not assessment.findings
+        or len(assessment.obligation_results) != len(scope.parent.obligation_ids)
+        or {item.id for item in assessment.obligation_results} != set(scope.parent.obligation_ids)
+    ):
+        return None
+    gaps = {item.id for item in assessment.obligation_results if item.outcome != "satisfied"}
+    if not gaps or any(
+        not finding.obligation_ids or not set(finding.obligation_ids) <= gaps for finding in assessment.findings
+    ):
+        return None
+    owners = {key for item in plan.obligations if item.id in gaps for key in item.unit_ids}
+    finding_units = {key for finding in assessment.findings for key in finding.unit_ids}
+    matches = [
+        child.node_id
+        for child in scope.children
+        if child.node_id in plan.verified_checkpoint_authority
+        and gaps <= set(child.obligation_ids)
+        and owners
+        and (owners | finding_units) <= set(child.unit_ids)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def parse_reverification(value: Any, parent: dict[str, Any]) -> dict[str, Any]:
@@ -365,6 +397,18 @@ def semantic_fallback_covers_gaps(
 
 
 @evidence_operation
+def semantic_fallback_can_resume(
+    status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
+) -> bool:
+    # A rejection remains binding after child confirmation. Only approval needs
+    # to postdate every child gap; reusing a negative result cannot approve work.
+    payload = _full_result_payload(status, record, "semantic", resolver=resolver)
+    return set(semantic_gap_ids(record)).issubset(payload["semantic_gaps"]) or (
+        isinstance(payload["assessment"], dict) and payload["assessment"].get("disposition") == "repair_required"
+    )
+
+
+@evidence_operation
 def reverification_budget_exhausted(
     status: DeliveryStatusResult, record: DeliveryVerificationRecord, *, resolver: EvidenceResolver | None = None
 ) -> bool:
@@ -385,7 +429,7 @@ def reverification_budget_exhausted(
             or (
                 "semantic" in fallbacks
                 and record.stop_code != "delivery_verification.candidate_repair_required"
-                and not semantic_fallback_covers_gaps(status, record, resolver=resolver)
+                and not semantic_fallback_can_resume(status, record, resolver=resolver)
             )
             or any(
                 reverification_budget_exhausted(
@@ -540,6 +584,21 @@ def run_node_composition_cycle(
     calls. This coordinator neither allocates new budgets nor admits children.
     """
     if role == "semantic" and semantic_gap_ids(running):
+        # A descendant may have completed its rejection just before interruption,
+        # while its composing parent still needs to publish the repair handoff.
+        # Finish those existing reservations before widening to full fallback.
+        if scope is not None:
+            pending = [
+                node_id
+                for node_id in semantic_gap_ids(running)
+                if running.reverification["children"][node_id]["verification"]["status"] == "running"
+            ]
+            if pending:
+                validate(running)
+            for node_id in pending:
+                scope.child(node_id)
+            for node_id in pending:
+                running, _ = review_child(running, node_id)
         return None, running
     if refresh is not None and scope is not None:
         running, nodes = refresh(running)

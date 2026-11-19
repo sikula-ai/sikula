@@ -95,7 +95,10 @@ def review_route(
 ) -> DeliveryReviewRoute:
     """Size complete protocols for one role, including rules and correction."""
     from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgent
-    from core.delivery_verification import delivery_verification_prompt_is_bounded
+    from core.delivery_verification import (
+        delivery_verification_prompt_is_bounded,
+        delivery_verification_context_is_bounded,
+    )
     from core.delivery_verification_validation import preview_delivery_validation_summary
 
     reviewer = reviewer or DeliveryIntegrationReviewAgent(None, cfg)
@@ -114,7 +117,8 @@ def review_route(
         candidate_tree="0" * 64,
         known_obligation_ids=set(scope.obligation_ids) if role == "semantic" else set(),
     )
-    full = reviewer._prompt(plan_context=scope.plan_context(), **args) + " " * REVIEW_CORRECTION_HEADROOM
+    full_context = scope.plan_context()
+    full = reviewer._prompt(plan_context=full_context, **args) + " " * REVIEW_CORRECTION_HEADROOM
     compact = (
         reviewer._prompt(plan_context=context, **args) + " " * REVIEW_CORRECTION_HEADROOM
         if context is not None
@@ -122,12 +126,15 @@ def review_route(
     )
     full_bytes = len(full.encode("utf-8"))
     compact_bytes = len(compact.encode("utf-8")) if compact is not None else None
-    full_available = delivery_verification_prompt_is_bounded(full)
+    full_available = delivery_verification_context_is_bounded(full_context) and delivery_verification_prompt_is_bounded(
+        full
+    )
     return DeliveryReviewRoute(
         full_bytes,
         compact_bytes,
         full_available,
         compact is not None
+        and delivery_verification_context_is_bounded(context)
         and delivery_verification_prompt_is_bounded(compact)
         and (full_available or bool(context.get("final_authority")))
         and (not full_available or compact_bytes < full_bytes),

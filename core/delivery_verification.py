@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 
 from core.delivery_evidence_resolution import evidence_failure_message, evidence_failure_code, EvidenceResolver
+from core.delivery_obligations import MAX_DELIVERY_LOCAL_OBLIGATIONS
 from core.delivery_authority import verification_authority_fragments
 from core.delivery_composition_scope import DeliveryCompositionScope, delivery_composition_scope
 from core.delivery_plan import DeliveryPlanCheckResult, DeliveryPlanIssue, is_private_delivery_source_task_path
@@ -472,7 +473,10 @@ def check_delivery_verification_readiness(
 def _conditional_candidate_route_issue(status, cfg, source: str) -> DeliveryPlanIssue | None:
     """Inspect available candidate routes for dry-run without modifying its repository."""
     from agents.delivery_integration_review_agent import DeliveryIntegrationReviewAgentError
+    from core.delivery_checkpoint_evidence import load_checkpoint_evidence
     from core.delivery_checkpoints import verification_scope_complete
+    from core.delivery_progress import delivery_progress_path
+    from core.delivery_repair import candidate_repair_reconciles_checkpoint
     from core.delivery_reverification import CandidateReviewBoundsError, preflight_candidate_tree
     from core.delivery_verification_model import delivery_verification_is_boundary_stop
     from core.worktree import detached_delivery_verification_worktree
@@ -499,10 +503,30 @@ def _conditional_candidate_route_issue(status, cfg, source: str) -> DeliveryPlan
             # Current accepted evidence and recovery have their own validation.
             # A stale ordinary record cannot bypass checks on the new candidate.
             return None
-        with detached_delivery_verification_worktree(
-            Path(status.project_root), status.assembled_commit, preview=True
-        ) as cwd:
-            preflight_candidate_tree(status, cfg, snapshot, cwd, source)
+        pending_admission = False
+        with EvidenceResolver() as resolver:
+            root = Path(status.project_root)
+            directory = delivery_progress_path(root, status.plan.plan_id).parent
+            for child in scope.children:
+                evidence = load_checkpoint_evidence(
+                    root,
+                    directory,
+                    status.checkpoint_verifications[child.node_id],
+                    plan_id=status.plan.plan_id,
+                    node_id=child.node_id,
+                    resolver=resolver,
+                )
+                if not evidence.covers(child):
+                    if not candidate_repair_reconciles_checkpoint(status, child.node_id):
+                        raise ValueError("Composition checkpoint evidence changed.")
+                    pending_admission = True
+            if pending_admission:
+                # Published candidate repairs enlarge checkpoint scopes. Their intact
+                # historical receipts are not current admission: let ordinary barriers
+                # schedule fresh child verification before sizing candidate composition.
+                return None
+            with detached_delivery_verification_worktree(root, status.assembled_commit, preview=True) as cwd:
+                preflight_candidate_tree(status, cfg, snapshot, cwd, source, resolver=resolver)
     except CandidateReviewBoundsError:
         return DeliveryPlanIssue(
             "error",
@@ -824,6 +848,11 @@ def delivery_verification_plan_context(status: DeliveryPlanCheckResult | Deliver
 
 def delivery_verification_prompt_is_bounded(prompt: str) -> bool:
     return len(prompt.encode("utf-8")) <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES
+
+
+def delivery_verification_context_is_bounded(context: dict[str, Any]) -> bool:
+    """Bound direct review work independently of whole-plan persisted coverage."""
+    return len(context.get("obligations", [])) <= MAX_DELIVERY_LOCAL_OBLIGATIONS
 
 
 def _verification_policy_payload_bytes(

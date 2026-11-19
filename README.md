@@ -202,7 +202,10 @@ contract. Repeating the same `delivery prepare` command resumes saved preparatio
 under unchanged inputs and configuration, with finite attempts and terminal stops
 preserved. Private preparation records stay under `.sikula/state/delivery-preparation/`.
 Changed inputs require a new plan ID. The resulting plan uses the usual readiness,
-checkpoint, repair and final-gate flow; current source and plan capacity limits still apply.
+checkpoint, repair and final-gate flow. A checked hierarchy can carry more total
+outcomes than one authoring or review exchange; each exchange remains bounded.
+Current source, plan-size and execution limits still apply, and readiness rejects
+plans without a complete supported verification route.
 Maintainers can exercise this path with the opt-in
 [real-provider preparation smoke](docs/hierarchical-preparation-smoke.md).
 The [deterministic capacity experiment](docs/hierarchical-delivery-capacity.md)
@@ -315,6 +318,9 @@ requirements are fully discharged by a checkpoint and which remain for final int
 With that approval, the final gate uses exact remaining authority, checked child interfaces
 and compact evidence references. Both reviewers independently assess applicability;
 child internals and review history do not accumulate in their prompts.
+A full subgroup review can request verification of a defect wholly delegated to
+one child. A confirmed child finding can use local repair; a child approval cannot
+erase the subgroup's rejection or bypass the final gate.
 `delivery status` distinguishes an accepted historical checkpoint handoff from the
 evidence applicable to the current candidate. Changed code requires fresh
 verification; the final gate establishes that evidence before finalization.

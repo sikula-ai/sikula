@@ -799,6 +799,26 @@ def _execute_gate(
                     semantic_status="blocked",
                 )
             if not semantic.assessment.approved:
+                if semantic.composition is None and running.reverification is not None:
+                    from core.delivery_reverification import full_review_child_request
+
+                    child_id = full_review_child_request(snapshot.composition_scope, semantic.assessment, status.plan)
+                    if child_id is not None:
+                        # The complete negative full result is already durable. A
+                        # child pass cannot replace it; only an independently
+                        # confirmed eligible gap may enter the repair handoff.
+                        running, _ = _reverify_candidate_child(
+                            status=status,
+                            snapshot=snapshot,
+                            running=running,
+                            cfg=project_config,
+                            node_id=child_id,
+                            source_task=source_task,
+                            evidence_path=evidence_path,
+                            state_store=state_store,
+                            semantic_reviewer=semantic_reviewer,
+                            security_reviewer=security_reviewer,
+                        )
                 repair_fingerprint = None
                 if semantic.assessment.disposition == "repair_required" and scope.obligation_ids:
                     from core.delivery_repair_input import store_repair_input
@@ -1312,6 +1332,9 @@ def _composition_review(
 
     role = kwargs.get("review_kind", "semantic")
     scope = kwargs["snapshot"].composition_scope
+    if role in (kwargs["running"].reverification or {}).get("fallbacks", {}):
+        # Resume the consumed full exchange before considering another route.
+        return None, kwargs["running"]
     try:
         return run_node_composition_cycle(
             scope,
@@ -1581,7 +1604,7 @@ def _bounded_full_review(
         load_full_result,
         review_result_path,
         semantic_gap_ids,
-        semantic_fallback_covers_gaps,
+        semantic_fallback_can_resume,
     )
     from core.delivery_repair_storage import write_repair_state
     from core.delivery_review_route import review_route
@@ -1589,7 +1612,7 @@ def _bounded_full_review(
     role = kwargs["kind"]
     fallbacks = (running.reverification or {}).get("fallbacks", {})
     if role in fallbacks:
-        if fallbacks[role] is None or (role == "semantic" and not semantic_fallback_covers_gaps(status, running)):
+        if fallbacks[role] is None or (role == "semantic" and not semantic_fallback_can_resume(status, running)):
             raise DeliveryIntegrationReviewAgentError(
                 "delivery_verification.reverification_budget_exhausted",
                 "The reserved fallback has no accepted result covering current child assessments.",
@@ -1617,7 +1640,11 @@ def _bounded_full_review(
             [],
         )
 
-    if running.reverification is None and snapshot.candidate_route and snapshot.composition_scope is not None:
+    if (
+        running.reverification is None
+        and snapshot.composition_scope is not None
+        and (snapshot.candidate_route or snapshot.composition_scope.retained_authority_json)
+    ):
         from core.delivery_reverification import new_reverification
 
         running = _update_candidate_record(
