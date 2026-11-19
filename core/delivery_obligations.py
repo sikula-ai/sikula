@@ -11,7 +11,10 @@ from core.delivery_public_metadata import project_delivery_public_identity, sani
 
 
 MAX_DELIVERY_AUTHORITY_FRAGMENTS = 512
-MAX_DELIVERY_OBLIGATIONS = 256
+# Persisted whole-plan authority may exceed one provider exchange. Neither this
+# ceiling nor child evidence permits expanding all outcomes into a local prompt.
+MAX_DELIVERY_OBLIGATIONS = 512
+MAX_DELIVERY_LOCAL_OBLIGATIONS = 256
 MAX_DELIVERY_OBLIGATION_SOURCE_REFS = 32
 MAX_DELIVERY_OBLIGATION_UNIT_IDS = 256
 

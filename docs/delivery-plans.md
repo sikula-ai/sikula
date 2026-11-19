@@ -1166,6 +1166,14 @@ acceptance alone does not imply that the final gate passed.
 
 ### Bounded integration repair
 
+If a complete full subgroup review finds defects wholly assigned to one immediate
+child with independently checked authority, Sikula verifies that child on the same
+candidate. Its own confirmed eligible finding can enter local repair, followed by
+authority renewal and fresh affected ancestor/final-gate checks. The original
+subgroup rejection remains binding if the child approves. Mixed or unattributed
+findings retain the existing bounded fallback or stop. This uses existing durable
+review reservations and repair allowances; interruption does not refill them.
+
 For a source-bound plan with exhaustive source accounting, `delivery run`
 automatically recovers an eligible semantic `repair_required` result by appending
 one repair unit. Every finding must identify current unsatisfied source
@@ -1320,14 +1328,18 @@ delivery:
         command: python3 -m pytest tests/integration -q
 ```
 
-The first implementation supports one bounded final authority packet: source
-task, rendered plan context, active-unit count, validation and final-check policy,
-applicable reviewer rules, security context, and protocol overhead have
-conservative limits. The exact rendered prompt is checked again before each
-provider call. Exceeding a limit fails with
-`delivery_verification.hierarchy_required`; content is not truncated. Flat checkpoints are scheduled automatically, but
-recursive
-verification and large-plan scaling remain later work. This first milestone requires `sandbox.allowed_read_paths` to include `.`;
+Verification bounds each local authority packet: source task, rendered plan
+context, direct obligations, validation and final-check policy, applicable reviewer
+rules, security context, and protocol overhead. Independently checked hierarchy
+composition can cover a larger total outcome set through child evidence without
+expanding those outcomes into the parent prompt. Flat authoring and individual
+reviews retain their local limits. Plan loading and readiness still enforce total
+capacity, source size, plan size and active-unit limits; a valid plan file alone
+does not establish a supported execution route.
+The local outcome count and exact rendered prompt are checked again before each
+provider call. Missing a complete bounded route for either required role fails with
+`delivery_verification.hierarchy_required`; content is not truncated and oversized
+full review is not an available fallback. Verification requires `sandbox.allowed_read_paths` to include `.`;
 narrower read scopes fail readiness because the autonomous provider boundary cannot
 enforce them consistently across providers. The packet shows the enabled validation
 phases and effective commands behind the reported results. Repeating verification

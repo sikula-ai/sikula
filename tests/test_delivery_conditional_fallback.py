@@ -240,7 +240,10 @@ def test_runtime_packet_sizing_uses_only_scoped_validation_policy(node_input, mo
         monkeypatch.setattr(delivery_verify, "_run_review", review)
         args = dict(
             status=None,
-            snapshot=snapshot,
+            # This branch isolates full-packet sizing, without a persisted
+            # composition attempt. Durable full-review recovery has its own
+            # real-state coverage in test_delivery_full_review_recovery.
+            snapshot=replace(snapshot, composition_scope=None),
             running=replace(running, reverification=None),
             project_config=cfg,
             worktree=root,

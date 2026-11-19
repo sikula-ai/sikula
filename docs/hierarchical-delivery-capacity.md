@@ -20,6 +20,11 @@ TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 2 --fanout 1 --
 # Cheap preparation-only growth measurements; this does not execute any units.
 TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 1 2 3 4 --prepare-only
 
+# Detailed binary hierarchy: 31 units and 372 outcomes, exceeding one local review.
+TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 4 --fanout 2 --scenario local-repair --prepare-only
+# Opt-in full repair/renewal/finalization acceptance; can take substantially longer.
+TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 4 --fanout 2 --scenario local-repair
+
 # Explore a wider graph and record the first actual production limit.
 TMPDIR=/tmp .venv/bin/python -m tests.delivery_capacity --depths 2 3 4 --fanout 4 --prepare-only
 
@@ -54,11 +59,16 @@ The `local-repair` scenario additionally requires repair at the affected leaf,
 independent authority renewal at every affected level, fresh semantic and security
 review, unchanged original units/contracts, and unchanged unrelated checkpoint
 authority and admission. Each parent review must match an observed runtime sizing
-decision for its exact prompt. A small full parent review is allowed only when its
-complete protocol fits and is no larger than the measured composition alternative.
+decision for its exact prompt. A full parent review must fit the complete protocol
+bound. Initial selection also requires it to be no larger than the measured composition
+alternative; a later fallback instead requires an observed durable reservation and
+unresolved composition or child work.
 Composition must remain bounded, smaller than full review, and limited to direct work
 and immediate children. This accommodates a changing delta making full review cheaper
 for a small group without allowing an unexpected unmeasured fallback.
+One defect can produce several confirming negative assessments before its single
+eligible leaf repair. Acceptance counts the repair and preserved original work,
+rather than requiring exactly one negative assessment.
 
 `--require-compact-parents` adds a separate acceptance condition to `local-repair`:
 even a legitimate smaller full parent review fails that experiment. It does not force
@@ -88,7 +98,9 @@ codes, prompt/response bytes by stage/node, implementation counts, evidence read
 and charged materialization, source/plan/artifact sizes, and optional Python peak
 memory. These are instrumentation measurements, not token or financial estimates.
 In `local-repair`, parent review records include `review_route`, `full_packet_bytes` and
-`composition_packet_bytes`; sizes include protocol correction headroom. Reports
+`composition_packet_bytes`; sizes include protocol correction headroom. Full exchanges
+also record `reserved_fallback` when the observer checks their durable reservation
+and whether unresolved work justifies fallback rather than initial cost selection. Reports
 count `full_parent_reviews` separately and distinguish `local_repair_lifecycle_verified`
 from `compact_parent_lifecycle_verified`. The latter requires a completed verified
 lifecycle with no full parent reviews, rather than preparation alone.

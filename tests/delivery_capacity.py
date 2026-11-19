@@ -4,8 +4,9 @@ Run with ``python -m tests.delivery_capacity --depths 1 2 3``. Nothing is
 created in the operator checkout; each case uses a fresh temporary repository.
 Use ``--depths 2 --fanout 1 --scenario local-repair`` to check recursive leaf
 repair and independent authority renewal at every affected level.
-A smaller bounded full parent review is permitted only with
-measured routing evidence. Add ``--require-compact-parents`` to require compact
+A bounded full parent review requires measured routing evidence: either it is
+smaller or an unresolved review has durably reserved its fallback.
+Add ``--require-compact-parents`` to require compact
 parent reviews throughout, without changing production routing or limits.
 Use ``--fanout 2`` for branching recovery, including preservation of unrelated
 checkpoint admission/authority and fresh final applicability of both branches.
@@ -171,9 +172,9 @@ class CapacityLLM(FakeLLMClient):
             )
         else:
             assert not self.require_compact_parents, "Parent review must use compact authority"
-            assert full <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES and full <= compact, (
-                "Full parent review must be bounded and no larger than composition"
-            )
+            assert full <= MAX_DELIVERY_VERIFICATION_PACKET_BYTES and (
+                full <= compact or route.get("reserved_fallback", False)
+            ), "Full parent review must be bounded and no larger than composition"
         return route
 
     def record(self, stage: str, node: str, prompt: str, output: str = "") -> str:
@@ -407,7 +408,12 @@ class CapacityLLM(FakeLLMClient):
 def observe_review_routes(fake: CapacityLLM):
     """Observe runtime sizing without replacing its decision or adding Git reads."""
     from core.delivery_review_route import review_route
-    from core.delivery_verify import _composition_packet_fits
+    from core.delivery_verify import (
+        _composition_packet_fits,
+        _bounded_full_review,
+        _run_review,
+        _current_candidate_record,
+    )
 
     def measured(context, snapshot, reviewer, worktree, source_task, validation, cfg, role):
         captured = []
@@ -443,7 +449,48 @@ def observe_review_routes(fake: CapacityLLM):
             }
         return result
 
-    with patch("core.delivery_verify._composition_packet_fits", new=measured):
+    def full_review(reviewer, **kwargs):
+        def reserved_exchange(agent, **review):
+            snapshot = kwargs["snapshot"]
+            if snapshot.composition_scope and snapshot.composition_scope.retained_authority_json:
+                current = _current_candidate_record(kwargs["status"], snapshot)
+                control = current.reverification or {}
+                role = review["kind"]
+                assert role in control.get("fallbacks", {}) and control["fallbacks"][role] is None
+                field = (
+                    "composition_evidence_fingerprint"
+                    if role == "semantic"
+                    else "security_composition_evidence_fingerprint"
+                )
+                unresolved = bool(
+                    getattr(current, field) or control.get("children") or control.get("refreshes", {}).get(role)
+                )
+                prompt = agent._prompt(
+                    cwd=review["worktree"],
+                    review_kind=role,
+                    source_task=review["source_task"],
+                    plan_context=review["plan_context"],
+                    validation_summary=review["validation"].to_review_dict(
+                        agent.project_config,
+                        project_root=review["worktree"],
+                        include_final_checks=snapshot.scope.node_id == "root",
+                    ),
+                    candidate_commit=review["identity"].candidate_commit,
+                    candidate_tree=review["identity"].candidate_tree,
+                    known_obligation_ids=review["known_obligation_ids"],
+                )
+                key = sha256(prompt.encode()).hexdigest()
+                if key in fake.review_routes:
+                    fake.review_routes[key]["reserved_fallback"] = unresolved
+            return _run_review(agent, **review)
+
+        with patch("core.delivery_verify._run_review", new=reserved_exchange):
+            return _bounded_full_review(reviewer, **kwargs)
+
+    with (
+        patch("core.delivery_verify._composition_packet_fits", new=measured),
+        patch("core.delivery_verify._bounded_full_review", new=full_review),
+    ):
         yield
 
 
@@ -498,7 +545,7 @@ def assert_local_repair_lifecycle(root: Path, original_plan: dict, fake: Capacit
 
     leaf = fake.order[0]
     chain = [".".join(leaf.split(".")[:level]) for level in range(fake.depth, 0, -1)] + ["root"]
-    assert fake.interrupted and fake.gaps == 1
+    assert fake.interrupted and fake.gaps >= 1
     assert [call["node"] for call in fake.calls if call["stage"] == "authority_renewal"] == chain
     assert len([call for call in fake.calls if call["stage"] == "repair_author"]) == 1
     plan = yaml.safe_load((root / ".sikula/delivery/capacity/plan.yaml").read_text())

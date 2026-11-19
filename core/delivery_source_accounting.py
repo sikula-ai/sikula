@@ -8,7 +8,7 @@ from hashlib import sha256
 import re
 from typing import Any
 
-from core.delivery_obligations import MAX_DELIVERY_AUTHORITY_FRAGMENTS
+from core.delivery_obligations import MAX_DELIVERY_AUTHORITY_FRAGMENTS, MAX_DELIVERY_OBLIGATIONS
 from core.delivery_public_metadata import project_delivery_public_identity
 
 
@@ -117,7 +117,7 @@ def parse_source_accounting(
             raise SourceAccountingError("disposition_invalid", "Source accounting disposition is invalid.")
         if disposition == "unresolved" and not allow_unresolved:
             raise SourceAccountingError("unresolved", "Unresolved source accounting blocks publication.")
-        obligations = _references(item.get("obligation_ids"), set(obligation_sources))
+        obligations = _references(item.get("obligation_ids"), set(obligation_sources), limit=MAX_DELIVERY_OBLIGATIONS)
         constraints = _references(item.get("constraint_ids"), constraint_ids)
         if (disposition == "mapped") != bool(obligations or constraints):
             raise SourceAccountingError(
@@ -202,8 +202,8 @@ def parse_source_accounting(
     return records
 
 
-def _references(value: Any, allowed: set[str]) -> list[str]:
-    if not isinstance(value, list) or len(value) > 256:
+def _references(value: Any, allowed: set[str], *, limit: int = 256) -> list[str]:
+    if not isinstance(value, list) or len(value) > limit:
         raise SourceAccountingError("reference_invalid", "Source accounting references must be bounded lists.")
     if any(not isinstance(item, str) or item not in allowed for item in value) or len(value) != len(set(value)):
         raise SourceAccountingError("reference_invalid", "Source accounting references must be known and unique.")

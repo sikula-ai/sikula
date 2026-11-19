@@ -17,6 +17,7 @@ from core.delivery_verification import (
     delivery_verification_allowed_read_paths,
     delivery_verification_provider_read_scope_supported,
     delivery_verification_prompt_is_bounded,
+    delivery_verification_context_is_bounded,
 )
 from core.llm_client import LLMClient, LLMReadOnlyViolation
 from core.delivery_authority import verification_authority_fragments
@@ -100,7 +101,9 @@ class DeliveryIntegrationReviewAgent:
                     "\n\nYour previous response was rejected as malformed: "
                     f"{format_error}. Return the complete assessment again and finish with the exact JSON object."
                 )
-            if not delivery_verification_prompt_is_bounded(effective_prompt):
+            if not delivery_verification_context_is_bounded(
+                plan_context
+            ) or not delivery_verification_prompt_is_bounded(effective_prompt):
                 raise DeliveryIntegrationReviewAgentError(
                     "delivery_verification.hierarchy_required",
                     "The integration review packet exceeds the bounded final-gate limit.",

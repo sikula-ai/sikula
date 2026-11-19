@@ -520,6 +520,7 @@ def assemble_preparation(
         source_task_description=source,
         require_obligations=True,
         require_source_accounting=True,
+        assembled_hierarchy=True,
     )
     draft.source_task = DeliveryPlanSourceTask(task_path, "sha256:" + sha256(source.encode()).hexdigest())
     binding = preparation_authority_fingerprint(

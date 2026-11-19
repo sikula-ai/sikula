@@ -306,6 +306,46 @@ def test_common_cycle_checks_all_requested_children_before_work(node_input: Node
     review.assert_not_called()
 
 
+@pytest.mark.parametrize("child_status", ["running", "failed"])
+def test_common_cycle_finishes_reserved_gap_handoff_before_fallback(node_input: NodeInput, child_status):
+    snapshot, parent = node_input[3:5]
+    parent = replace(
+        parent,
+        composition_attempted=True,
+        reverification={
+            "children": {
+                "storage": {
+                    "semantic_gap": True,
+                    "verification": {"status": child_status, "semantic_status": "not_run"},
+                }
+            },
+            "reassessments": {},
+            "fallbacks": {},
+        },
+    )
+    validate, exchange, load = Mock(), Mock(), Mock()
+    review = Mock(return_value=(parent, False))
+    result, unchanged = run_node_composition_cycle(
+        snapshot.composition_scope,
+        parent,
+        "semantic",
+        exchange=exchange,
+        validate=validate,
+        load=load,
+        review_child=review,
+        semantic_fallback_covers=Mock(),
+    )
+    assert result is None and unchanged is parent
+    exchange.assert_not_called()
+    load.assert_not_called()
+    if child_status == "running":
+        validate.assert_called_once_with(parent)
+        review.assert_called_once_with(parent, "storage")
+    else:
+        validate.assert_not_called()
+        review.assert_not_called()
+
+
 @pytest.mark.parametrize("child_passes", [False, True])
 def test_parent_gap_rechecks_uncertain_child_before_reassessment(node_input: NodeInput, child_passes: bool) -> None:
     root, _, _, snapshot, parent, _ = node_input

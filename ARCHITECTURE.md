@@ -449,9 +449,13 @@ preempt review and correction, including mixed-error responses. A corrected prop
 must pass all deterministic and independent checks; correction does not add another
 semantic round or refill reservations on resume.
 Fan-in, depth, node and call ceilings are owned by the preparation modules and tested
-there. Existing global source, plan, obligation and active-unit limits remain in force;
-this removes descendant-contract prompt growth within those limits, not all capacity
-limits or the need for later large-source preparation.
+there. Whole-plan obligation capacity is separate from local provider capacity:
+checked hierarchy assembly, plan loading and source-accounting references use the
+total bound, while flat authoring, each local proposal, correction and amendment
+output retain the smaller local bound. Both are owned by `core/delivery_obligations.py`.
+The host never truncates coverage into a usable plan. Existing global source, plan-byte
+and active-unit limits remain in force; this removes descendant-contract prompt growth
+within those limits, not all capacity limits or the need for later large-source preparation.
 
 The authoring schema requires an explicit `constraints` list. Each inherited
 hard constraint has a stable ID, one supported kind, a bounded paraphrased
@@ -1481,6 +1485,11 @@ readiness and checkpoint selection share one short-lived evidence resolver;
 selection still rechecks mutable authority and handoff decisions. Integrity is
 checked before leaving this read phase, and failures preempt provider or child
 work. No resolver survives into recovery, verification admission or finalization.
+When the coordinator reaches finalization with that same status and no intervening
+recovery, it uses the existing readiness projection only to choose verification
+or finalization, without projecting the hierarchy again. Recovery invalidates
+this routing shortcut. Verification and finalization still read and validate
+their own current authority; a projected pass never authorizes publication.
 Finalization's current-result checks load fresh raw authority before their own
 configured handoff validation, including after acquiring the progress lock;
 they do not first compute a public scheduling projection. Public result snapshots
@@ -1825,8 +1834,9 @@ can run full review. Security and read-only boundary stops continue to preempt r
 `core/delivery_reverification.py` owns the bounded private control schema, candidate
 identity, accepted-reference resolution and rendered-packet preflight. The existing
 final-gate coordinator schedules the work; there is no new operator approval step.
-Only compact composition with independently verified final authority can request
-this path. Each `verification_required` decision names a declared checkpoint.
+Compact composition with independently verified authority can request this path;
+a complete negative full review can also request one child under the attribution
+rules below. Each request names a declared immediate child checkpoint.
 The coordinator reviews its original exact authorized scope, current contracts and
 completed execution inputs against the final candidate in a detached read-only
 workspace, with configured validation and both required reviewer roles. Validation
@@ -1880,6 +1890,20 @@ stops preempt further automatic review. After resolving an external prerequisite
 verification can spend the remaining full fallback without reopening the child
 exchange. Security/read-only child boundaries remain durable even
 if auditing fails or assembly advances; they also block after candidate/policy changes.
+
+A complete negative full semantic review at a composing node can also request one
+immediate child's verification. The persisted full assessment must identify all
+scoped outcomes, and every unsatisfied obligation and finding must belong wholly
+to that one child under independently checked delegation, including unit ownership.
+This is a request for fresh verification on the same candidate, not inherited repair
+authority. Only the child's own eligible finding can enter the existing local repair
+handoff, renewal and fresh ancestor verification. A child pass does not cancel the
+parent rejection. Mixed, retained-parent and unattributed gaps keep the existing
+bounded fallback or stop. The request reuses the same candidate reservations and
+full-result storage; resume cannot replace the consumed full exchange with another
+review. A stored rejection remains binding even after additional child gaps, whereas
+a stored approval must cover every later child rejection. Terminal boundaries and
+initiating attempt checks are unchanged.
 
 **Bounded refresh for oversized checkpoint deltas:** for intermediate checkpoints
 and the final gate, a complete metadata inspection may establish that a public
@@ -1980,7 +2004,11 @@ preview restored from independently checked authority; it cannot predict later c
 changes or reviewer outcomes. Leaves and nodes without checked delegation must fit
 full scoped review. Every immediate child and required role must have a bounded
 route; the full source (128 KiB), serialized plan (256 KiB) and active-unit (256)
-guards remain in force.
+guards remain in force. Readiness, fallback selection and the runtime reviewer all
+enforce the local obligation bound as well as rendered prompt bytes for both roles.
+A larger total outcome set requires checked composition with bounded direct work;
+it cannot fall back to a full review that exceeds either bound. Typed evidence still
+requires exact closure over every current outcome, including inherited children.
 
 For completed candidates that need composition, readiness/dry-run inspects actual
 child evidence and deltas in a temporary preview checkout. Execution repeats this
@@ -1988,6 +2016,10 @@ preflight in the candidate workspace before any provider call. Unsupported/priva
 binary or gitlink deltas require full review; missing immutable evidence remains an
 evidence stop. If the required packet cannot fit, `hierarchy_required` blocks work.
 No preview is approval and no evidence is truncated to make a route available.
+After a validated candidate-repair publication enlarges a child scope, readiness
+checks the historical evidence's integrity but defers candidate composition until
+ordinary checkpoint barriers obtain fresh admission. An unreconciled scope change
+or missing/corrupt historical evidence remains blocking.
 
 Eligible child and retained-parent gaps still use scoped repair and independent
 authority renewal. Repair preflight sizes the proposed renewed local packets before

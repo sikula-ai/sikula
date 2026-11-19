@@ -885,9 +885,11 @@ def test_finalize_delivery_run_delegates_preflight_and_current_checks_to_finaliz
     assert seen == ["finalize", "status"]
 
 
+@pytest.mark.parametrize("readiness_checked", [False, True])
 def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
+    readiness_checked: bool,
 ) -> None:
     status = _status(["done"])
     status.plan.requires_final_verification = True
@@ -930,12 +932,41 @@ def test_finalize_delivery_run_verifies_schema_v2_before_finalization(
         units_succeeded=1,
         last_unit=None,
         child_task_id=None,
+        readiness_checked=readiness_checked,
     )
 
     assert "Final gate: passed (" in capsys.readouterr().err
     assert calls == ["verify"]
     assert result.finalized is True
     assert result.succeeded is True
+
+
+def test_coordinator_discards_readiness_after_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = _status(["done"])
+    status.plan.checkpoints = [SimpleNamespace(id="storage")]
+    _mock_delivery_status(monkeypatch, lambda *args, **kwargs: status)
+    monkeypatch.setattr("sikula_cli.delivery._delivery_run_readiness", lambda *args: (status, None))
+    monkeypatch.setattr("core.delivery_checkpoints.reconcile_checkpoint_assembly", lambda current, **kwargs: current)
+    monkeypatch.setattr("core.delivery_repair.pending_delivery_repair_node", lambda current: "storage")
+    recovered = []
+
+    def recover(*args, **kwargs):
+        recovered.append(True)
+        return DeliveryRepairResult(ready=True, unit_id="unit-1")
+
+    monkeypatch.setattr("core.delivery_repair.coordinate_delivery_repair", recover)
+    monkeypatch.setattr("core.delivery_verification.get_delivery_verification_status", lambda *args, **kwargs: status)
+    completed = _run_result(completed=True, finalized=True)
+
+    def finalize(*args, **kwargs):
+        assert recovered == [True]
+        # Even identical status objects cannot carry readiness across recovery.
+        assert kwargs["status"] is status
+        assert not kwargs["readiness_checked"]
+        return completed
+
+    monkeypatch.setattr("sikula_cli.delivery._finalize_delivery_run", finalize)
+    assert _run_delivery_plan(_args(max_units=1), {}, _context(), project_root=Path("/project")) is completed
 
 
 @pytest.mark.parametrize(
