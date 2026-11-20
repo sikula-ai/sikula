@@ -121,3 +121,5 @@ success, expected rejection and completed delivery are separate report outcomes.
 Routine CI runs helper checks and one small repair E2E. Larger growth experiments
 are opt-in; they must not add multi-hour runs to the default suite. Preparation
 success alone does not establish execution capacity for larger deliveries.
+The [recovery acceptance matrix](delivery-autonomy-acceptance.md) covers ordinary
+unit failures, explicit reset and bounded correction separately from capacity.
