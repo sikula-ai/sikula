@@ -1597,6 +1597,8 @@ guidelines:
         assert "scheme" in capsys.readouterr().out
 
     def test_node_package_manager_printed_and_todo_emitted(self, tmp_path: Path, monkeypatch, capsys):
+        import yaml
+
         (tmp_path / ".git").mkdir()
         monkeypatch.chdir(tmp_path)
         scan_result = self._scan_result(
@@ -1613,6 +1615,10 @@ guidelines:
         out = capsys.readouterr().out
         assert "package manager: pnpm" in out
         assert "build.sync_command / compile_command / test_command" in out
+        # Scanned defaults must not become explicit overrides of NodeTool policy.
+        config = yaml.safe_load((tmp_path / ".sikula/config.yaml").read_text())
+        assert "sync_command" not in config["build"]
+        assert config["build"]["package_manager"] == "pnpm"
 
     def test_todos_for_gradle_build_tool(self, tmp_path: Path, monkeypatch, capsys):
         (tmp_path / ".git").mkdir()

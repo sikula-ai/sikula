@@ -42,7 +42,7 @@ If you want help integrating Sikula into your codebase, do not hesitate to reach
 | Python | `python` |
 | Rust / Cargo | `cargo` |
 
-The orchestration loop is platform-neutral. Stack-specific behavior lives in `BuildTool` subclasses under `tools/`.
+The orchestration loop is platform-neutral. Stack-specific behavior lives in `BuildTool` subclasses under `tools/`. When build validation is enabled, changes to build configuration are synchronized before the next enabled review or build, so reviewers see regenerated outputs. See [build sync configuration](docs/configuration.md#build-sync-and-generated-outputs), including custom Gradle lockfile regeneration.
 
 ### LLM Providers
 

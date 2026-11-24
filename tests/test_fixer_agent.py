@@ -617,11 +617,10 @@ class TestFixerAgentFixCycleRecord:
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = state.fix_cycle_records[0]["fixer_prompt"]
 
-        assert "For Cargo/Rust projects" in prompt
-        assert "do not manually synthesize or edit Cargo.lock" in prompt
-        assert "Cargo.toml changes require lockfile updates" in prompt
-        assert "rely on configured" in prompt
-        assert "Cargo sync/build tooling" in prompt
+        assert "Pipeline-owned build outputs" in prompt
+        assert "Do not manually synthesize or edit these generated outputs" in prompt
+        assert "before enabled reviews" in prompt
+        assert "Cargo/Rust projects" not in prompt
 
     def test_prompt_omits_cargo_lockfile_guidance_for_non_cargo_projects(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.agent_result = ["src/Login.kt"]

@@ -91,6 +91,55 @@ Supported run flags:
 | `--build-per-step` / `--no-build-per-step` | `run_build_per_step` |
 | `--checks` / `--no-checks` | `run_checks` |
 
+## Build Sync And Generated Outputs
+
+When an implementation or repair changes build configuration recognized by the active
+build tool, Sikula synchronizes dependencies and generated outputs before the next
+enabled semantic or security review. If both reviews are disabled, sync runs before
+build. `run_build: false` disables automatic sync. `run_build_per_step: false` still
+defers compile/test/check phases until the end; the sync command itself may perform
+compilation. Unrelated source edits do not trigger early sync.
+
+The pipeline owns regeneration; agents change source inputs and reviewers assess the
+adopted outputs. Sync failures use bounded build/fix recovery. Resume retains the
+original output baseline after interruption rather than forgetting partially written
+files. A changed recovery configuration or repository baseline stops recovery safely.
+
+Both Gradle platforms accept `build.sync_command`. It replaces the Android default
+`generateDebugSources --parallel`, or takes precedence over JVM `sync_task` (default
+`classes`). It uses `sync_timeout` and does not alter `presync_task`. For example, a
+project with its own task resolving all locked configurations could configure:
+
+```yaml
+build:
+  sync_command: "./gradlew resolveAndLockAll --update-locks org.example:new-library generateDebugSources --parallel"
+  sync_timeout: 1800
+```
+
+This is a project-specific example: supply tasks that resolve the necessary
+configurations and choose the intended dependency update policy. Sikula does not
+invent a lock-generation task or automatically unlock all dependency versions.
+Custom commands run exactly as configured; use the appropriate shell syntax and
+wrapper name on Windows, such as `gradlew.bat`.
+
+Known tracked sync outputs are adopted into the reviewed changes. Brand-new generated
+files require explicit project-relative `build.sync_adopt_paths`, for example
+`["app/gradle.lockfile"]`. Adoption does not expand the active delivery unit write
+scope. Include required lockfiles in that scope when preparing a delivery plan.
+
+Node defaults also permit lockfile regeneration: `npm install`,
+`pnpm install --no-frozen-lockfile`, `yarn install`, or `bun install`. For default
+Yarn sync only, Sikula sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false` in the child
+environment so CI does not prevent updates. Existing compatible locked resolutions
+remain the package manager's input; Sikula does not delete lockfiles or run an
+unconditional dependency upgrade.
+
+New Node configurations leave `sync_command` unset to use this policy. Explicit
+commands are executed unchanged, including frozen/immutable commands. If an older
+configuration contains `npm ci` or a frozen install, remove that override to use
+the default, or supply a regeneration command appropriate for the project. A
+custom Yarn command also owns its immutable-install configuration.
+
 ## Per-Agent LLM Overrides
 
 Each agent can use a different provider, model, or timeout. Keep provider-specific setup, YAML examples, CLI override examples, and valid agent names in [Providers](providers.md).

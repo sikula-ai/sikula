@@ -14,8 +14,8 @@ Loop phases:
                         to implementer + review loop; warnings logged, pipeline continues
   4. test write    — (run_test_writing only) TestWriterAgent writes/updates unit tests
   5. build/fix loop (run_build only):
-       sync   — BuildTool.sync(); runs before first build and after any fix
-                that touches a build-config file (detected by BuildTool.is_build_config_file())
+       sync   — BuildTool.sync(); runs before first build, or before enabled reviews
+                after build-config writes (detected by BuildTool.is_build_config_file())
        build  — BuildTool.compile_check()
        test   — BuildTool.run_tests() (run_tests only); runs after a passing build
        checks — BuildTool.run_check() per entry in build.checks (run_checks only); runs after tests
@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import copy
 import fnmatch
+import hashlib
+import json
 import logging
 import os
 import posixpath
@@ -90,8 +92,10 @@ from core.test_execution_gate_audit import (
 from core.validation_artifacts import (
     DeliveryScopeSnapshotError,
     delivery_scope_git_env,
+    deserialize_delivery_scope_snapshot,
     detect_validation_artifacts,
     restore_validation_artifacts,
+    serialize_delivery_scope_snapshot,
     snapshot_validation_dirty_files,
 )
 from core.validation_coverage import INTERNAL_PIPELINE_CONFIG_KEY, validation_coverage_gaps
@@ -356,6 +360,7 @@ class Orchestrator:
         _llm = lambda name: (agent_llms or {}).get(name, llm)  # noqa: E731
 
         self._session_code_changed = False
+        self._mutation_generation = 0
         self._reviewer_ran_this_session = False
         self._delivery_quarantine_tool = DeliveryQuarantineTool(root)
         quarantine_supported = self._delivery_quarantine_tool.supported()
@@ -488,6 +493,18 @@ class Orchestrator:
 
         if self._abort_on_validation_coverage_gaps(state):
             return
+
+        # Finish interrupted tool work before another agent can change its baseline.
+        if state.build_sync_pending is not None:
+            if not self._config.run_build or state.review_mode == "review_report":
+                state.record("orchestrator", "abort", "Pending build sync requires enabled build validation")
+                state.failed = True
+                self._store.save(state)
+                return
+            if not self._sync_before_review(state):
+                return
+        if not state.build_synced and not state.review_mode:
+            self._mark_build_sync_stale_if_needed(state.files_changed, "resumed implementation", state)
 
         # Phase 0: presync — generate sources before analyze (run_presync: true only)
         # Skipped on resume if already attempted. Failure is a warning, not an abort —
@@ -787,6 +804,7 @@ class Orchestrator:
                         len(dirty),
                     )
                     state.files_changed.extend(dirty)
+                    self._mark_build_sync_stale_if_needed(dirty, "adopted implementation", state)
                     self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
@@ -939,7 +957,10 @@ class Orchestrator:
                 "all steps reported already satisfied; continuing to final configured gates",
             )
 
-        if self._config.run_build and (state.fixer_changed_code or _build_loop_active_for_current_scope(state)):
+        if self._config.run_build and (
+            _build_loop_active_for_current_scope(state)
+            or (state.fixer_changed_code and state.active_scope == _SCOPE_FINAL_FULL_TASK)
+        ):
             state.active_scope = _SCOPE_FINAL_FULL_TASK
             self._store.save(state)
             log.info("--- Phase: final build/fix (resume active loop) ---")
@@ -968,16 +989,17 @@ class Orchestrator:
 
     def _run_final_full_task_gate(self, state: TaskState) -> None:
         """Review/security/test the complete planned task before final validation."""
+        starting = state.active_scope != _SCOPE_FINAL_FULL_TASK
         state.active_scope = _SCOPE_FINAL_FULL_TASK
         log.info("--- Phase: final full-task gate ---")
-        if self._config.run_review:
+        if starting and self._config.run_review:
             state.review_approved = False
             state.review_issues.clear()
             state.review_iterations = 0
-        if self._config.run_security_review:
+        if starting and self._config.run_security_review:
             state.security_approved = False
             state.security_review_iterations = 0
-        if self._config.run_test_writing:
+        if starting and self._config.run_test_writing:
             state.tests_up_to_date = False
         self._store.save(state)
 
@@ -1038,6 +1060,7 @@ class Orchestrator:
                     )
                     state.files_changed.extend(dirty)
                     self._record_step_files_changed(state, dirty)
+                    self._mark_build_sync_stale_if_needed(dirty, "adopted implementation", state)
                     self._invalidate_delivery_no_change_outcome(state, dirty, source="adopted implementer output")
                     state.record(
                         "orchestrator", "adopt_worktree_changes", f"{len(dirty)} file(s) adopted from worktree"
@@ -1290,12 +1313,16 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _run_review_loop(self, state: TaskState) -> None:
-        if not self._config.run_review or state.review_approved:
+        if not self._config.run_review:
+            return
+        if not self._sync_before_review(state) or state.review_approved:
             return
         max_fixes = self._config.max_review_iterations
         # review_iterations counts fix attempts (implements triggered by review issues).
         # Each fix always gets a follow-up review — abort only after reviewing the last fix.
         while not state.review_approved and not state.failed:
+            if not self._sync_before_review(state):
+                return
             label = "initial" if state.review_iterations == 0 else f"after fix {state.review_iterations}/{max_fixes}"
             log.info(f"--- Phase: {_phase_scope_label(state)}review ({label}) ---")
             if not self._refresh_review_fix_diff(state):
@@ -1349,7 +1376,9 @@ class Orchestrator:
 
     def _run_security_review_and_fix_loop(self, state: TaskState) -> None:
         """Run security review; if blocking issues found, fix and re-review until approved or limit reached."""
-        if not self._config.run_security_review or state.security_approved:
+        if not self._config.run_security_review:
+            return
+        if not self._sync_before_review(state) or state.security_approved:
             return
 
         max_iter = self._config.max_security_review_iterations
@@ -1357,6 +1386,12 @@ class Orchestrator:
         # security_review_iterations counts fix attempts (same semantics as review_iterations).
         # Each fix always gets a follow-up security review — abort only after reviewing the last fix.
         while not state.security_approved and not state.failed:
+            if not self._sync_before_review(state):
+                return
+            # Sync can invalidate a semantic approval obtained before these outputs existed.
+            self._run_review_loop(state)
+            if state.failed:
+                return
             sec_label = (
                 "initial"
                 if state.security_review_iterations == 0
@@ -1577,6 +1612,7 @@ class Orchestrator:
 
         review_fixes_before = state.review_iterations
         security_fixes_before = state.security_review_iterations
+        mutation_generation = self._mutation_generation
 
         log.info(f"--- Phase: {_phase_scope_label(state)}post-validation semantic gates ---")
         self._run_review_loop(state)
@@ -1602,15 +1638,54 @@ class Orchestrator:
             state.review_iterations > review_fixes_before
             or state.security_review_iterations > security_fixes_before
             or test_files_changed
+            or self._mutation_generation != mutation_generation
         )
+
+    def _sync_before_review(self, state: TaskState) -> bool:
+        """Resolve changed build inputs without forcing a per-step compile/test cycle.
+
+        Failed sync repairs consume the current build/fix budget. This helper never
+        calls a review or the build loop, including when invoked from its semantic gates.
+        """
+        if state.failed:
+            return False
+        if (
+            not self._config.run_build
+            or state.review_mode == "review_report"
+            or not (state.build_sync_required or state.build_sync_pending is not None)
+        ):
+            return True
+        while not state.failed:
+            if self._sync(state):
+                return True
+            if state.failed:
+                return False
+            if state.build_loop_key != _build_loop_key(state):
+                state.build_loop_key = _build_loop_key(state)
+                state.build_loop_start_iteration = state.build_iterations
+            if _build_loop_attempts_used(state) >= self._config.max_iterations:
+                state.record("orchestrator", "abort", "Build sync exhausted the current build/fix budget")
+                state.failed = True
+                self._store.save(state)
+                return False
+            # Reserve before the provider call; interruption must not replenish repairs.
+            state.build_iterations += 1
+            state.build_sync_required = True
+            self._store.save(state)
+            if not self._run_fix_phase(state, "build sync"):
+                return False
+        return False
 
     def _mark_build_sync_stale_if_needed(self, files_written, source: str, state: TaskState) -> None:
         if not files_written:
             return
         build_tool: BuildTool = self._tools["build"]
         if any(build_tool.is_build_config_file(f) for f in files_written):
-            log.info("%s changed build-config files — will re-sync before next build", source.capitalize())
+            log.info("%s changed build-config files — sync required before review or build", source.capitalize())
             state.build_synced = False
+            state.build_sync_required = True
+            state.review_approved = False
+            state.security_approved = False
 
     def _configured_test_write_paths(self) -> list[str]:
         raw = self._config.project_config.get("sandbox", {}).get("allowed_test_write_paths", [])
@@ -1665,7 +1740,8 @@ class Orchestrator:
         state.fixer_changed_code = True
         if self._fixer_change_is_test_only(paths):
             state.security_approved = False
-            state.security_review_iterations = 0
+            if not state.build_sync_required:
+                state.security_review_iterations = 0
             if state.active_scope == _SCOPE_FINAL_FULL_TASK:
                 state.final_full_task_review_done = False
             if record_test_only:
@@ -1679,8 +1755,9 @@ class Orchestrator:
         self._invalidate_delivery_no_change_outcome(state, paths, source="fixer")
         state.review_approved = False
         state.security_approved = False
-        state.review_iterations = 0
-        state.security_review_iterations = 0
+        if not state.build_sync_required:
+            state.review_iterations = 0
+            state.security_review_iterations = 0
         state.tests_up_to_date = False
         if state.active_scope == _SCOPE_FINAL_FULL_TASK:
             state.final_full_task_review_done = False
@@ -2377,10 +2454,9 @@ class Orchestrator:
         self._record_step_files_changed(state, paths)
         self._invalidate_delivery_no_change_outcome(state, paths, source="adopted build sync output")
         self._session_code_changed = True
+        self._mutation_generation += 1
         state.review_approved = False
         state.security_approved = False
-        state.review_iterations = 0
-        state.security_review_iterations = 0
         state.tests_up_to_date = False
         if state.active_scope == _SCOPE_FINAL_FULL_TASK:
             state.final_full_task_review_done = False
@@ -2903,6 +2979,9 @@ class Orchestrator:
             quarantined_path_set = set(quarantined_result_paths)
             step_files_written = [path for path in step_files_written if path not in quarantined_path_set]
         self._record_step_files_changed(state, step_files_written)
+        if name in {"implementer", "fixer", "test_writer"} and step_files_written:
+            self._mutation_generation += 1
+            self._mark_build_sync_stale_if_needed(step_files_written, name, state)
         if name == "fixer" and not result.success and isinstance(data.get("file_operation_error"), str):
             reported_files = data.get("files_written", [])
             fixer_files = (
@@ -3387,7 +3466,53 @@ class Orchestrator:
     def _sync(self, state: TaskState) -> bool:
         build_tool: BuildTool = self._tools["build"]
         log.info(f"Running build sync ({build_tool.__class__.__name__}.sync()) — this may take a few minutes...")
-        artifact_before = self._validation_artifact_snapshot(state)
+        root = self._validation_artifact_root(state)
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"], cwd=root, capture_output=True, text=True, check=False
+        )
+        binding = {
+            "root": str(root),
+            "project": str(self._config.project_root.resolve()),
+            "head": head.stdout.strip() if head.returncode == 0 else None,
+            "policy": hashlib.sha256(
+                json.dumps(
+                    {
+                        "build_tool": self._agent_project_config.get("project", {}).get("build_tool"),
+                        "build": self._agent_project_config.get("build", {}),
+                        "write_paths": self._config.allowed_write_paths,
+                        "unit_write_paths": state.delivery_effective_write_paths,
+                        "unit_exact_files": state.delivery_effective_write_exact_file_paths,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        pending = state.build_sync_pending
+        try:
+            if pending is None:
+                artifact_before = self._validation_artifact_snapshot(state)
+                state.build_sync_pending = {
+                    "binding": binding,
+                    "before": serialize_delivery_scope_snapshot(artifact_before),
+                }
+            else:
+                if not isinstance(pending, dict) or pending.get("binding") != binding:
+                    raise ValueError("Sync recovery authority changed")
+                raw = pending.get("before")
+                if not isinstance(raw, dict) or any(
+                    not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts
+                    for path in raw
+                ):
+                    raise ValueError("Sync recovery snapshot is invalid")
+                artifact_before = deserialize_delivery_scope_snapshot(raw)
+        except (ValueError, TypeError, DeliveryScopeSnapshotError):
+            state.record("orchestrator", "sync_recovery_unavailable", "Cannot safely resume pending build sync")
+            state.failed = True
+            self._store.save(state)
+            return False
+        state.build_synced = False
+        self._store.save(state)
         t0 = time.perf_counter()
         try:
             with self._active_operation(state, phase="sync", message="Running build sync"):
@@ -3407,6 +3532,7 @@ class Orchestrator:
         sync_success = result.success and artifacts_ok
         if sync_success:
             state.build_synced = True
+            state.build_sync_required = False
             state.record("orchestrator", "sync", "ok", elapsed_s=elapsed_s)
             state.record_validation("sync", "success", elapsed_s=elapsed_s, metadata=metadata)
             log.info(f"Build sync OK ({_fmt_elapsed(elapsed_s)})")
@@ -3420,6 +3546,9 @@ class Orchestrator:
                 f"Build sync failed ({_fmt_elapsed(elapsed_s)}):\n{diagnostic_excerpt(error, limit=_LOG_ERROR_LIMIT)}"
             )
             state.errors.append(diagnostic_excerpt(error, limit=_FIXER_ERROR_LIMIT))
+        # Save adoption, validation and completion together. Interrupted calls retain
+        # the original baseline, even when a repeated command makes no further edits.
+        state.build_sync_pending = None
         self._store.save(state)
         return sync_success
 

@@ -88,6 +88,7 @@ def create_build_tool(sandbox: Sandbox, root: Path, project_config: dict) -> Bui
             compile_task=build.get("compile_task", "classes"),
             test_task=build.get("test_task", "test"),
             sync_task=build.get("sync_task", "classes"),
+            sync_command=build.get("sync_command"),
             presync_task=build.get("presync_task", "classes"),
             presync_clean=bool(build.get("presync_clean", False)),
             sync_timeout=build.get("sync_timeout", 600),
@@ -112,6 +113,7 @@ def create_build_tool(sandbox: Sandbox, root: Path, project_config: dict) -> Bui
     return AndroidGradleTool(
         sandbox,
         root,
+        sync_command=build.get("sync_command"),
         compile_task=build.get("compile_task", "compileDebugKotlin"),
         test_task=build.get("test_task", "testDebugUnitTest"),
         presync_task=build.get("presync_task", "generateDebugSources"),

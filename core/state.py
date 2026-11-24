@@ -467,6 +467,8 @@ class TaskState:
     final_full_task_review_done: bool = False
     files_changed: list[str] = field(default_factory=list)
     build_synced: bool = False
+    build_sync_required: bool = False  # configuration changed; sync must precede enabled reviews
+    build_sync_pending: Optional[dict] = None  # private pre-sync snapshot and recovery binding
     build_iterations: int = 0  # total build/fix attempts across all build loops
     build_loop_key: Optional[str] = None
     build_loop_start_iteration: int = 0
