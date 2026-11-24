@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -123,10 +125,12 @@ class TestNodeDefaultCommands:
         assert node_tsc_command("custompm") == "npx tsc --noEmit"
         assert default_node_test_command("bun", {"test": "bun test"}) == "bun run test"
 
-    def test_bun_sync_command_uses_frozen_lockfile_when_present(self, tmp_path: Path):
-        assert default_node_sync_command(tmp_path, "bun") == "bun install"
-        (tmp_path / "bun.lock").write_text("")
-        assert default_node_sync_command(tmp_path, "bun") == "bun install --frozen-lockfile"
+    @pytest.mark.parametrize("lockfile,manager", _PACKAGE_MANAGER_LOCKFILES)
+    def test_sync_can_regenerate_existing_lockfiles(self, tmp_path: Path, lockfile, manager):
+        expected = "pnpm install --no-frozen-lockfile" if manager == "pnpm" else f"{manager} install"
+        assert default_node_sync_command(tmp_path, manager) == expected
+        (tmp_path / lockfile).write_text("")
+        assert default_node_sync_command(tmp_path, manager) == expected
 
     def test_unknown_sync_command_falls_back_to_install(self, tmp_path: Path):
         assert default_node_sync_command(tmp_path, "custompm") == "custompm install"
@@ -147,13 +151,13 @@ class TestNodeDefaultCommands:
 
 
 class TestNodeToolCommands:
-    def test_sync_uses_npm_ci_when_lockfile_exists(self, tmp_path: Path):
+    def test_sync_uses_npm_install_when_lockfile_exists(self, tmp_path: Path):
         (tmp_path / "package-lock.json").write_text("")
         tool = _make_tool(tmp_path)
         with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
-        assert args[0] == "npm ci"
+        assert args[0] == "npm install"
 
     def test_sync_uses_pnpm_install_when_lockfile_exists(self, tmp_path: Path):
         (tmp_path / "pnpm-lock.yaml").write_text("")
@@ -161,7 +165,7 @@ class TestNodeToolCommands:
         with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
-        assert args[0] == "pnpm install --frozen-lockfile"
+        assert args[0] == "pnpm install --no-frozen-lockfile"
 
     def test_sync_uses_non_frozen_install_when_package_manager_field_has_no_lockfile(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"packageManager": "pnpm@9.0.0"}')
@@ -169,7 +173,7 @@ class TestNodeToolCommands:
         with patch(_SHELL_RUNNER, return_value=_mock_run()) as mock:
             tool.sync()
         args, _ = mock.call_args
-        assert args[0] == "pnpm install"
+        assert args[0] == "pnpm install --no-frozen-lockfile"
 
     def test_sync_uses_non_frozen_yarn_install_without_lockfile(self, tmp_path: Path):
         _write_package_json(tmp_path, '{"packageManager": "yarn@4.0.0"}')
@@ -178,6 +182,37 @@ class TestNodeToolCommands:
             tool.sync()
         args, _ = mock.call_args
         assert args[0] == "yarn install"
+
+    @pytest.mark.parametrize("custom", [False, True])
+    def test_yarn_ci_environment_is_changed_only_for_default_sync(self, tmp_path, monkeypatch, custom):
+        monkeypatch.setenv("CI", "true")
+        monkeypatch.setenv("YARN_ENABLE_IMMUTABLE_INSTALLS", "true")
+        tool = _make_tool(tmp_path, package_manager="yarn", sync_command="yarn install --immutable" if custom else None)
+        with patch(_SHELL_RUNNER, return_value=_mock_run()) as run:
+            assert tool.sync().success
+            sync_call = run.call_args
+            tool.compile_check()
+        if custom:
+            assert sync_call.args[0] == "yarn install --immutable"
+            assert "env" not in sync_call.kwargs
+        else:
+            assert sync_call.args[0] == "yarn install"
+            assert sync_call.kwargs["env"]["YARN_ENABLE_IMMUTABLE_INSTALLS"] == "false"
+            assert sync_call.kwargs["env"]["CI"] == "true"
+        assert "env" not in run.call_args.kwargs
+        assert os.environ["YARN_ENABLE_IMMUTABLE_INSTALLS"] == "true"
+
+    @pytest.mark.parametrize(
+        "manager,command",
+        [("npm", "npm ci"), ("pnpm", "pnpm install --frozen-lockfile"), ("bun", "bun install --frozen-lockfile")],
+    )
+    def test_explicit_frozen_commands_are_not_rewritten_or_retried(self, tmp_path, manager, command):
+        tool = _make_tool(tmp_path, package_manager=manager, sync_command=command)
+        with patch(_SHELL_RUNNER, return_value=_mock_run(returncode=1, stderr="lockfile is stale")) as run:
+            assert not tool.sync().success
+        assert run.call_count == 1
+        assert run.call_args.args[0] == command
+        assert "env" not in run.call_args.kwargs
 
     def test_configured_commands_override_defaults(self, tmp_path: Path):
         tool = _make_tool(
@@ -359,3 +394,45 @@ class TestNodeToolIsSyncAdoptableFile:
     def test_rejects_package_manifest(self, tmp_path: Path):
         tool = _make_tool(tmp_path)
         assert tool.is_sync_adoptable_file("package.json") is False
+
+
+@pytest.mark.skipif(shutil.which("npm") is None, reason="npm is needed for the offline lockfile regression")
+def test_default_npm_sync_regenerates_stale_lockfile_offline(tmp_path, monkeypatch):
+    # Isolate npm state and prevent registry access and lifecycle scripts.
+    empty_config = tmp_path / "empty.npmrc"
+    empty_config.write_text("")
+    for key, value in {
+        "cache": str(tmp_path / "npm-cache"),
+        "userconfig": str(empty_config),
+        "globalconfig": str(tmp_path / "global.npmrc"),
+        "offline": "true",
+        "ignore_scripts": "true",
+        "audit": "false",
+        "fund": "false",
+        "package_lock": "true",
+    }.items():
+        monkeypatch.setenv(f"npm_config_{key}", value)
+    root = tmp_path / "project"
+    root.mkdir()
+    manifest = root / "package.json"
+    manifest.write_text(json.dumps({"name": "sync-regression", "version": "1.0.0", "private": True}))
+    tool = _make_tool(root)
+    initial = tool.sync()
+    assert initial.success, initial.error
+    lock = root / "package-lock.json"
+    original_lock = lock.read_bytes()
+    dependency = root / "local-dependency"
+    dependency.mkdir()
+    (dependency / "package.json").write_text(json.dumps({"name": "local-dependency", "version": "1.0.0"}))
+    body = json.loads(manifest.read_text())
+    body["dependencies"] = {"local-dependency": "file:./local-dependency"}
+    manifest.write_text(json.dumps(body))
+    expected_manifest = manifest.read_bytes()
+    frozen = _make_tool(root, sync_command="npm ci").sync()
+    assert not frozen.success
+    assert lock.read_bytes() == original_lock
+    repaired = tool.sync()
+    assert repaired.success, repaired.error
+    assert manifest.read_bytes() == expected_manifest
+    assert json.loads(lock.read_text())["packages"][""]["dependencies"] == body["dependencies"]
+    assert _make_tool(root, sync_command="npm ci").sync().success

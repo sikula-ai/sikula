@@ -20,6 +20,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from agents.build_guidance import pipeline_sync_guidance
 from agents.base_agent import (
     AGENT_SECURITY_PREFIX,
     AgentResult,
@@ -433,6 +434,7 @@ class AnalystAgent(BaseAgent):
 
         full_prompt = (
             AGENT_SECURITY_PREFIX
+            + pipeline_sync_guidance(self.project_config)
             + _SYSTEM_ANALYZE.format(tech_stack=_tech_stack(self.project_config))
             + "\n\n"
             + _USER_ANALYZE.format(

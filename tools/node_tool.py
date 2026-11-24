@@ -164,18 +164,10 @@ def node_tsc_command(package_manager: str) -> str:
 
 
 def default_node_sync_command(root: Path, package_manager: str) -> str:
-    if package_manager == "npm":
-        if (root / "package-lock.json").exists() or (root / "npm-shrinkwrap.json").exists():
-            return "npm ci"
-        return "npm install"
+    # Sync runs after manifest edits, so it must be able to refresh existing locks.
+    # The package manager still reuses compatible locked resolutions.
     if package_manager == "pnpm":
-        return "pnpm install --frozen-lockfile" if (root / "pnpm-lock.yaml").exists() else "pnpm install"
-    if package_manager == "yarn":
-        return "yarn install --frozen-lockfile" if (root / "yarn.lock").exists() else "yarn install"
-    if package_manager == "bun":
-        if (root / "bun.lock").exists() or (root / "bun.lockb").exists():
-            return "bun install --frozen-lockfile"
-        return "bun install"
+        return "pnpm install --no-frozen-lockfile"
     return f"{package_manager} install"
 
 
@@ -236,13 +228,14 @@ class NodeTool(BuildTool):
         self._sync_timeout = sync_timeout
         self._compile_timeout = compile_timeout
         self._test_timeout = test_timeout
+        self._default_sync = not sync_command
         self._sync_command = sync_command or default_node_sync_command(self._root, self._package_manager)
         self._compile_command = compile_command or default_node_compile_command(
             self._root, self._package_manager, self._scripts
         )
         self._test_command = test_command or default_node_test_command(self._package_manager, self._scripts)
 
-    def _run(self, command: str, timeout: int) -> ToolResult:
+    def _run(self, command: str, timeout: int, *, env: dict[str, str] | None = None) -> ToolResult:
         log.info(f"$ {command}  [cwd: {self._root}]  (timeout {timeout}s)")
         try:
             run_kwargs = {
@@ -252,6 +245,8 @@ class NodeTool(BuildTool):
                 "cwd": self._root,
                 "timeout": timeout,
             }
+            if env is not None:
+                run_kwargs["env"] = env
             if os.name == "nt":
                 r = run_windows_shell_process(command, **run_kwargs)
             else:
@@ -266,6 +261,11 @@ class NodeTool(BuildTool):
             return ToolResult(success=False, output="", error=str(e))
 
     def sync(self) -> ToolResult:
+        if self._default_sync and self._package_manager == "yarn":
+            # Modern Yarn defaults to immutable installs in CI. Use its portable
+            # environment setting (Classic ignores it), only for our default sync.
+            env = dict(os.environ, YARN_ENABLE_IMMUTABLE_INSTALLS="false")
+            return self._run(self._sync_command, self._sync_timeout, env=env)
         return self._run(self._sync_command, self._sync_timeout)
 
     def compile_check(self) -> ToolResult:

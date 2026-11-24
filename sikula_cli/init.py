@@ -114,8 +114,11 @@ build:
 """
     elif build_tool == "node":
         package_manager = node_package_manager or "npm"
-        sync_command = node_sync_command or (
-            "bun install --frozen-lockfile" if package_manager == "bun" else f"{package_manager} install"
+        sync_line = (
+            f'  sync_command: "{node_sync_command}"'
+            if node_sync_command
+            else "  # Sync defaults to dependency installation with lockfile regeneration.\n"
+            "  # Set sync_command only to override the build tool's default."
         )
         compile_command = node_compile_command or (
             "bun run build" if package_manager == "bun" else f"{package_manager} run build"
@@ -136,7 +139,7 @@ build:
         build_section = f"""\
 build:
   package_manager: {package_manager}
-  sync_command: "{sync_command}"
+{sync_line}
   # Optional: adopt project-specific source-controlled files generated or updated by sync().
   # Platform defaults already cover existing tracked package-manager lockfiles.
   # Use this only for generated files that belong in the final diff; keep caches/build outputs gitignored.
@@ -661,7 +664,9 @@ def cmd_init(args: argparse.Namespace, context: InitContext | None = None) -> No
         test_write_paths=result.test_write_paths or None,
         xcode_scheme=result.xcode_scheme,
         node_package_manager=result.package_manager,
-        node_sync_command=result.node_sync_command,
+        # Keep automatic sync policy in NodeTool, including its CI environment.
+        # A scanned command is a default, not an explicit user override.
+        node_sync_command=None,
         node_compile_command=result.node_compile_command,
         node_test_command=result.node_test_command,
         node_checks=result.node_checks,

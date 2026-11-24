@@ -365,7 +365,7 @@ class TestScanWritePaths:
         )
         result = scan(tmp_path)
         assert result.package_manager == "pnpm"
-        assert result.node_sync_command == "pnpm install --frozen-lockfile"
+        assert result.node_sync_command == "pnpm install --no-frozen-lockfile"
         assert result.node_compile_command == "pnpm typecheck"
         assert result.node_test_command == "pnpm test"
         assert result.node_checks == [{"name": "lint", "command": "pnpm lint", "timeout": 120}]
@@ -374,7 +374,7 @@ class TestScanWritePaths:
         (tmp_path / "package.json").write_text('{"packageManager": "pnpm@9.0.0"}')
         result = scan(tmp_path)
         assert result.package_manager == "pnpm"
-        assert result.node_sync_command == "pnpm install"
+        assert result.node_sync_command == "pnpm install --no-frozen-lockfile"
 
     def test_xcode_detects_source_dir_matching_project_name(self, tmp_path: Path):
         (tmp_path / "Countries.xcodeproj").mkdir()

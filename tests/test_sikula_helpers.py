@@ -508,7 +508,7 @@ class TestGenerateConfig:
     def test_node_build_section_uses_bun_defaults_when_commands_missing(self):
         cfg = self._cfg(build_tool="node", language="TypeScript", node_package_manager="bun")
         assert "package_manager: bun" in cfg
-        assert 'sync_command: "bun install --frozen-lockfile"' in cfg
+        assert "sync_command:" not in cfg
         assert 'compile_command: "bun run build"' in cfg
         assert 'test_command: "bun run test"' in cfg
 

@@ -14,6 +14,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
+from agents.build_guidance import pipeline_sync_guidance
 from agents.base_agent import (
     AGENT_SECURITY_PREFIX,
     AgentResult,
@@ -339,7 +340,9 @@ class SecurityReviewerAgent(BaseAgent):
                 f"\n\n---\nYour previous security reviews of this task (maintain consistency):\n{history_text}"
             )
 
-        full_prompt = read_only_agent_prompt(AGENT_SECURITY_PREFIX + full_prompt)
+        full_prompt = read_only_agent_prompt(
+            AGENT_SECURITY_PREFIX + pipeline_sync_guidance(self.project_config) + full_prompt
+        )
 
         try:
             output = self.llm.run_readonly_agent(full_prompt, cwd=file_tool._root)

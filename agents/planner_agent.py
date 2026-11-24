@@ -11,6 +11,7 @@ import logging
 import re
 from typing import NamedTuple
 
+from agents.build_guidance import pipeline_sync_guidance
 from agents.base_agent import (
     AGENT_SECURITY_PREFIX,
     AgentResult,
@@ -180,6 +181,7 @@ class PlannerAgent(BaseAgent):
             numbered_list_contract = f"a numbered list with 2–{max_steps} items"
         return (
             AGENT_SECURITY_PREFIX
+            + pipeline_sync_guidance(self.project_config)
             + _SYSTEM_PLAN.format(
                 tech_stack=_tech_stack(self.project_config),
                 step_count_guidance=step_count_guidance,

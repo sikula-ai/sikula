@@ -758,14 +758,11 @@ class TestReviewerAgentPrompt:
         _make_agent(stub_llm, file_tool=file_tool, project_config=config).run(state)
         prompt = stub_llm.readonly_calls[0]
 
-        assert "Build-tool-specific policy" in prompt
-        assert "Cargo lockfiles" in prompt
-        assert "not hand-written by agents" in prompt
+        assert "Pipeline-owned build outputs" in prompt
         assert "signs of manual fabrication" in prompt
-        assert "Do not ask the implementer to run Cargo tooling" in prompt
-        assert "do not block solely" in prompt
-        assert "sync/build validation record does" in prompt
-        assert "not exist yet" in prompt
+        assert "Do not ask implementation or fix agents to run build tooling" in prompt
+        assert "Do not waive stale or inconsistent output" in prompt
+        assert "absence of compile/test records" in prompt
 
     def test_lockfile_guidance_is_omitted_for_non_cargo_projects(self, stub_llm: StubLLMClient, file_tool):
         stub_llm.readonly_result = "APPROVED"

@@ -35,13 +35,17 @@ class JvmGradleTool(GradleBaseTool):
         sync_timeout: int = _DEFAULT_SYNC_TIMEOUT,
         compile_timeout: int = _JVM_COMPILE_TIMEOUT,
         test_timeout: int = _JVM_TEST_TIMEOUT,
+        sync_command: str | None = None,
     ) -> None:
         super().__init__(sandbox, project_root, sync_timeout, compile_timeout, test_timeout)
+        if sync_command is not None and (not isinstance(sync_command, str) or not sync_command.strip()):
+            raise ValueError("build.sync_command must be a non-empty string")
         self._compile_task = compile_task
         self._test_task = test_task
         self._sync_task = sync_task
         self._presync_task = presync_task
         self._presync_clean = presync_clean
+        self._sync_command = sync_command
 
     def generate_sources(self) -> ToolResult:
         if self._presync_clean:
@@ -51,6 +55,8 @@ class JvmGradleTool(GradleBaseTool):
         return self._run(self._presync_task, "--parallel", timeout=self._sync_timeout)
 
     def sync(self) -> ToolResult:
+        if self._sync_command is not None:
+            return self._run_shell(self._sync_command, timeout=self._sync_timeout)
         return self._run(self._sync_task, "--parallel", timeout=self._sync_timeout)
 
     def compile_check(self) -> ToolResult:

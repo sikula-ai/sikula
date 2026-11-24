@@ -2411,6 +2411,32 @@ Orchestrator.run()
    └─ if state.plan empty    → single-pass (phases 2-5 once)
 ```
 
+**Build sync ordering:** actual implementation and repair writes are classified by the
+active `BuildTool.is_build_config_file()`. Relevant changes set `build_sync_required`
+and invalidate `build_synced`, independently of review flags. With `run_build: true`,
+pending configuration sync completes before the next enabled semantic or security
+review. With both reviews disabled it runs before the next build. Ordinary source
+changes do not trigger early sync merely because a run has never synchronized.
+`run_build: false` disables this automatic sync; report-only review never invokes it.
+Review-fix only synchronizes configuration changes made by its write passes, not a
+pre-existing reviewed diff.
+
+Early sync uses the existing output adoption and delivery mutation audit. Its success
+does not separately invoke compile, tests or checks when per-step builds are deferred
+(the configured sync command itself may compile). Sync failure enters bounded Fixer
+recovery charged to the current build/fix budget, without calling review recursively.
+Adoption invalidates approvals without resetting consumed review/security attempts.
+Any gate-induced writes still require deterministic validation before completion.
+
+Before invoking sync, the orchestrator persists `build_sync_pending`, containing the
+original private artifact baseline bound to the worktree root, project root, HEAD
+and effective build/write-scope policy. It clears this control only together with
+the recorded sync outcome and adoption. Resume reruns interrupted sync against that baseline before
+another agent runs, so an already-written output remains reviewable even if the replay
+makes no further edits. Changed recovery authority blocks rather than silently
+rebaselining; pending sync cannot resume with builds disabled. Baselines are local
+private state, not public status output.
+
 **Single-pass flow** (`state.plan` is empty — when `run_planner: false` or planner outputs `SINGLE_PASS`):
 
 ```
@@ -2611,8 +2637,9 @@ use the complete change context.
 
 After the last step completes, `plan_completed` guards resume so the final step is not
 re-run just because the final review/build phase was interrupted. The final full-task
-gate resets review/security/test-write flags and reruns those agents over the complete
-planned task. If the final build/fix loop later invokes `FixerAgent`, the follow-up
+gate resets review/security/test-write flags on first entry and reruns those agents over
+the complete planned task. Resume within that scope preserves consumed review attempts.
+If the final build/fix loop later invokes `FixerAgent`, the follow-up
 review, security review, and test writer also run with `active_scope = "final_full_task"`;
 they are not scoped to the last planned step. When `run_build_per_step: true`, step-local
 build/fix reviews remain step-scoped while they are still inside `_run_single_step()`;
@@ -3583,9 +3610,11 @@ content pre-loaded in the prompt.
   optional `scope_recovery`, and optional `test_only_scope_violation` restore audit; reviewer
   prompts summarize recent test-related records for contract-weakening audit.
 
-**Re-sync trigger:** orchestrator calls `BuildTool.is_build_config_file()` on each newly
-changed file. If any match, `state.build_synced = False` is set so sync runs before the
-next build. The patterns are defined by the `BuildTool` implementation, not the orchestrator.
+**Re-sync trigger:** the orchestrator calls `BuildTool.is_build_config_file()` on
+implementation and repair writes, including re-edits of already-recorded files.
+Matches set `state.build_synced = False` and `state.build_sync_required = True`.
+Sync then precedes the next enabled review or build, as described in execution flow.
+The patterns are defined by the `BuildTool` implementation, not the orchestrator.
 
 **Sync output adoption:** after `BuildTool.sync()` succeeds, the orchestrator compares the
 non-ignored repository snapshot taken before sync with the snapshot after sync. Platform
@@ -3683,6 +3712,8 @@ Sikula processes at once is still unsupported.
 | `presync_done` | `bool` | Orchestrator | Set True after Phase 0 presync attempt (success or failure); guards re-run on resume |
 | `files_changed` | `list[str]` | Implementer / Fixer | Paths touched so far; used by orchestrator for build-config re-sync detection |
 | `build_synced` | `bool` | Orchestrator | Guards unnecessary re-syncs; reset when build-config files change |
+| `build_sync_required` | `bool` | Orchestrator | Configuration changes require sync before enabled reviews; defaults to false, independently of initial build sync |
+| `build_sync_pending` | `dict` or `None` | Orchestrator | Private pre-sync artifact baseline and recovery binding; retained until outcome/adoption is saved |
 | `build_iterations` | `int` | Orchestrator | Total build/fix attempts across the task; used as an audit/correlation counter in validation and agent records |
 | `build_loop_key` | `str \| None` | Orchestrator | Active build/fix loop identity (`"task"`, `"step:N"`, or `"final_full_task"`); persisted so resume keeps the same loop budget |
 | `build_loop_start_iteration` | `int` | Orchestrator | Global `build_iterations` value at the start of the active build/fix loop; `config.max_iterations` is enforced relative to this value, with one final validation-only pass allowed when the last fixer attempt wrote files |
@@ -3869,13 +3900,20 @@ then chooses package-script defaults in this order:
 | Key | Default | Description |
 |---|---|---|
 | `package_manager` | auto-detected `npm`, `pnpm`, `yarn`, or `bun` | Package manager used only for default command generation; explicit command fields always win |
-| `sync_command` | lockfile-aware install (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile`, `bun install --frozen-lockfile`; plain `install` when no matching lockfile exists) | Shell command run by `sync()` |
+| `sync_command` | `npm install`, `pnpm install --no-frozen-lockfile`, `yarn install`, or `bun install` | Shell command run by `sync()`; defaults can regenerate lockfiles after manifest changes |
 | `compile_command` | detected package script, `tsc --noEmit`, or build script fallback | Shell command run by `compile_check()`. Common values: `npm run typecheck`, `pnpm typecheck`, `yarn typecheck`, `npm run build` |
 | `test_command` | package-manager test command (`npm test`, `pnpm test`, `yarn test`, `bun run test`) | Shell command run by `run_tests()` |
 | `sync_timeout` | `600` | Timeout in seconds for `sync()` |
 | `compile_timeout` | `600` | Timeout in seconds for `compile_check()` |
 | `test_timeout` | `600` | Timeout in seconds for `run_tests()` |
 | `checks` | detected non-mutating package scripts, otherwise `[]` | Named quality checks. Keys: `name`, `command`, `timeout`, optional `fix_command`. Example: `{name: lint, command: "npm run lint", timeout: 120}` |
+
+Automatic Node sync permits lockfile updates after manifest changes. Default Yarn
+sync sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false` in its subprocess environment,
+including in CI; other commands and explicit sync overrides inherit the environment
+unchanged. `sikula init` leaves sync unset so this policy remains in `NodeTool`.
+Existing frozen/immutable overrides are never silently rewritten or retried with
+weaker options; projects wanting regeneration must remove or replace that override.
 
 `is_build_config_file` triggers on `package.json`, lockfiles, workspace files
 (`pnpm-workspace.yaml`, `lerna.json`, `rush.json`), `tsconfig*.json`, `jsconfig.json`,
@@ -3903,6 +3941,7 @@ All keys live under `build:` in `.sikula/config.yaml`.
 
 | Key | Default | Description |
 |---|---|---|
+| `sync_command` | unset | Optional shell command replacing `generateDebugSources --parallel`; executed exactly as configured with `sync_timeout`, without appended tasks or flags. Does not override presync. |
 | `presync_task` | `generateDebugSources` | Gradle task run by `generate_sources()` (presync phase). Use `openApiGenerateAll` when `generateDebugSources` fails due to pre-existing compile errors in unrelated modules |
 | `presync_clean` | `false` | Run `clean` before `presync_task`. Removes stale generated files (e.g. old DTOs from removed spec entries). Significantly slower — enable only when incremental build produces outdated sources |
 | `compile_task` | `compileDebugKotlin` | Gradle task run by `compile_check()` — see table below |
@@ -3929,7 +3968,8 @@ All keys live under `build:` in `.sikula/config.yaml`.
 |---|---|---|
 | `compile_task` | `classes` | Gradle task run by `compile_check()`. `classes` compiles all sources and triggers annotation processors (Lombok, MapStruct, OpenAPI codegen, …). Use `compileKotlin` or `compileJava` for faster incremental builds when the project has no codegen. |
 | `test_task` | `test` | Gradle task run by `run_tests()` |
-| `sync_task` | `classes` | Gradle task run by `sync()` |
+| `sync_task` | `classes` | Gradle task run by `sync()` with `--parallel` when `sync_command` is unset |
+| `sync_command` | unset | Optional shell command taking precedence over `sync_task`; executed exactly as configured with `sync_timeout`. Does not override presync. |
 | `presync_task` | `classes` | Gradle task run by `generate_sources()` (presync phase) |
 | `presync_clean` | `false` | Run `clean` before `presync_task` |
 | `sync_timeout` | `600` | Timeout in seconds for `sync()` and `generate_sources()` |
@@ -3937,8 +3977,10 @@ All keys live under `build:` in `.sikula/config.yaml`.
 | `test_timeout` | `600` | Timeout in seconds for `run_tests()` |
 | `checks` | `[]` | Named quality checks — same structure as AndroidGradleTool |
 
-On Windows, Gradle-based tools select `gradlew.bat` and Maven selects `mvnw.cmd`;
-both route wrappers through the shared batch-command resolver. On other platforms
+For default task commands on Windows, Gradle-based tools select `gradlew.bat` and Maven selects `mvnw.cmd`;
+both route wrappers through the shared batch-command resolver. A custom Gradle
+`sync_command` instead uses the existing platform shell runner and must use syntax
+and wrapper names appropriate to that operating system. On other platforms
 they continue to execute the extensionless wrappers directly. Python dependency
 sync invokes the active interpreter as an argument vector so interpreter paths with
 spaces remain valid.

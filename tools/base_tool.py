@@ -121,7 +121,7 @@ class BuildTool(BaseTool):
         return self.sync()
 
     def sync(self) -> ToolResult:
-        """Resolve dependencies and generate sources before the first build.
+        """Resolve dependencies and generate sources before dependent reviews or build.
 
         Android/Gradle: generateDebugSources --parallel
         iOS/Xcode:      xcodebuild -resolvePackageDependencies
@@ -150,7 +150,7 @@ class BuildTool(BaseTool):
     def is_build_config_file(self, path: str) -> bool:
         """Return True if the file is part of the build configuration.
 
-        Used by the orchestrator to decide whether to re-sync after a fix.
+        Used by the orchestrator to invalidate sync after implementation or repair writes.
         Each platform subclass defines its own patterns.
         """
         raise NotImplementedError
