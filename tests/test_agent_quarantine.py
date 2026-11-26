@@ -593,6 +593,40 @@ def test_interrupted_quarantine_preserves_other_repair_writes_for_build_sync(
 
 
 @pytest.mark.parametrize("actor", ["implementer", "fixer"])
+@pytest.mark.parametrize("delivery", [False, True])
+def test_scope_stop_retains_completed_response_only_in_private_audit(isolated, caplog, actor, delivery):
+    root, orch, state, _, _ = isolated
+    if delivery:
+        state = _scoped_delivery_state(orch, ["src/"])
+        state.worktree_path = state.worktree_base = str(root)
+    private_output = "PRIVATE_COMPLETED_SCOPE_RESPONSE\n" + OPERATION
+
+    def repair():
+        (root / "outside.py").write_bytes(b"Rejected write\n")
+        return ["outside.py"], private_output
+
+    client = _agents(root, orch, [lambda: _create(root), repair])
+    assert orch._run_agent("implementer", state).success
+    state.review_issues = ["Remove scratch"]
+    state.review_iterations = 1
+    state.errors = ["Production check failed"]
+    result = orch._run_agent(actor, state)
+    assert not result.success and result.message == "unit_scope_violation"
+    assert client.provider_calls == 2
+    stopped = orch._store.load(state.task_id)
+    assert stopped.failed
+    cycles = stopped.implement_cycle_records if actor == "implementer" else stopped.fix_cycle_records
+    record = cycles[-1]
+    assert record[f"{actor}_output"] == private_output
+    assert record[f"{actor}_prompt"]
+    assert record["files_written"] == ["outside.py"]
+    assert not stopped.delivery_quarantine_records
+    assert (root / "src/scratch.py").exists()
+    public_diagnostics = json.dumps(stopped.history) + str(result) + caplog.text
+    assert "PRIVATE_COMPLETED_SCOPE_RESPONSE" not in public_diagnostics
+
+
+@pytest.mark.parametrize("actor", ["implementer", "fixer"])
 @pytest.mark.parametrize("interrupt", [False, True])
 @pytest.mark.parametrize("validation_succeeds", [False, True])
 def test_scope_stop_persists_retained_writes_before_review_fix_resume(

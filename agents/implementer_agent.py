@@ -22,6 +22,7 @@ from agents.delivery_contracts import delivery_agent_prompt_context
 from agents.quarantine_guidance import QUARANTINE_CONSTRAINT
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult, quarantine_run_eligible
+from core.llm_client import LLMWriteAttemptStopped
 from core.state import TaskState
 from core.structured_output import (
     DELIVERY_DISPOSITION_ALREADY_SATISFIED,
@@ -230,6 +231,7 @@ class ImplementerAgent(BaseAgent):
             changed, agent_output = self.llm.run_agent(prompt, cwd=file_tool._root)
         except RuntimeError as e:
             msg = str(e)
+            completed = e.completed_result if isinstance(e, LLMWriteAttemptStopped) else None
             state.record(self.name, "implement_failed", msg[:500])
             state.implement_cycle_records.append(
                 {
@@ -240,8 +242,8 @@ class ImplementerAgent(BaseAgent):
                     "scope": _scope(state),
                     "step_description": step_description,
                     "implementer_prompt": prompt,
-                    "implementer_output": None,
-                    "files_written": [],
+                    "implementer_output": completed[1] if completed is not None else None,
+                    "files_written": completed[0] if completed is not None else [],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )

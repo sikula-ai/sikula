@@ -14,6 +14,7 @@ from typing import Callable, Iterator
 
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
 from core.delivery_quarantine import quarantine_prunable_paths, quarantine_run_eligible
+from core.llm_client import LLMWriteAttemptStopped
 from core.state import DELIVERY_STOP_UNIT_SCOPE_VIOLATION, StateStore, TaskState
 from core.validation_artifacts import (
     DeliveryScopeGitBinding,
@@ -91,7 +92,7 @@ class DeliveryScopeAuditPolicy:
     agent: str
 
 
-class DeliveryScopeProviderAttemptStopped(RuntimeError):
+class DeliveryScopeProviderAttemptStopped(LLMWriteAttemptStopped):
     """Stop provider retries after a fail-closed delivery scope audit."""
 
 

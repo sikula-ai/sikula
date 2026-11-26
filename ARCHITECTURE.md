@@ -3559,6 +3559,10 @@ mutations are reconciled into file tracking and invalidate these gates before th
 stop is persisted, even if the agent never returns its changed-file result.
 Repair counters remain consumed. Test-only Fixer attempts instead retain their
 existing rollback-and-retry ownership of rejected writes.
+When a scope audit stops a completed provider attempt, its response and reported
+changed paths remain in the Implementer or Fixer's private failure cycle record.
+The stop stays terminal: the response is not executed, retried, or exposed through
+ordinary diagnostics or usage events. This applies to standalone and delivery runs.
 Clean quarantined paths are removed from the net `files_changed` projection;
 their audit remains in `delivery_quarantine_records`. For `review --fix`, provenance
 and the durable move record retain whether the path belonged to the original

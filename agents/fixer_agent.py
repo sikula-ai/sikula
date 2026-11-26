@@ -31,6 +31,7 @@ from agents.delivery_contracts import delivery_agent_prompt_context
 from core.delivery_constraint_context import DeliveryConstraintContextError
 from agents.quarantine_guidance import QUARANTINE_CONSTRAINT
 from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult, quarantine_run_eligible
+from core.llm_client import LLMWriteAttemptStopped
 from core.state import TaskState
 from core.structured_output import FixerFileOperationParseError, parse_fixer_file_operation
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
@@ -1097,6 +1098,7 @@ class FixerAgent(BaseAgent):
                     self._delivery_scope_attempt_authority = None
             except RuntimeError as e:
                 msg = str(e)
+                completed = e.completed_result if isinstance(e, LLMWriteAttemptStopped) else None
                 state.record(self.name, "fix_failed", msg[:500])
                 record = {
                     "build_iteration": state.build_iterations,
@@ -1104,8 +1106,8 @@ class FixerAgent(BaseAgent):
                     "scope": _scope(state),
                     "errors_before": errors_snapshot,
                     "fixer_prompt": prompt,
-                    "fixer_output": None,
-                    "files_written": [],
+                    "fixer_output": completed[1] if completed is not None else None,
+                    "files_written": completed[0] if completed is not None else [],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 if triage_scope:
