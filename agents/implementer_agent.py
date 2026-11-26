@@ -7,6 +7,7 @@ Changed files are detected via git diff before/after the agent call.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Callable
 
 from agents.base_agent import (
     AgentResult,
@@ -18,13 +19,18 @@ from agents.base_agent import (
 )
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from agents.delivery_contracts import delivery_agent_prompt_context
+from agents.quarantine_guidance import QUARANTINE_CONSTRAINT
 from core.delivery_constraint_context import DeliveryConstraintContextError
+from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult, quarantine_run_eligible
+from core.llm_client import LLMWriteAttemptStopped
 from core.state import TaskState
 from core.structured_output import (
     DELIVERY_DISPOSITION_ALREADY_SATISFIED,
     DELIVERY_IMPLEMENTATION_DISPOSITIONS,
     DeliveryDispositionParseError,
+    FixerFileOperationParseError,
     parse_delivery_disposition,
+    parse_fixer_file_operation,
 )
 
 _AGENT_PROMPT = """\
@@ -143,6 +149,17 @@ def _scope(state: TaskState) -> str:
 class ImplementerAgent(BaseAgent):
     name = "implementer"
 
+    def __init__(
+        self,
+        llm,
+        tools: dict,
+        project_config: dict | None = None,
+        *,
+        quarantine_executor: Callable[[TaskState, str, list[str]], DeliveryQuarantineResult] | None = None,
+    ) -> None:
+        super().__init__(llm, tools, project_config)
+        self._quarantine_executor = quarantine_executor
+
     def run(self, state: TaskState) -> AgentResult:
         if not state.implementation_prompt:
             return AgentResult(success=False, message="No implementation prompt in state")
@@ -182,13 +199,20 @@ class ImplementerAgent(BaseAgent):
         review_fix_section = ""
         if state.review_issues:
             review_fix_section = _REVIEW_FIX_SECTION.format(issues="\n\n".join(state.review_issues))
+        quarantine_enabled = bool(
+            callable(self._quarantine_executor)
+            and quarantine_run_eligible(state)
+            and state.review_issues
+            and (state.review_iterations > 0 or state.security_review_iterations > 0)
+        )
 
         prompt = AGENT_SECURITY_PREFIX + _AGENT_PROMPT.format(
             tech_stack=tech_stack,
             allowed_read_paths=allowed_read_str,
             allowed_write_paths=allowed_str,
             guidelines_files=_guidelines_files(self.project_config),
-            build_tool_constraints=_write_agent_constraints(self.project_config),
+            build_tool_constraints=_write_agent_constraints(self.project_config)
+            + (QUARANTINE_CONSTRAINT if quarantine_enabled else ""),
             delivery_constraint_context=delivery_context.inherited_constraints,
             delivery_disposition_contract=delivery_context.disposition_contract,
             implementation_prompt=state.implementation_prompt,
@@ -207,6 +231,7 @@ class ImplementerAgent(BaseAgent):
             changed, agent_output = self.llm.run_agent(prompt, cwd=file_tool._root)
         except RuntimeError as e:
             msg = str(e)
+            completed = e.completed_result if isinstance(e, LLMWriteAttemptStopped) else None
             state.record(self.name, "implement_failed", msg[:500])
             state.implement_cycle_records.append(
                 {
@@ -217,8 +242,8 @@ class ImplementerAgent(BaseAgent):
                     "scope": _scope(state),
                     "step_description": step_description,
                     "implementer_prompt": prompt,
-                    "implementer_output": None,
-                    "files_written": [],
+                    "implementer_output": completed[1] if completed is not None else None,
+                    "files_written": completed[0] if completed is not None else [],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -242,6 +267,15 @@ class ImplementerAgent(BaseAgent):
         if changed:
             _record_write_path_warnings(state, self.name, changed, allowed_write_paths, "allowed_write_paths")
 
+        operation = None
+        operation_error = None
+        if quarantine_enabled:
+            try:
+                operation = parse_fixer_file_operation(agent_output)
+            except FixerFileOperationParseError as exc:
+                operation_error = exc.code
+                cycle_record["file_operation_error"] = exc.code
+
         if delivery_child:
             try:
                 disposition = parse_delivery_disposition(
@@ -261,7 +295,9 @@ class ImplementerAgent(BaseAgent):
             if disposition is not None:
                 cycle_record["disposition"] = disposition.to_dict()
                 if disposition.disposition == DELIVERY_DISPOSITION_ALREADY_SATISFIED:
-                    if changed:
+                    if operation_error is not None:
+                        return self._file_operation_failed(state, cycle_record, changed, operation_error)
+                    if changed or operation is not None:
                         error_code = "delivery_disposition.already_satisfied_with_changes"
                         cycle_record["disposition_parse_error"] = error_code
                         state.record_delivery_disposition_parse_error(self.name, error_code)
@@ -309,6 +345,17 @@ class ImplementerAgent(BaseAgent):
                     },
                 )
 
+        if operation_error is not None:
+            return self._file_operation_failed(state, cycle_record, changed, operation_error)
+        if operation is not None:
+            try:
+                result = self._quarantine_executor(state, operation.path, allowed_write_paths)
+            except DeliveryQuarantineError as exc:
+                return self._file_operation_failed(state, cycle_record, changed, exc.code)
+            changed = list(dict.fromkeys([*changed, result.path]))
+            cycle_record["files_written"] = changed
+            cycle_record["file_quarantined"] = result.to_dict()
+
         if not changed:
             state.delivery_no_change_outcome = None
             msg = "Agent made no file changes"
@@ -322,4 +369,13 @@ class ImplementerAgent(BaseAgent):
             success=True,
             message=f"Written {len(changed)} file(s): {changed}",
             data={"files_written": changed},
+        )
+
+    def _file_operation_failed(self, state: TaskState, record: dict, changed: list[str], code: str) -> AgentResult:
+        record["file_operation_error"] = code
+        state.record(self.name, "file_operation_failed", code)
+        return AgentResult(
+            success=False,
+            message=f"Implementer file operation failed ({code})",
+            data={"files_written": changed, "file_operation_error": code},
         )

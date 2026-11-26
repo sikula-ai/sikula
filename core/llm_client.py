@@ -72,6 +72,14 @@ UsageObserver = Callable[[dict[str, object]], None]
 WriteAttemptBoundary = Callable[[dict[str, object]], ContextManager[None]]
 
 
+class LLMWriteAttemptStopped(RuntimeError):
+    """Non-retryable audit stop; completed output is private agent audit data."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.completed_result: tuple[list[str], str] | None = None
+
+
 class LLMProviderError(RuntimeError):
     """Base class for LLM provider failures."""
 
@@ -270,15 +278,24 @@ def _call_observed(
                 }
             )
         )
-        with boundary_context:
-            value = fn()
-            if isinstance(value, _LLMCallValue):
-                observation.output_chars = value.output_chars
-                observation.reported_tokens = value.reported_tokens
-                result = value.value
-            else:
-                observation.complete(value)
-                result = value
+        result = None
+        try:
+            with boundary_context:
+                value = fn()
+                if isinstance(value, _LLMCallValue):
+                    observation.output_chars = value.output_chars
+                    observation.reported_tokens = value.reported_tokens
+                    result = value.value
+                else:
+                    observation.complete(value)
+                    result = value
+        except LLMWriteAttemptStopped as exc:
+            # Context exit can reject writes after the provider has completed.
+            # Carry its response to the agent's private failure record, never to
+            # diagnostics or retry observers, and keep the stop terminal.
+            if operation == "run_agent" and result is not None:
+                exc.completed_result = result
+            raise
         return result
 
 

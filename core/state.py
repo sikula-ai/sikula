@@ -485,6 +485,7 @@ class TaskState:
     analyst_retry_records: list[dict] = field(default_factory=list)
     review_diff: Optional[str] = None
     review_mode: Optional[str] = None
+    review_validation_pending: bool = False  # review-fix mutations still require configured validation after resume
     review_base_branch: Optional[str] = None
     review_delivery_mode: Optional[str] = None
     review_target_branch: Optional[str] = None

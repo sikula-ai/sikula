@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import pytest
 
 from agents.base_agent import AGENT_SECURITY_PREFIX, paths_outside_allowed
 from agents.implementer_agent import ImplementerAgent, _guidelines_files, _tech_stack
 from core.delivery_constraint_context import delivery_constraint_context_fingerprint
+from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult
 from core.llm_client import LLMEnvironmentError
 from core.state import TaskState
 from tests.conftest import StubLLMClient
@@ -88,6 +90,91 @@ class TestImplementerAgentGuards:
         assert state.implement_cycle_records == []
         assert state.files_changed == []
         assert state.history[-1]["action"] == "delivery_constraint_context_rejected"
+
+
+@pytest.mark.parametrize("mode", ["initial", "no_isolate", "unsupported", "semantic", "security", "delivery"])
+def test_quarantine_is_offered_only_to_isolated_review_repairs(stub_llm, file_tool, mode):
+    state = _make_state(
+        worktree_path=str(file_tool._root),
+        worktree_base=str(file_tool._root),
+        review_issues=["Remove obsolete src/scratch.py"],
+        review_iterations=1,
+    )
+    if mode == "initial":
+        state.review_issues = []
+        state.review_iterations = 0
+    if mode == "security":
+        state.review_iterations = 0
+        state.security_review_iterations = 1
+    if mode == "no_isolate":
+        state.worktree_path = state.worktree_base = None
+    if mode == "delivery":
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 2
+    executor = Mock(return_value=DeliveryQuarantineResult("src/scratch.py", "a" * 32, "digest", 420, 0))
+    stub_llm.agent_output = json.dumps(
+        {"sikula_file_operation_schema_version": 1, "operation": "quarantine_untracked", "path": "src/scratch.py"}
+    )
+    agent = ImplementerAgent(
+        stub_llm,
+        {"file": file_tool},
+        {"sandbox": {"allowed_write_paths": ["src/"]}},
+        quarantine_executor=None if mode == "unsupported" else executor,
+    )
+    result = agent.run(state)
+    enabled = mode in {"semantic", "security", "delivery"}
+    assert ("quarantine_untracked" in stub_llm.agent_calls[0]) is enabled
+    if enabled:
+        executor.assert_called_once_with(state, "src/scratch.py", ["src/"])
+        assert result.success and result.data["files_written"] == ["src/scratch.py"]
+        assert state.implement_cycle_records[-1]["file_quarantined"]["path"] == "src/scratch.py"
+    else:
+        executor.assert_not_called()
+        assert not result.data.get("files_written")
+
+
+@pytest.mark.parametrize(
+    "failure", ["malformed", "denied", "already_satisfied", "terminal_disposition", "mixed_terminal"]
+)
+def test_implementer_quarantine_errors_preserve_output_and_delivery_dispositions(stub_llm, file_tool, failure):
+    state = _make_state(
+        worktree_path=str(file_tool._root),
+        worktree_base=str(file_tool._root),
+        review_issues=["Remove scratch"],
+        review_iterations=1,
+    )
+    operation = {
+        "sikula_file_operation_schema_version": 1,
+        "operation": "quarantine_untracked",
+        "path": "src/scratch.py",
+    }
+    if failure in {"malformed", "mixed_terminal"}:
+        operation["operation"] = "delete"
+    stub_llm.agent_output = json.dumps(operation)
+    if failure in {"already_satisfied", "terminal_disposition", "mixed_terminal"}:
+        _add_delivery_constraint_context(state)
+        state.delivery_write_scope_schema_version = 2
+        disposition = "already_satisfied" if failure == "already_satisfied" else "external_dependency_gap"
+        stub_llm.agent_output += "\n" + json.dumps(
+            {
+                "sikula_disposition_schema_version": 1,
+                "disposition": disposition,
+                "summary": "No safe change.",
+            }
+        )
+    executor = Mock(side_effect=DeliveryQuarantineError("delivery_quarantine.provenance_missing", "Unavailable"))
+    agent = ImplementerAgent(stub_llm, {"file": file_tool}, quarantine_executor=executor)
+    result = agent.run(state)
+    assert not result.success
+    assert state.implement_cycle_records[-1]["implementer_output"] == stub_llm.agent_output
+    assert (state.review_iterations, state.security_review_iterations) == (1, 0)
+    if failure == "denied":
+        executor.assert_called_once()
+        assert result.data["file_operation_error"] == "delivery_quarantine.provenance_missing"
+    else:
+        executor.assert_not_called()
+    if failure in {"terminal_disposition", "mixed_terminal"}:
+        assert state.delivery_stop_disposition["disposition"] == "external_dependency_gap"
 
 
 # ---------------------------------------------------------------------------

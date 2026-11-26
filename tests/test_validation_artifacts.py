@@ -681,6 +681,47 @@ def test_delivery_scope_file_identity_failures_are_closed(tmp_path: Path, monkey
         validation_artifacts_module.delivery_scope_file_identities(tmp_path, binding.git_dir)
 
 
+@pytest.mark.parametrize("force_path_fallback", [False, True])
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_delivery_scope_snapshot_keeps_clean_files_and_build_outputs_sparse(
+    tmp_path, monkeypatch, force_path_fallback, line_ending
+):
+    if force_path_fallback:
+        monkeypatch.setattr(
+            validation_artifacts_module, "_delivery_scope_descriptor_traversal_supported", lambda: False
+        )
+    # Audit Git calls exclude global config. Commit the same bytes on every host
+    # instead of letting a global autocrlf setting normalize this clean baseline.
+    subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "src").mkdir(exist_ok=True)
+    for index in range(200):
+        (tmp_path / "src" / f"clean{index}.py").write_bytes(b"# unchanged source" + line_ending)
+    (tmp_path / ".gitignore").write_bytes(b"build/" + line_ending)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "clean sources"], cwd=tmp_path, check=True, capture_output=True)
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "cache.bin").write_bytes(b"Build contents must not be read")
+    (build / ".gitignore").write_text("*.tmp\n")
+    (tmp_path / "src/scratch.py").write_text("# new source\n")
+    read = validation_artifacts_module._snapshot_delivery_scope_regular_file
+
+    def guarded_read(path, **kwargs):
+        assert Path(path).name != "cache.bin"
+        assert not Path(path).name.startswith("clean")
+        return read(path, **kwargs)
+
+    monkeypatch.setattr(validation_artifacts_module, "_snapshot_delivery_scope_regular_file", guarded_read)
+    kwargs = dict(exclude_ephemeral=lambda path: "build" in Path(path).parts)
+    before = snapshot_delivery_scope_files(tmp_path, **kwargs)
+    assert set(before) == {"src/scratch.py"}
+    assert deserialize_delivery_scope_snapshot(serialize_delivery_scope_snapshot(before)) == before
+    (tmp_path / ".gitignore").write_bytes(b"build/" + line_ending + b"*.log" + line_ending)
+    (build / "cache.bin").write_bytes(b"Changed build contents")
+    after = snapshot_delivery_scope_files(tmp_path, **kwargs)
+    assert {item.path for item in detect_validation_artifacts(before, after)} == {".gitignore"}
+
+
 def test_delivery_scope_snapshot_prunes_ephemeral_ignored_roots_before_opening(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

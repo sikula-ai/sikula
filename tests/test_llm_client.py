@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -28,6 +29,7 @@ from core.llm_client import (
     LLMReadOnlyViolation,
     LLMTransientError,
     LLMTimeoutError,
+    LLMWriteAttemptStopped,
     _agent_text_or_empty,
     _AntigravityCopyPolicy,
     _antigravity_copy_ignore,
@@ -212,6 +214,45 @@ class TestCallWithRetry:
         assert events[0]["error_type"] == "RuntimeError"
         assert events[0]["output_chars"] == 6
         assert events[0]["reported_tokens"] == usage
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    @pytest.mark.parametrize("stage", ["before", "provider_failure", "after"])
+    def test_write_stop_carries_only_completed_output_without_retry_or_disclosure(self, wrapped, stage, caplog):
+        stop = LLMWriteAttemptStopped("unit_scope_violation")
+
+        @contextmanager
+        def boundary(_attempt):
+            if stage == "before":
+                raise stop
+            try:
+                yield
+            finally:
+                raise stop
+
+        events, retries = [], []
+        cfg = LLMConfig(
+            provider="codex",
+            usage_observer=events.append,
+            retry_observer=retries.append,
+            write_attempt_boundary=boundary,
+        )
+        result = (["src/private.py"], "PRIVATE_COMPLETED_RESPONSE")
+        fn = MagicMock(return_value=_LLMCallValue(result, output_chars=len(result[1])) if wrapped else result)
+        if stage == "provider_failure":
+            fn.side_effect = LLMTransientError("provider did not complete")
+        with pytest.raises(LLMWriteAttemptStopped) as caught:
+            _call_with_retry("test", fn, cfg, "run_agent", input_chars=20)
+        assert caught.value is stop
+        assert stop.completed_result == (result if stage == "after" else None)
+        assert fn.call_count == (0 if stage == "before" else 1)
+        assert len(events) == 1 and not retries
+        assert events[0]["outcome"] == "error"
+        assert events[0]["error_type"] == "LLMWriteAttemptStopped"
+        if stage == "after" and wrapped:
+            assert events[0]["output_chars"] == len(result[1])
+        diagnostics = json.dumps(events) + str(stop) + repr(stop) + caplog.text
+        assert "PRIVATE_COMPLETED_RESPONSE" not in diagnostics
+        assert "src/private.py" not in diagnostics
 
     def test_records_timeout_and_retry_as_separate_attempts(self):
         events = []

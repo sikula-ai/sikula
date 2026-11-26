@@ -127,6 +127,7 @@ def test_successful_rewrite_refreshes_provenance(owned_file, identity):
             "digest": rewritten.digest,
             "mode": 0o600,
             "session_id": "session",
+            "review_preexisting_change": False,
         }
     ]
 

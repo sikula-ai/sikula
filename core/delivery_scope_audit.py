@@ -1,4 +1,4 @@
-"""Provider-independent mutation auditing for delivery-unit write scopes."""
+"""Shared provider-independent mutation auditing for effective write scopes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from core.delivery_public_metadata import sanitize_delivery_public_metadata
+from core.delivery_quarantine import quarantine_prunable_paths, quarantine_run_eligible
+from core.llm_client import LLMWriteAttemptStopped
 from core.state import DELIVERY_STOP_UNIT_SCOPE_VIOLATION, StateStore, TaskState
 from core.validation_artifacts import (
     DeliveryScopeGitBinding,
@@ -90,7 +92,7 @@ class DeliveryScopeAuditPolicy:
     agent: str
 
 
-class DeliveryScopeProviderAttemptStopped(RuntimeError):
+class DeliveryScopeProviderAttemptStopped(LLMWriteAttemptStopped):
     """Stop provider retries after a fail-closed delivery scope audit."""
 
 
@@ -191,14 +193,16 @@ class DeliveryScopeAudit:
         tools: dict[str, object],
         agents: Callable[[], dict[str, object]],
         quarantine_session_id: str | None = None,
+        on_retained_scope_violation: Callable[[TaskState, str, list[str]], None] | None = None,
     ) -> None:
         self._config = config
         self._store = store
         self._tools = tools
         self._agents_provider = agents
         self._quarantine_session_id = quarantine_session_id
+        self._on_retained_scope_violation = on_retained_scope_violation
         self._delivery_scope_roots_cache: tuple[tuple[str, bool], ...] | None = None
-        self._verified_provider_attempt_policy: tuple[str, DeliveryScopeAuditPolicy] | None = None
+        self._verified_provider_attempt_policy: tuple[str, DeliveryScopeAuditPolicy, tuple[str, ...]] | None = None
         self._quarantine_session_tasks: set[str] = set()
 
     @property
@@ -309,11 +313,23 @@ class DeliveryScopeAudit:
         policy: DeliveryScopeAuditPolicy,
         attempt: dict[str, object],
     ):
+        if not state.delivery_plan_id:
+            return self._quarantine_provider_attempt_boundary(state, name, policy, attempt)
         return self._delivery_scope_provider_attempt_boundary(state, name, policy, attempt)
+
+    def observes_quarantine(self, state: TaskState, name: str) -> bool:
+        return bool(
+            name in {"implementer", "fixer"}
+            and self._quarantine_session_id is not None
+            and quarantine_run_eligible(state)
+        )
 
     def start_quarantine_session(self, state: TaskState) -> None:
         """Discard persisted move authority when a task enters a new process session."""
 
+        # An agent invocation without an observed provider call must not consume
+        # the previous invocation's successful audit, even for the same actor.
+        self._verified_provider_attempt_policy = None
         if state.task_id in self._quarantine_session_tasks:
             return
         self._quarantine_session_tasks.add(state.task_id)
@@ -329,12 +345,12 @@ class DeliveryScopeAudit:
                 "stale file-quarantine authority cleared for a new process session",
             )
 
-    def consume_verified_provider_attempt_policy(
+    def consume_verified_provider_attempt(
         self,
         name: str,
         active_write_paths: tuple[str, ...],
-    ) -> DeliveryScopeAuditPolicy:
-        """Consume the exact policy verified around the latest provider attempt."""
+    ) -> tuple[DeliveryScopeAuditPolicy, tuple[str, ...]]:
+        """Consume the exact policy and observed writes of the latest verified attempt."""
 
         verified = self._verified_provider_attempt_policy
         self._verified_provider_attempt_policy = None
@@ -349,9 +365,10 @@ class DeliveryScopeAudit:
                 ]
             )
         )
-        if captured != active_write_paths:
-            raise DeliveryScopeSnapshotError("Verified provider-attempt scope does not match the Fixer request.")
-        return policy
+        normalize = self._normalize_delivery_scope_authority_path
+        if tuple(dict.fromkeys(map(normalize, captured))) != tuple(dict.fromkeys(map(normalize, active_write_paths))):
+            raise DeliveryScopeSnapshotError("Verified provider-attempt scope does not match the agent request.")
+        return policy, verified[2]
 
     def tool_mutation_boundary(self, state: TaskState, phase: str):
         return self._delivery_scope_tool_mutation_boundary(state, phase)
@@ -437,6 +454,7 @@ class DeliveryScopeAudit:
 
     def _delivery_scope_fixer_test_change(
         self,
+        state: TaskState,
         policy: DeliveryScopeAuditPolicy,
         path: str,
         before,
@@ -447,6 +465,13 @@ class DeliveryScopeAudit:
             policy.resolved_test_write_paths,
         ):
             return False
+        classify = getattr(self._agents.get("fixer"), "delivery_scope_test_change", None)
+        if not state.delivery_plan_id and callable(classify):
+            return classify(
+                path,
+                self._delivery_scope_snapshot_text(before),
+                self._delivery_scope_snapshot_text(after),
+            )
         if _path_looks_like_test_artifact(path):
             return True
         build_tool: BuildTool = self._tools["build"]
@@ -580,6 +605,10 @@ class DeliveryScopeAudit:
     def _delivery_scope_audit_location(self, state: TaskState) -> tuple[Path, Path, str]:
         root = self._validation_artifact_root(state).resolve()
         project_root = self._config.project_root.resolve()
+        if not state.delivery_plan_id and (
+            not quarantine_run_eligible(state) or Path(state.worktree_path).resolve() != project_root
+        ):
+            raise DeliveryScopeSnapshotError("File quarantine requires the task's isolated project workspace.")
         try:
             relative = project_root.relative_to(root)
         except ValueError as exc:
@@ -885,6 +914,82 @@ class DeliveryScopeAudit:
         except DeliveryScopeSnapshotError:
             return self._record_delivery_scope_snapshot_failure(state, name)
 
+    def revoke_quarantine_observation(self, state: TaskState) -> None:
+        self._verified_provider_attempt_policy = None
+        state.delivery_quarantine_candidates = []
+        state.record(
+            "orchestrator",
+            "quarantine_authority_unavailable",
+            "The provider attempt could not establish file-quarantine authority; candidates cleared.",
+        )
+        self._store.save(state)
+
+    @contextmanager
+    def _quarantine_provider_attempt_boundary(
+        self,
+        state: TaskState,
+        name: str,
+        policy: DeliveryScopeAuditPolicy,
+        attempt: dict[str, object],
+    ) -> Iterator[None]:
+        """Certify standalone removal authority without imposing delivery's durable audit.
+
+        Evidence is process-local. Missing snapshots or changed ignore rules revoke
+        removal authority, while ordinary standalone execution retains its sandbox.
+        Actual quarantine moves still use the shared durable recovery protocol.
+        """
+        self._verified_provider_attempt_policy = None
+        before = None
+        try:
+            policy = self._delivery_scope_provider_attempt_policy(state, name, policy)
+            binding = delivery_scope_git_binding(policy.root)
+            snapshot_args = dict(
+                git_baseline=binding.baseline,
+                git_dir=binding.git_dir,
+                git_common_dir=binding.common_dir,
+                git_ignore_fingerprint=binding.ignore_fingerprint,
+                git_ref_fingerprint=binding.ref_fingerprint,
+                validate_policy_bindings=True,
+            )
+            before = self._capture_delivery_scope_snapshot(state, policy, **snapshot_args)
+            identities = delivery_scope_file_identities(policy.root, binding.git_dir)
+        except (DeliveryScopeSnapshotError, OSError, TypeError, ValueError):
+            before = None
+            self.revoke_quarantine_observation(state)
+        try:
+            yield
+        except BaseException:
+            self.revoke_quarantine_observation(state)
+            raise
+        if before is None:
+            return
+        try:
+            after = self._capture_delivery_scope_snapshot(state, policy, **snapshot_args)
+        except (DeliveryScopeSnapshotError, OSError, TypeError, ValueError):
+            self.revoke_quarantine_observation(state)
+            return
+        # Standalone test-only Fixer calls own rollback and a bounded retry.
+        # Observation must revoke removal authority without preempting that recovery.
+        fixer_owns_recovery = name == "fixer" and not policy.production_roots
+        stopped = self._record_delivery_scope_audit(
+            state,
+            name,
+            [item.path for item in detect_validation_artifacts(before, after)],
+            before=before,
+            after=after,
+            policy=policy,
+            provider_attempt=attempt,
+            provider_succeeded=True,
+            preexisting_file_identities=identities,
+            defer_scope_failure=fixer_owns_recovery,
+        )
+        if stopped:
+            self.revoke_quarantine_observation(state)
+            if fixer_owns_recovery:
+                return
+            raise DeliveryScopeProviderAttemptStopped(DELIVERY_SCOPE_VIOLATION_CODE)
+        self._store.save(state)
+
     @contextmanager
     def _delivery_scope_provider_attempt_boundary(
         self,
@@ -978,7 +1083,6 @@ class DeliveryScopeAudit:
             if stopped:
                 self._verified_provider_attempt_policy = None
                 raise DeliveryScopeProviderAttemptStopped(DELIVERY_SCOPE_VIOLATION_CODE)
-            self._verified_provider_attempt_policy = (name, policy)
 
     def _restore_delivery_scope_outer_pending(
         self,
@@ -1324,7 +1428,7 @@ class DeliveryScopeAudit:
         return tuple(lexical_paths), tuple(resolved_paths)
 
     def _record_delivery_scope_snapshot_failure(self, state: TaskState, name: str) -> bool:
-        message = "Delivery scope audit could not establish a trustworthy filesystem snapshot."
+        message = "Write scope audit could not establish a trustworthy filesystem snapshot."
         metadata = {"code": "delivery_scope_audit_unavailable", "agent": name}
         if name in DELIVERY_SCOPE_TOOL_ACTORS:
             metadata["audit_boundary"] = "tool_mutation"
@@ -1336,9 +1440,17 @@ class DeliveryScopeAudit:
             metadata=metadata,
         )
         state.record("orchestrator", "delivery_scope_audit_unavailable", message)
-        state.set_delivery_terminal_stop(DELIVERY_STOP_UNIT_SCOPE_VIOLATION, source="orchestrator")
+        self._stop_for_scope_violation(state)
         self._store.save(state)
         return True
+
+    @staticmethod
+    def _stop_for_scope_violation(state: TaskState) -> None:
+        if state.delivery_plan_id and state.delivery_unit_id:
+            state.set_delivery_terminal_stop(DELIVERY_STOP_UNIT_SCOPE_VIOLATION, source="orchestrator")
+        else:
+            state.failed = True
+            state.done = False
 
     def _record_delivery_scope_audit(
         self,
@@ -1354,6 +1466,7 @@ class DeliveryScopeAudit:
         provider_succeeded: bool = False,
         preexisting_file_identities: set[tuple[int, int]] | None = None,
         tool_phase: str | None = None,
+        defer_scope_failure: bool = False,
     ) -> bool:
         project_paths: list[tuple[str, str]] = []
         outside_project_paths: list[str] = []
@@ -1369,6 +1482,7 @@ class DeliveryScopeAudit:
             if not (
                 name == "fixer"
                 and self._delivery_scope_fixer_test_change(
+                    state,
                     policy,
                     project_path,
                     before.get(audit_path),
@@ -1387,18 +1501,37 @@ class DeliveryScopeAudit:
         ]
         violation_count = len(violation_paths) + len(outside_project_paths)
         quarantine_candidates: list[str] = []
+        ignore_changed = any(path.rsplit("/", 1)[-1] == ".gitignore" for path in changed_paths)
+        if ignore_changed:
+            # A classification-changing attempt never grants removal authority.
+            state.delivery_quarantine_candidates = []
         if provider_attempt is not None and name in {"implementer", "fixer"}:
             quarantine_candidates = self._update_delivery_quarantine_candidates(
                 state,
                 project_paths,
                 before=before,
                 after=after,
-                trusted=provider_succeeded and not violation_count,
+                trusted=provider_succeeded and not violation_count and not ignore_changed,
                 preexisting_file_identities=preexisting_file_identities,
             )
         reconciled_paths: list[str] = []
         if resume_recovery and not violation_count and name == "implementer":
-            reconciled_paths = sorted({project_path for _, project_path in production_paths})
+            quarantined = quarantine_prunable_paths(
+                state,
+                [
+                    record
+                    for record in state.delivery_quarantine_records
+                    if isinstance(record, dict)
+                    and record.get("status") in {"quarantined", "cleaned"}
+                    and isinstance(record.get("path"), str)
+                ],
+            )
+            removed = {path for audit_path, path in production_paths if path in quarantined and audit_path not in after}
+            # A completed move can precede interruption of the outer audit. Keep
+            # its private history without resurrecting absent files as net writes.
+            state.files_changed = [path for path in state.files_changed if path not in removed]
+            state.step_files_changed = [path for path in state.step_files_changed if path not in removed]
+            reconciled_paths = sorted({path for _, path in production_paths} - removed)
             for path in reconciled_paths:
                 if path not in state.files_changed:
                     state.files_changed.append(path)
@@ -1451,32 +1584,39 @@ class DeliveryScopeAudit:
                     "violation_paths": self._bounded_delivery_scope_paths(violation_paths),
                     "declared_paths": self._bounded_delivery_scope_paths(state.delivery_declared_write_paths),
                     "effective_paths": self._bounded_delivery_scope_paths(path for path, _ in policy.production_roots),
-                    "recommended_action": "delivery_amend_prepare",
+                    "recommended_action": "delivery_amend_prepare" if state.delivery_plan_id else "inspect_worktree",
                 }
             )
         state.record_validation(
             "delivery_scope_audit",
             "failed" if violation_count else "passed",
-            error=(
-                "Production changes escaped the effective delivery-unit scope; prepare a delivery amendment."
-                if violation_count
-                else None
-            ),
+            error=("Production changes escaped the effective write scope." if violation_count else None),
             metadata=metadata,
         )
         if not violation_count:
+            if provider_succeeded and provider_attempt is not None:
+                self._verified_provider_attempt_policy = (
+                    name,
+                    policy,
+                    tuple(sorted({path for _, path in project_paths})),
+                )
             return False
+        if defer_scope_failure:
+            return True
+
+        # The exception bypasses the agent's changed-file result. Reconcile the
+        # observed retained writes before persisting a terminal standalone stop.
+        # Test-only Fixer rollback owns its transient writes and returns above.
+        if not state.delivery_plan_id and self._on_retained_scope_violation is not None:
+            self._on_retained_scope_violation(state, name, sorted({path for _, path in project_paths}))
 
         message = (
             f"{DELIVERY_SCOPE_VIOLATION_CODE}: {violation_count} production path(s) escaped the "
-            "effective delivery-unit scope; prepare a delivery amendment before retrying"
+            "effective write scope; inspect the worktree before retrying"
         )
         log.error(message)
         state.record("orchestrator", DELIVERY_SCOPE_VIOLATION_CODE, message)
-        state.set_delivery_terminal_stop(
-            DELIVERY_STOP_UNIT_SCOPE_VIOLATION,
-            source="orchestrator",
-        )
+        self._stop_for_scope_violation(state)
         self._store.save(state)
         return True
 
@@ -1564,6 +1704,10 @@ class DeliveryScopeAudit:
                 "mode": after_snapshot.mode,
                 "identity": list(after_snapshot.identity),
                 "session_id": self._quarantine_session_id,
+                "review_preexisting_change": provenance.get(
+                    "review_preexisting_change",
+                    state.review_mode in {"review_report", "review_fix"} and project_path in state.files_changed,
+                ),
             }
         state.delivery_quarantine_candidates = [
             owned[path] for path in sorted(owned)[:DELIVERY_QUARANTINE_CANDIDATE_LIMIT]

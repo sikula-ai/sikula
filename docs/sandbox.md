@@ -49,7 +49,13 @@ git commit -m "Add Sikula project setup"
 
 These paths are passed to agents as constraints. Provider-specific hard
 enforcement varies. For ordinary tasks, an unexpected write remains an audited
-write-scope warning unless a more specific pipeline invariant applies.
+write-scope warning unless a more specific pipeline invariant applies. On systems
+supporting reversible quarantine, isolated standalone Implementer/Fixer calls also
+collect process-local evidence for removal authority. An observed scope violation
+stops the task. Unavailable evidence or changed ignore rules revoke quarantine
+authority without stopping ordinary execution; they never authorize removal.
+This optional observation does not replace the sandbox or impose the required
+delivery audit described below on standalone tasks.
 
 Delivery children add a fail-closed production boundary. An absent or empty unit
 `scope_paths` list keeps `sandbox.allowed_write_paths`; a non-empty list is
@@ -66,6 +72,33 @@ sanitized audit evidence, but does not proceed to validation, review, test
 writing, commit, handoff, or delivery assembly. The audit exposes only bounded
 project-relative path metadata, never file contents, prompts, provider output,
 or raw task state.
+
+## Reversible Removal Of Agent-Created Files
+
+In isolated standalone tasks and delivery children on supported POSIX systems,
+the Fixer can request removal of an obsolete ordinary-untracked file created by
+a successful audited Implementer or Fixer attempt in the current process. The
+Implementer can request the same operation when addressing semantic or security
+review findings. Removing the file is a real repair even when no other files change;
+required reviews and validation still run afterward, within their existing budgets.
+
+Sikula verifies provenance and the current call's exact write scope, then moves the
+file into private retained storage under the repository's Git common directory.
+It does not delete the contents. Tracked, staged, ignored, pre-existing, linked,
+private, out-of-scope and stale files are rejected. Restarting or resuming in a new
+process does not adopt earlier files as removable; their historical audit remains.
+Initial Implementer calls, read-only reviewers, TestWriter, Fixer test-only triage,
+`--no-isolate` runs and unsupported platforms, including Windows, have no removal
+capability. Fixer's production-confirmed triage pass can request it after its own
+successful audit, without deferring a request from an earlier test-only pass.
+
+Explicit `sikula cleanup <task-id> --force` or `sikula delete <task-id> --force`
+removes retained storage; the corresponding dry run reports its count and size.
+If a move is interrupted, `sikula cleanup <task-id> --quarantine-only --force` can
+preserve the worktree and unblock resume only when the retained entry proves that
+the move completed. If it stopped before rename, inspection or normal cleanup
+with `--discard` is required. Quarantined paths disappear from net change tracking,
+while private operation records and agent output retain the audit history.
 
 ## Read-Only Agents
 
