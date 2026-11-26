@@ -1914,7 +1914,43 @@ def _saved_state(tmp_path: Path, *, worktree: Path | None = None):
 
 
 class TestCmdCleanup:
-    def test_quarantine_only_cleanup_preserves_worktree_and_invalidates_gates(self, tmp_path: Path, capsys):
+    @pytest.mark.parametrize("phase", ["moving", "cleaned_pending", "cleaned", "unrelated"])
+    def test_reset_failed_preserves_only_pending_implementer_quarantine_budgets(self, tmp_path, phase):
+        from sikula import _reset_failed_state
+
+        store, state = _saved_state(tmp_path, worktree=tmp_path / "wt")
+        state.failed = True
+        state.files_changed = ["src/Keep.kt"]
+        state.review_iterations = 2
+        state.security_review_iterations = 3
+        state.build_iterations = 4
+        state.build_loop_key = "final_full_task"
+        state.build_loop_start_iteration = 1
+        if phase != "unrelated":
+            state.delivery_quarantine_records = [
+                {
+                    "requested_by": "implementer",
+                    "status": "moving" if phase == "moving" else "cleaned",
+                    "recovery_pending": phase == "cleaned_pending",
+                }
+            ]
+        store.save(state)
+        _reset_failed_state(state.task_id, _run_cfg(tmp_path), store)
+        loaded = store.load(state.task_id)
+        assert not loaded.failed
+        preserve = phase in {"moving", "cleaned_pending"}
+        assert (loaded.review_iterations, loaded.security_review_iterations, loaded.build_iterations) == (
+            (2, 3, 4) if preserve else (0, 0, 0)
+        )
+        assert loaded.build_loop_key == ("final_full_task" if preserve else None)
+        assert loaded.build_loop_start_iteration == (1 if preserve else 0)
+        assert loaded.delivery_quarantine_records == state.delivery_quarantine_records
+
+    @pytest.mark.parametrize("requested_by", ["fixer", "implementer"])
+    @pytest.mark.parametrize("review_original", [None, False, True])
+    def test_quarantine_only_cleanup_preserves_worktree_and_invalidates_gates(
+        self, tmp_path: Path, capsys, requested_by, review_original
+    ):
         import sikula_cli.cleanup as cleanup_cli
 
         worktree = tmp_path / "wt"
@@ -1932,7 +1968,12 @@ class TestCmdCleanup:
         state.files_changed = ["src/Scratch.kt", "src/Keep.kt"]
         state.step_files_changed = ["src/Scratch.kt", "src/Keep.kt"]
         state.test_files_written = ["src/Scratch.kt"]
-        state.delivery_quarantine_records = [{"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32}]
+        state.delivery_quarantine_records = [
+            {"status": "moving", "path": "src/Scratch.kt", "quarantine_id": "1" * 32, "requested_by": requested_by}
+        ]
+        if review_original is not None:
+            state.review_mode = "review_fix"
+            state.delivery_quarantine_records[0]["review_preexisting_change"] = review_original
         store.save(state)
         context = cleanup_cli.CleanupContext(
             resolve_state_dir=lambda _cfg: tmp_path / ".sikula" / "state",
@@ -1964,16 +2005,17 @@ class TestCmdCleanup:
         assert worktree.exists()
         assert loaded.failed is True
         assert loaded.delivery_quarantine_records[0]["status"] == "cleaned"
-        assert loaded.files_changed == ["src/Keep.kt"]
-        assert loaded.step_files_changed == ["src/Keep.kt"]
+        expected_paths = ["src/Scratch.kt", "src/Keep.kt"] if review_original else ["src/Keep.kt"]
+        assert loaded.files_changed == expected_paths
+        assert loaded.step_files_changed == expected_paths
         assert loaded.test_files_written == []
         assert loaded.build_synced is False
         assert loaded.fixer_changed_code is True
         assert loaded.delivery_no_change_outcome is None
         assert loaded.review_approved is False
         assert loaded.security_approved is False
-        assert loaded.review_iterations == 0
-        assert loaded.security_review_iterations == 0
+        assert loaded.review_iterations == (2 if requested_by == "implementer" else 0)
+        assert loaded.security_review_iterations == (2 if requested_by == "implementer" else 0)
         assert loaded.tests_up_to_date is False
         assert loaded.final_full_task_review_done is False
         assert loaded.history[-1]["action"] == "delivery_quarantine_interrupted_cleanup"

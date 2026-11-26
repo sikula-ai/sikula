@@ -1,10 +1,14 @@
-"""Platform-neutral contracts for reversible delivery-file quarantine."""
+"""Platform-neutral contracts for reversible agent-created file quarantine."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core.state import TaskState
 
 
 DELIVERY_QUARANTINE_SCHEMA_VERSION = 1
@@ -12,6 +16,22 @@ DELIVERY_QUARANTINE_OPERATION = "quarantine_untracked"
 MAX_DELIVERY_QUARANTINE_PATH_CHARS = 500
 
 _QUARANTINE_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def quarantine_run_eligible(state: TaskState) -> bool:
+    """Select isolated runs; filesystem and attempt authority are checked separately."""
+    return bool(
+        state.worktree_path
+        and state.worktree_base
+        and (
+            not (state.delivery_plan_id or state.delivery_unit_id)
+            or (
+                state.delivery_plan_id
+                and state.delivery_unit_id
+                and state.delivery_write_scope_schema_version is not None
+            )
+        )
+    )
 
 
 class DeliveryQuarantineError(RuntimeError):
@@ -77,3 +97,26 @@ def delivery_quarantine_has_incomplete_move(records: object) -> bool:
         if record["status"] == "moving":
             return True
     return False
+
+
+def quarantine_recovery_preserves_budgets(records: list[dict]) -> bool:
+    """Keep consumed repair budgets until an interrupted Implementer move is recovered."""
+    return any(
+        isinstance(record, dict)
+        and record.get("requested_by") == "implementer"
+        and (record.get("status") == "moving" or record.get("recovery_pending") is True)
+        for record in records
+    )
+
+
+def quarantine_prunable_paths(state: TaskState, records: list[dict]) -> set[str]:
+    """Keep original review changes even when an agent-created replacement is removed."""
+    return {
+        record["path"]
+        for record in records
+        if isinstance(record, dict)
+        and isinstance(record.get("path"), str)
+        and (
+            state.review_mode not in {"review_report", "review_fix"} or record.get("review_preexisting_change") is False
+        )
+    }

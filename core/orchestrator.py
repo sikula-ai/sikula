@@ -64,9 +64,11 @@ from core.delivery_scope_audit import (
     delivery_scope_audit_recovery_required as delivery_scope_audit_recovery_required,
 )
 from core.delivery_quarantine import (
+    quarantine_prunable_paths,
     DeliveryQuarantineError,
     DeliveryQuarantineResult,
     delivery_quarantine_has_incomplete_move,
+    quarantine_run_eligible,
 )
 from core.delivery_unit_metadata import delivery_unit_planner_step_limit
 from core.diagnostics import diagnostic_excerpt
@@ -369,7 +371,12 @@ class Orchestrator:
         self._agents = {
             "analyst": AnalystAgent(_llm("analyst"), self._tools, pc),
             "planner": PlannerAgent(_llm("planner"), self._tools, pc),
-            "implementer": ImplementerAgent(_llm("implementer"), self._tools, pc),
+            "implementer": ImplementerAgent(
+                _llm("implementer"),
+                self._tools,
+                pc,
+                quarantine_executor=self._execute_implementer_quarantine if quarantine_supported else None,
+            ),
             "reviewer": ReviewerAgent(_llm("reviewer"), self._tools, pc),
             "security_reviewer": SecurityReviewerAgent(_llm("security_reviewer"), self._tools, pc),
             "test_writer": TestWriterAgent(_llm("test_writer"), self._tools, pc),
@@ -386,6 +393,7 @@ class Orchestrator:
             tools=self._tools,
             agents=lambda: self._agents,
             quarantine_session_id=self._delivery_quarantine_session_id,
+            on_retained_scope_violation=self._record_retained_scope_violation,
         )
 
     # ------------------------------------------------------------------
@@ -448,7 +456,7 @@ class Orchestrator:
             return state
         if active_invocation and delivery_quarantine_has_incomplete_move(state.delivery_quarantine_records):
             message = (
-                "An interrupted file quarantine requires explicit cleanup before this delivery child can resume. Run "
+                "An interrupted file quarantine requires explicit cleanup before this task can resume. Run "
                 f"`sikula cleanup {state.task_id} --quarantine-only --force` and follow its reported next action."
             )
             state.record("orchestrator", "delivery_quarantine_cleanup_required", message)
@@ -459,6 +467,15 @@ class Orchestrator:
             return state
         if active_invocation and before_pipeline is not None:
             before_pipeline(state)
+        if (
+            active_invocation
+            and not state.failed
+            and any(record.get("recovery_pending") is True for record in state.delivery_quarantine_records)
+        ):
+            for record in state.delivery_quarantine_records:
+                if record.get("recovery_pending") is True:
+                    record["recovery_pending"] = False
+            self._store.save(state)
         self._loop(state)
         return state
 
@@ -853,6 +870,7 @@ class Orchestrator:
             and has_preexisting_changes
             and self._reviewer_ran_this_session
             and not self._session_code_changed
+            and not state.review_validation_pending
             and not state.fixer_changed_code
         ):
             if self._active_test_execution_gate_findings(state):
@@ -887,9 +905,13 @@ class Orchestrator:
         if not self._config.run_build:
             if self._abort_no_build_with_active_test_execution_gates(state):
                 return
+            if self._reject_unclassified_delivery_completion(state, set_done=True):
+                return
             state.test_status = "skipped"
             state.check_status = "skipped"
             state.done = bool(state.files_changed) or is_delivery_implementation_already_satisfied(state)
+            if state.done:
+                state.review_validation_pending = False
             if not state.done:
                 log.warning("Implementation produced no file changes")
             self._store.save(state)
@@ -975,6 +997,8 @@ class Orchestrator:
 
         if not self._config.run_build:
             if self._abort_no_build_with_active_test_execution_gates(state):
+                return
+            if self._reject_unclassified_delivery_completion(state, set_done=True):
                 return
             state.test_status = "skipped"
             state.check_status = "skipped"
@@ -1134,7 +1158,7 @@ class Orchestrator:
         # Build/fix for this step — only when run_build_per_step is explicitly enabled.
         # Default: build is deferred to after the last step (_run_step_loop handles it).
         if not self._config.run_build or not self._config.run_build_per_step:
-            return True
+            return not self._reject_unclassified_delivery_completion(state, set_done=False)
 
         return self._run_build_fix_loop(state, set_done=False)
 
@@ -1277,24 +1301,11 @@ class Orchestrator:
             # Passing build (and tests/checks if enabled)
             state.build_loop_key = None
             state.build_loop_start_iteration = 0
-            delivery_change_paths = state.files_changed if set_done else state.step_files_changed
-            if (
-                state.delivery_plan_id
-                and state.delivery_unit_id
-                and not delivery_change_paths
-                and not is_delivery_implementation_already_satisfied(state)
-            ):
-                scope = "unit" if set_done else "current planner step"
-                message = (
-                    f"Delivery validation passed, but quarantine removed every {scope} implementation change "
-                    "without an explicit already-satisfied outcome."
-                )
-                state.record("orchestrator", "delivery_no_change_unclassified", message)
-                state.failed = True
-                self._store.save(state)
+            if self._reject_unclassified_delivery_completion(state, set_done=set_done):
                 return False
             if set_done:
                 state.done = True
+                state.review_validation_pending = False
             self._store.save(state)
             return True
 
@@ -1311,6 +1322,24 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Review / test-write / fix phases (shared helpers)
     # ------------------------------------------------------------------
+
+    def _reject_unclassified_delivery_completion(self, state: TaskState, *, set_done: bool) -> bool:
+        # Older resumed plans have only cumulative provenance. Do not interpret
+        # an unavailable per-step list as proof that this step made no changes.
+        paths = state.files_changed if set_done or not state.step_file_tracking_enabled else state.step_files_changed
+        if (
+            state.delivery_plan_id
+            and state.delivery_unit_id
+            and not paths
+            and not is_delivery_implementation_already_satisfied(state)
+        ):
+            scope = "unit" if set_done else "current planner step"
+            message = f"Delivery {scope} has no net implementation changes or explicit already-satisfied outcome."
+            state.record("orchestrator", "delivery_no_change_unclassified", message)
+            state.failed = True
+            self._store.save(state)
+            return True
+        return False
 
     def _run_review_loop(self, state: TaskState) -> None:
         if not self._config.run_review:
@@ -1357,7 +1386,7 @@ class Orchestrator:
                 return
             files_written = (implementer_result.data or {}).get("files_written", [])
             if files_written:
-                self._session_code_changed = True
+                self._mark_session_code_changed(state)
                 self._mark_build_sync_stale_if_needed(files_written, "review fix", state)
                 state.tests_up_to_date = False
             self._store.save(state)
@@ -1416,7 +1445,7 @@ class Orchestrator:
                 break
             state.security_review_iterations += 1
             state.review_approved = False
-            state.review_iterations = 0
+            quarantine_record_start = len(state.delivery_quarantine_records)
             scope = _phase_scope_label(state)
             log.info(f"--- Phase: implement ({scope}security fix {state.security_review_iterations}/{max_iter}) ---")
             implementer_result = self._run_agent("implementer", state)
@@ -1429,9 +1458,17 @@ class Orchestrator:
                 state.failed = True
                 self._store.save(state)
                 return
+            # Keep the consumed semantic allowance throughout the provider call
+            # and any interrupted quarantine. Ordinary successful security edits
+            # retain their existing fresh semantic-review allowance.
+            if not any(
+                record.get("requested_by") == "implementer" and record.get("status") == "quarantined"
+                for record in state.delivery_quarantine_records[quarantine_record_start:]
+            ):
+                state.review_iterations = 0
             files_written = (implementer_result.data or {}).get("files_written", [])
             if files_written:
-                self._session_code_changed = True
+                self._mark_session_code_changed(state)
                 self._mark_build_sync_stale_if_needed(files_written, "security fix", state)
                 state.tests_up_to_date = False
             self._store.save(state)
@@ -1736,7 +1773,7 @@ class Orchestrator:
         paths = {str(path) for path in files_written if str(path).strip()}
         if not paths:
             return
-        self._session_code_changed = True
+        self._mark_session_code_changed(state)
         state.fixer_changed_code = True
         if self._fixer_change_is_test_only(paths):
             state.security_approved = False
@@ -2453,7 +2490,7 @@ class Orchestrator:
                 state.files_changed.append(path)
         self._record_step_files_changed(state, paths)
         self._invalidate_delivery_no_change_outcome(state, paths, source="adopted build sync output")
-        self._session_code_changed = True
+        self._mark_session_code_changed(state)
         self._mutation_generation += 1
         state.review_approved = False
         state.security_approved = False
@@ -2859,20 +2896,24 @@ class Orchestrator:
         delivery_scope_enabled = self._delivery_scope_audit_enabled(state, name)
         delivery_scope_policy: DeliveryScopeAuditPolicy | None = None
         try:
-            if delivery_scope_enabled:
+            if delivery_scope_enabled or self._delivery_scope_audit.observes_quarantine(state, name):
                 self._delivery_scope_audit.start_quarantine_session(state)
                 delivery_scope_policy = self._delivery_scope_audit_policy(state, name)
-                self._set_delivery_scope_audit_pending(state, name, policy=delivery_scope_policy)
+                if delivery_scope_enabled:
+                    self._set_delivery_scope_audit_pending(state, name, policy=delivery_scope_policy)
             delivery_scope_before = self._delivery_scope_audit_snapshot(
                 state,
                 name,
                 policy=delivery_scope_policy,
             )
         except DeliveryScopeSnapshotError:
-            self._record_delivery_scope_snapshot_failure(state, name)
             if delivery_scope_enabled:
+                self._record_delivery_scope_snapshot_failure(state, name)
                 self._clear_delivery_scope_audit_pending(state)
-            return AgentResult(success=False, message="delivery_scope_audit_unavailable")
+                return AgentResult(success=False, message="delivery_scope_audit_unavailable")
+            self._delivery_scope_audit.revoke_quarantine_observation(state)
+            delivery_scope_policy = None
+            delivery_scope_before = None
         log.info(f"Running {name} agent...")
         t0 = time.perf_counter()
         hist_len = len(state.history)
@@ -2925,7 +2966,7 @@ class Orchestrator:
                     delivery_scope_before,
                     delivery_scope_policy,
                 )
-                if name == "fixer":
+                if name in {"implementer", "fixer"}:
                     result_data = result.data if isinstance(result.data, dict) else {}
                     raw_reported_paths = result_data.get("files_written", [])
                     reported_paths = (
@@ -2944,6 +2985,12 @@ class Orchestrator:
                     self._prune_clean_test_state_paths(
                         state,
                         quarantined_result_paths,
+                        before_snapshot={
+                            path: None
+                            for path in quarantine_prunable_paths(
+                                state, state.delivery_quarantine_records[quarantine_record_start:]
+                            )
+                        },
                         git_env=delivery_scope_git_env(),
                     )
                 if delivery_scope_enabled:
@@ -2979,7 +3026,8 @@ class Orchestrator:
             quarantined_path_set = set(quarantined_result_paths)
             step_files_written = [path for path in step_files_written if path not in quarantined_path_set]
         self._record_step_files_changed(state, step_files_written)
-        if name in {"implementer", "fixer", "test_writer"} and step_files_written:
+        if name in {"implementer", "fixer", "test_writer"} and (step_files_written or quarantined_result_paths):
+            self._mark_session_code_changed(state)
             self._mutation_generation += 1
             self._mark_build_sync_stale_if_needed(step_files_written, name, state)
         if name == "fixer" and not result.success and isinstance(data.get("file_operation_error"), str):
@@ -2995,28 +3043,90 @@ class Orchestrator:
                         state.files_changed.append(path)
                 self._mark_build_sync_stale_if_needed(fixer_files, "fixer", state)
                 self._apply_fixer_change_gate_effects(state, fixer_files, record_test_only=True)
+        if name == "implementer" and not result.success and isinstance(data.get("file_operation_error"), str):
+            if step_files_written:
+                self._invalidate_retained_implementation_gates(state, step_files_written, source="implementer")
         self._store.save(state)
         return result
 
+    def _mark_session_code_changed(self, state: TaskState) -> None:
+        self._session_code_changed = True
+        if state.review_mode == "review_fix" or state.review_diff:
+            state.review_validation_pending = True
+
+    def _record_retained_scope_violation(self, state: TaskState, actor: str, paths: list[str]) -> None:
+        """Account for rejected writes that remain on disk without an agent result."""
+        for path in paths:
+            if path not in state.files_changed:
+                state.files_changed.append(path)
+        self._record_step_files_changed(state, paths)
+        self._invalidate_retained_implementation_gates(state, paths, source=actor)
+        self._mutation_generation += 1
+        self._mark_build_sync_stale_if_needed(paths, actor, state)
+        state.record(
+            "orchestrator",
+            "rejected_provider_changes_reconciled",
+            f"{len(paths)} project path(s) retained after scope rejection; validation invalidated.",
+        )
+
+    def _invalidate_retained_implementation_gates(self, state: TaskState, paths: list[str], *, source: str) -> None:
+        """Invalidate retained implementation mutations without replenishing repair budgets."""
+        self._mark_session_code_changed(state)
+        state.review_approved = False
+        state.security_approved = False
+        state.tests_up_to_date = False
+        state.final_full_task_review_done = False
+        self._invalidate_delivery_no_change_outcome(state, paths, source=source)
+
     def _execute_fixer_quarantine(
+        self, state: TaskState, path: str, active_write_paths: list[str]
+    ) -> DeliveryQuarantineResult:
+        return self._execute_agent_quarantine(state, path, active_write_paths, actor="fixer")
+
+    def _execute_implementer_quarantine(
+        self, state: TaskState, path: str, active_write_paths: list[str]
+    ) -> DeliveryQuarantineResult:
+        if not state.review_issues or not (state.review_iterations > 0 or state.security_review_iterations > 0):
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.scope_unavailable", "Implementer quarantine requires an active review repair."
+            )
+        if self._is_configured_test_write_path(path) or _path_looks_like_test_artifact(path):
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.scope_unavailable", "Implementer quarantine cannot remove test files."
+            )
+        return self._execute_agent_quarantine(state, path, active_write_paths, actor="implementer")
+
+    def _execute_agent_quarantine(
         self,
         state: TaskState,
         path: str,
         active_write_paths: list[str],
+        *,
+        actor: str,
     ) -> DeliveryQuarantineResult:
-        """Execute one Fixer request against its just-audited provider authority."""
+        """Execute one agent request against its just-audited provider authority."""
 
+        if (
+            state.delivery_plan_id
+            and state.plan
+            and state.active_scope != _SCOPE_FINAL_FULL_TASK
+            and not state.step_file_tracking_enabled
+        ):
+            raise DeliveryQuarantineError(
+                "delivery_quarantine.scope_unavailable",
+                "Quarantine in a delivery planner step requires per-step change provenance.",
+            )
         try:
-            if self._delivery_quarantine_session_id is None:
+            if self._delivery_quarantine_session_id is None or not quarantine_run_eligible(state):
                 raise DeliveryScopeSnapshotError("Reversible quarantine is unavailable on this platform.")
-            policy = self._delivery_scope_audit.consume_verified_provider_attempt_policy(
-                "fixer",
+            policy, repair_paths = self._delivery_scope_audit.consume_verified_provider_attempt(
+                actor,
                 tuple(active_write_paths),
             )
         except DeliveryScopeSnapshotError as exc:
             raise DeliveryQuarantineError(
                 "delivery_quarantine.scope_unavailable",
-                "The Fixer quarantine request has no matching audited write scope.",
+                "The agent quarantine request has no matching audited write scope.",
             ) from exc
 
         provenance = next(
@@ -3040,6 +3150,14 @@ class Orchestrator:
         exact_roots = [root for root, exact in policy.resolved_production_roots if exact]
 
         def before_move(intent: dict[str, object]) -> None:
+            # A completed provider call can have other writes besides the removal.
+            # Persist their tracking and sync requirement with the first move intent,
+            # before interruption can bypass the agent's returned changed-file list.
+            for repair_path in repair_paths:
+                if repair_path not in state.files_changed:
+                    state.files_changed.append(repair_path)
+            self._record_step_files_changed(state, repair_paths)
+            self._mark_build_sync_stale_if_needed(repair_paths, actor, state)
             state.delivery_quarantine_candidates = [
                 record
                 for record in state.delivery_quarantine_candidates
@@ -3048,11 +3166,12 @@ class Orchestrator:
             state.delivery_quarantine_records.append(
                 {
                     **intent,
-                    "requested_by": "fixer",
+                    "requested_by": actor,
+                    "review_preexisting_change": provenance.get("review_preexisting_change", True),
                     "recorded_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-            state.record("fixer", "file_quarantine_started", path)
+            state.record(actor, "file_quarantine_started", path)
             self._store.save(state)
 
         def after_move(result: DeliveryQuarantineResult) -> None:
@@ -3063,14 +3182,20 @@ class Orchestrator:
                     break
             if result.path not in state.files_changed:
                 state.files_changed.append(result.path)
-            self._mark_build_sync_stale_if_needed([result.path], "fixer quarantine", state)
-            self._apply_fixer_change_gate_effects(state, [result.path], record_test_only=False)
+            self._mark_build_sync_stale_if_needed([result.path], f"{actor} quarantine", state)
+            changed_paths = list(dict.fromkeys([*repair_paths, result.path]))
+            if actor == "fixer":
+                self._apply_fixer_change_gate_effects(state, changed_paths, record_test_only=False)
+            else:
+                # Review repair consumes its existing budget, even for removal-only output.
+                self._invalidate_retained_implementation_gates(state, changed_paths, source="implementer")
             self._prune_clean_test_state_paths(
                 state,
                 [result.path],
+                before_snapshot={path: None for path in quarantine_prunable_paths(state, [provenance])},
                 git_env=delivery_scope_git_env(),
             )
-            state.record("fixer", "file_quarantined", result.path)
+            state.record(actor, "file_quarantined", result.path)
             self._store.save(state)
 
         for attempt in range(2):
@@ -3098,16 +3223,16 @@ class Orchestrator:
                             record["status"] = "aborted"
                             record["failure_code"] = exc.code
                             record["aborted_at"] = datetime.now(timezone.utc).isoformat()
-                            state.record("fixer", "file_quarantine_aborted", path)
+                            state.record(actor, "file_quarantine_aborted", path)
                             if exc.retry_safe and provenance.get("session_id") == self._delivery_quarantine_session_id:
                                 state.delivery_quarantine_candidates.append(dict(provenance))
                                 authority_restored = True
-                                state.record("fixer", "file_quarantine_authority_restored", path)
+                                state.record(actor, "file_quarantine_authority_restored", path)
                             self._store.save(state)
                             break
                 if not authority_restored or attempt == 1:
                     raise
-                state.record("fixer", "file_quarantine_retry", path)
+                state.record(actor, "file_quarantine_retry", path)
 
     def _run_delivery_review_agent(self, name: str, state: TaskState):
         """Retry one malformed delivery review without consuming a fix attempt."""

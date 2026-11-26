@@ -1527,8 +1527,8 @@ continue to use the separate test-write policy; snapshot content is retained onl
 bounded, non-binary files whose platform-specific mixed source/test classification needs
 it.
 
-On supported POSIX systems, a Fixer in an ordinary pass or a production-confirmed
-pass after test-failure triage may ask Sikula to quarantine one ordinary-untracked
+On supported POSIX systems, a Fixer in an ordinary or production-confirmed triage
+pass, or an Implementer addressing review findings, may ask Sikula to quarantine one ordinary-untracked
 file that a successful audited agent attempt created in the current process.
 Sikula verifies the file identity and exact active write scope, then moves the
 file out of the child worktree without deleting its contents. Tracked, staged, ignored,
@@ -1536,7 +1536,9 @@ linked, pre-existing, stale, private, or cross-session files are rejected. The r
 copy is outside the assembled Git tree and remains available until an explicit
 `sikula cleanup <task-id> --force` or `sikula delete <task-id> --force`; the corresponding
 dry run reports its count and size. The capability is not advertised on Windows,
-non-isolated runs, or the Fixer `test_only` and `test_only_retry` subpasses.
+non-isolated runs, initial Implementer calls, or the Fixer `test_only` and
+`test_only_retry` subpasses. Isolated standalone tasks support the same operation;
+see [reversible file removal](sandbox.md#reversible-removal-of-agent-created-files).
 A `production_confirmed` pass can edit production files and request quarantine
 in the same response. The move happens only after that pass's successful scope
 audit and before the next validation cycle, with no request deferred from an

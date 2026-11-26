@@ -29,7 +29,8 @@ from agents.base_agent import (
 from agents.build_guidance import write_agent_constraints as _write_agent_constraints
 from agents.delivery_contracts import delivery_agent_prompt_context
 from core.delivery_constraint_context import DeliveryConstraintContextError
-from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult
+from agents.quarantine_guidance import QUARANTINE_CONSTRAINT
+from core.delivery_quarantine import DeliveryQuarantineError, DeliveryQuarantineResult, quarantine_run_eligible
 from core.state import TaskState
 from core.structured_output import FixerFileOperationParseError, parse_fixer_file_operation
 from core.synthetic_test_harness_audit import prompt_context_for_records as _synthetic_harness_prompt_context
@@ -274,17 +275,6 @@ GENERATED TEST RE-TRIAGE RECOVERY:
 _CHECK_TEST_CONSTRAINT = """\
 - You MAY modify production or test files if the check errors explicitly reference them
 - Fix ONLY the files named in the check errors — nothing else"""
-
-_DELIVERY_QUARANTINE_CONSTRAINT = """\
-- If the only correct fix is removing one untracked file that this delivery run created, do not
-  use shell deletion. Request Sikula's reversible quarantine by emitting exactly one JSON object:
-  {"sikula_file_operation_schema_version":1,"operation":"quarantine_untracked","path":"project/relative/file"}
-- The request is accepted only for a verified agent-created ordinary file inside this exact write
-  scope. Sikula moves it outside the worktree and retains its contents until explicit cleanup.
-- Do not empty or stub an obsolete file merely to emulate its removal.
-- Request at most one quarantine operation in this response. Do not request it for tracked files,
-  directories, links, pre-existing files, or files outside the active write scope.
-"""
 
 _DEFAULT_CONTEXT_FILES = ["README.md"]
 _TESTABILITY_GAP_MARKER = "TESTABILITY GAP:"
@@ -978,6 +968,21 @@ class FixerAgent(BaseAgent):
             "test_write_paths": list(test_paths),
         }
 
+    def delivery_scope_test_change(self, path: str, before: str | None, after: str | None) -> bool:
+        """Classify audited writes using the same rules as test-failure recovery.
+
+        The caller must independently enforce the captured test-write roots.
+        Configuring a mixed source root for tests alone never classifies its
+        production contents as test-only.
+        """
+        return not _test_failure_production_writes(
+            [path],
+            self.project_config.get("sandbox", {}),
+            self.tools.get("build"),
+            {path: before},
+            {path: after},
+        )
+
     def run(self, state: TaskState) -> AgentResult:
         if not state.errors and not state.test_errors and not state.check_errors:
             return AgentResult(success=False, message="No errors in state to fix")
@@ -997,14 +1002,7 @@ class FixerAgent(BaseAgent):
         agent_cwd = Path(file_tool._root)
         test_origin_validation = _is_test_origin_validation_failure(state, sandbox, agent_cwd)
         uses_test_failure_triage = _uses_test_failure_triage(state, sandbox, agent_cwd)
-        quarantine_available = bool(
-            callable(self._quarantine_executor)
-            and state.delivery_plan_id
-            and state.delivery_unit_id
-            and state.delivery_write_scope_schema_version is not None
-            and state.worktree_path
-            and state.worktree_base
-        )
+        quarantine_available = bool(callable(self._quarantine_executor) and quarantine_run_eligible(state))
         triage_scope = None
         if test_origin_validation:
             triage_scope = "test_origin_validation"
@@ -1055,7 +1053,7 @@ class FixerAgent(BaseAgent):
                 allowed_write_paths=allowed_str,
                 build_tool_constraints=_write_agent_constraints(self.project_config),
                 test_constraint=test_constraint,
-                quarantine_constraint=_DELIVERY_QUARANTINE_CONSTRAINT if quarantine_enabled else "",
+                quarantine_constraint=QUARANTINE_CONSTRAINT if quarantine_enabled else "",
                 task_description=state.task_description,
                 delivery_constraint_context=delivery_context.inherited_constraints,
                 implementation_prompt=state.implementation_prompt or "(not available)",

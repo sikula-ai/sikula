@@ -7352,6 +7352,31 @@ mod tests {
 
 
 class TestOrchestratorInterruptResume:
+    @pytest.mark.parametrize("validation", ["disabled", "deferred", "per_step"])
+    def test_legacy_delivery_step_resume_keeps_cumulative_change_provenance(self, tmp_path, validation):
+        orch, _, _ = _make_orchestrator(
+            tmp_path,
+            run_build=validation != "disabled",
+            run_build_per_step=validation == "per_step",
+        )
+        _save_state(
+            orch,
+            implementation_prompt="Resume the implemented step",
+            plan_decided=True,
+            plan=["First step", "Second step"],
+            current_step=1,
+            step_implemented=True,
+            step_file_tracking_enabled=False,
+            files_changed=["src/retained.py"],
+            delivery_plan_id="plan",
+            delivery_unit_id="unit",
+            delivery_unit_budget={"max_planner_steps": 2},
+        )
+        result = orch.run(task_id="t1")
+        assert result.done and not result.failed and result.plan_completed
+        assert not result.step_file_tracking_enabled and not result.step_files_changed
+        assert result.files_changed == ["src/retained.py"]
+
     def test_resume_after_interrupt_between_fixer_and_reviewer_runs_review(self, tmp_path: Path):
         """Interrupt after fixer ran and flags were reset+saved, reviewer had not yet run.
         On resume, review_approved=False must cause reviewer to run."""

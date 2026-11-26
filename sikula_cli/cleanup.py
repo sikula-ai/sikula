@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 import sys
 
 from core import worktree as core_worktree
-from core.delivery_quarantine import DeliveryQuarantineError
+from core.delivery_quarantine import DeliveryQuarantineError, quarantine_prunable_paths
 from core.state import JsonStateStore
 from sikula_cli.config import _resolve_state_dir
 from tools.delivery_quarantine_tool import (
@@ -129,8 +129,9 @@ def _prune_absent_quarantine_paths(state, records: list[dict]) -> None:
     absent = _absent_quarantine_paths(state, records)
     if not absent:
         return
-    state.files_changed = [path for path in state.files_changed if path not in absent]
-    state.step_files_changed = [path for path in state.step_files_changed if path not in absent]
+    prunable = absent & quarantine_prunable_paths(state, records)
+    state.files_changed = [path for path in state.files_changed if path not in prunable]
+    state.step_files_changed = [path for path in state.step_files_changed if path not in prunable]
     state.test_files_written = [path for path in state.test_files_written if path not in absent]
 
 
@@ -216,15 +217,21 @@ def cmd_cleanup(args: argparse.Namespace, cfg: dict, context: CleanupContext | N
             for record in active_quarantine_records:
                 record["status"] = "cleaned"
             if interrupted_records:
+                for record in interrupted_records:
+                    if record.get("requested_by") == "implementer":
+                        record["recovery_pending"] = True
                 _prune_absent_quarantine_paths(state, interrupted_records)
                 state.build_synced = False
                 state.fixer_changed_code = True
                 state.delivery_no_change_outcome = None
                 state.review_approved = False
                 state.security_approved = False
-                state.review_iterations = 0
-                state.security_review_iterations = 0
+                if not any(record.get("requested_by") == "implementer" for record in interrupted_records):
+                    state.review_iterations = 0
+                    state.security_review_iterations = 0
                 state.tests_up_to_date = False
+                if state.review_mode == "review_fix" or state.review_diff:
+                    state.review_validation_pending = True
                 state.final_full_task_review_done = False
             state.record(
                 "sikula",

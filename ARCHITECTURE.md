@@ -21,7 +21,7 @@
 | `FixerAgent` | `agents/fixer_agent.py` | Runs the configured LLM as an autonomous agent to fix build or test errors |
 | `FileTool` | `tools/file_tool.py` | Read / write files; enforces sandbox whitelist for direct file-tool calls |
 | `GitTool` | `tools/git_tool.py` | `diff_head(paths=None)` — called by reviewer, security_reviewer, and test_writer agents to obtain the live diff when `state.review_diff` is not set; optional project-relative paths constrain the diff with literal Git pathspecs, while absolute and parent-traversing paths fail closed |
-| `DeliveryQuarantineTool` | `tools/delivery_quarantine_tool.py` | POSIX-only, descriptor-relative move of one audited agent-created ordinary-untracked delivery file into persistent private quarantine; physical removal is reserved for explicit cleanup/delete |
+| `DeliveryQuarantineTool` | `tools/delivery_quarantine_tool.py` | POSIX-only, descriptor-relative move of one audited agent-created ordinary-untracked file into persistent private quarantine; physical removal is reserved for explicit cleanup/delete |
 | `BuildTool` | `tools/base_tool.py` | **Abstract interface** for platform build systems — implement per platform |
 | `GradleBaseTool` | `tools/gradle_tool.py` | Shared Gradle mechanics (`_run`, `run_check`, `is_build_config_file`); subclassed by Android and JVM variants |
 | `AndroidGradleTool` | `tools/gradle_android_tool.py` | `BuildTool` implementation for Android / Gradle |
@@ -159,21 +159,25 @@ so a user's shell is not left inside a deleted tree. Shared git/worktree primiti
 as root detection, dirty checks, path containment, worktree removal, current-branch
 inspection, and commit resolution live in `core/worktree.py`; `sikula.py` keeps
 compatibility wrappers for existing tests and command contexts.
-If a delivery Fixer retained files in the task quarantine, dry-run output reports their
+If a Fixer or an Implementer review repair retained files in the task quarantine, dry-run output reports their
 bounded count and byte size. `--force` removes that exact task namespace and records the
 cleanup before state is retained or deleted. Quarantine lives under
 `<git-common-dir>/sikula/quarantine/<opaque-task-id>/`, so it is outside the assembled tree
-and survives child-worktree finalization until this explicit cleanup.
+and survives worktree finalization until this explicit cleanup.
 An interrupted `moving` record uses `cleanup --quarantine-only --force`. When its exact
 retained entry proves the rename completed, this removes only retained quarantine storage,
-preserves the child worktree and task state, marks semantic and validation gates stale,
+preserves the task worktree and state, marks semantic and validation gates stale,
 and leaves the failed state available for an explicit `run --task-id ... --reset-failed`
 resume. If the interruption preceded rename, the command fails closed and preserves the
 worktree because it cannot safely remove the original file. If cleanup removed retained
 storage before its state save, retry reconciles the `moving` record only when both the
 retained entry and original worktree path are absent; an existing or replacement worktree
 entry remains blocked. Completed post-rename cleanup also removes absent quarantined paths
-from net change tracking before resume.
+from net change tracking before resume. Recovery of an Implementer review repair
+preserves its consumed review, security and build counters through `--reset-failed`.
+Interrupted Implementer moves retain a `recovery_pending` control flag on the cleaned
+quarantine record until the orchestrator re-enters the pipeline; ordinary later failures
+keep the existing explicit-reset behavior.
 
 **Status/show/summary commands:** `sikula status`, `sikula show`, and
 `sikula summary` parser registration
@@ -3467,9 +3471,42 @@ Build, test, sync, and check error blobs are diagnostic excerpts, not plain tail
 preserves failure-marker blocks from long command output so the fixer still sees the concrete
 compiler diagnostic, failing test, assertion, panic, traceback, or tool error even when the
 build tool prints many lines after the failure.
-For modern isolated delivery children on supported POSIX filesystems, a Fixer
-in an ordinary pass or a `production_confirmed` triage pass may request one
-`quarantine_untracked` operation in its structured output. The provider call
+For isolated standalone tasks and modern delivery children on supported POSIX
+filesystems, a Fixer in an ordinary or `production_confirmed` triage pass, or an
+Implementer addressing semantic/security review findings, may request one
+`quarantine_untracked` operation in its structured output. Initial Implementer
+calls collect provenance but do not receive removal authority. Standalone calls
+use the configured sandbox write scope; delivery calls retain their effective unit
+scope. Delivery retains its required scope audit, private pending markers and
+interruption recovery. Standalone uses an optional process-local observation around
+each physical provider attempt to establish removal authority. It reuses sparse
+snapshots and scope checks; it does not persist a delivery audit baseline or add a
+whole-tree content snapshot. Ordinary clean tracked files are not added merely
+to enable quarantine; existing test-classification content requirements and
+platform-owned ignored build-output exclusions remain in effect. The separate
+pre-attempt inode inventory still includes excluded files without reading their
+contents, preventing their adoption as newly created files.
+Standalone Fixer observation uses Fixer's existing test-change classifier only
+after checking membership in the captured test-write scope. Configuring a mixed
+source root for tests does not by itself authorize arbitrary production changes;
+mixed-source exceptions still require the build-tool hook. Delivery retains its
+existing stricter unit-scope classification.
+A failed provider attempt or unavailable observation revokes all quarantine
+candidates. Changed ignore rules, including `.gitignore` in an excluded build
+directory, invalidate the observation rather than stopping an otherwise successful
+standalone call. A quarantine request without a certified observation is rejected.
+Git/reference/ignore bindings and exact write policy must remain valid to certify
+an attempt; an observed scope violation still stops the run, except that standalone
+test-only Fixer passes retain their existing rollback and bounded retry. Their
+violation is recorded and quarantine authority revoked before Fixer recovery;
+restore failure or a repeated violation remains terminal. The observation is
+not a replacement for the existing sandbox or a promise of full delivery-style
+scope enforcement when evidence is unavailable. Ordinary authorized ignore edits
+and ignored generated outputs keep their existing standalone behavior.
+Quarantine moves in both modes retain the same durable `moving` record, completion
+record and cleanup/recovery protocol. Losing process-local observation state never
+restores removal authority and never clears an interrupted move.
+The provider call
 does not execute the mutation. After that call passes the provider-independent scope audit,
 the orchestrator consumes its exact captured write policy and current-process provenance;
 `DeliveryQuarantineTool` then moves the matching ordinary-untracked, single-link regular
@@ -3494,21 +3531,57 @@ the tool rechecks its exact identity, contents, mode, ordinary-untracked status
 and unchanged Git binding. Only a successful recheck permits the orchestrator
 to restore current-process provenance alongside the durable `aborted` record
 and retry the move once without another provider call. Each move has its own
-intent and audit record. Repeated failure stops the Fixer; uncertain moves,
+intent and audit record. Repeated failure stops the requesting agent; uncertain moves,
 changed evidence and intent/completion persistence failures do not grant a retry.
 The intent is persisted before the move and completion is
-persisted immediately afterward, invalidating build sync and semantic gates like any other
-Fixer change. Clean quarantined paths are removed from the net `files_changed` projection;
-their audit remains in `delivery_quarantine_records`. An interrupted `moving` record blocks
-resume until explicit cleanup confirms that the retained entry exists. Standard,
-non-isolated and Windows Fixer runs never receive or parse this protocol.
+persisted immediately afterward, invalidating build sync and affected pipeline gates.
+The intent also reconciles all project writes observed in the requesting provider
+attempt and classifies their build-sync requirements. Completion invalidates gates
+for those writes together with the quarantined path, so interruption cannot lose a
+configuration change merely because the removed file is ordinary source.
+An Implementer removal-only review repair counts as a mutation and invalidates
+semantic/security approval, test freshness and final full-task review without
+resetting consumed review, security or build budgets. Security repair retains the
+consumed semantic-review count throughout its provider call and any interrupted
+quarantine; the usual semantic allowance reset applies only after successful repairs
+that did not quarantine a file. Failed Implementer file-operation requests with
+retained writes also invalidate these gates before the task stops, so resume cannot
+reuse test freshness from before those writes. A request can consume only
+the current agent invocation's successful physical-attempt audit; a previous
+invocation cannot supply its authority. Review-fix mutations also set durable
+`review_validation_pending`. The unchanged-review fast path cannot bypass it on
+resume, including after `--reset-failed` or interrupted-quarantine cleanup. It is
+cleared only at successful completion of the configured validation pipeline, not
+by reviewer approval or a passing compile check alone. A fresh unchanged review
+keeps its existing validation-skipping behavior.
+When standalone observation rejects a provider's scope, observed project-relative
+mutations are reconciled into file tracking and invalidate these gates before the
+stop is persisted, even if the agent never returns its changed-file result.
+Repair counters remain consumed. Test-only Fixer attempts instead retain their
+existing rollback-and-retry ownership of rejected writes.
+Clean quarantined paths are removed from the net `files_changed` projection;
+their audit remains in `delivery_quarantine_records`. For `review --fix`, provenance
+and the durable move record retain whether the path belonged to the original
+review changes before its creation. New paths disappear from net tracking, while
+original branch changes (including deletions temporarily recreated by an agent)
+remain through quarantine, interrupted-audit recovery and cleanup.
+An interrupted `moving` record blocks
+resume until explicit cleanup confirms that the retained entry exists. Non-isolated
+runs and unsupported platforms (including Windows) never receive or parse this protocol.
+Existing `delivery_quarantine_*` state fields retain their names and types and hold
+both standalone and delivery audit records; no state migration is needed.
 The `test_only` and `test_only_retry` triage passes also never advertise or execute
 quarantine: their writes may still be rejected and restored. A subsequent
 `production_confirmed` pass uses its own freshly audited write scope; requests
 from preceding passes are never carried forward. Quarantined bytes are not unlinked
 by the pipeline. A delivery child or current planner step whose only changes were
 quarantined cannot complete unless its Implementer supplied the existing
-parser-validated `already_satisfied` outcome.
+parser-validated `already_satisfied` outcome. The step-completion check applies even
+when build validation is deferred to the end of the plan or disabled.
+Legacy resumed plans without per-step change tracking retain their cumulative
+completion check. Quarantine within such a delivery planner step is unavailable:
+the current step's remaining changes cannot be established. Final full-task
+quarantine uses cumulative change tracking and remains eligible.
 For test failures, and for build/check failures whose diagnostics reference only test files
 or recognized test targets, the fixer is explicitly told to decide whether the failure is
 caused by production behaviour or by an incorrect/stale test. Target-only diagnostics are
@@ -3692,7 +3765,7 @@ Sikula processes at once is still unsupported.
 | `delivery_effective_write_paths` | `list[str]` | `delivery run-next` / `cmd_run()` | Canonical project-relative production paths resolved from configured write scope and unit scope before child creation. They are the persisted upper bound for fresh and resumed child runtime; the current configured production policy may narrow but never expand them. This private audit snapshot is not added to ordinary delivery output. |
 | `delivery_effective_write_exact_file_paths` | `list[str] \| None` | `delivery run-next` / `cmd_run()` | Schema-v2 subset that preserves exact-file semantics in the persisted upper bound. Runtime construction stops if an entry is missing or has become a directory in the authoritative child tree. |
 | `delivery_runtime_write_scope_binding` | `dict \| None` | `cmd_run()` | Versioned immutable post-assembly production-scope binding. A `bound` value stores canonical lexical roots together with their resolved project-relative identities and exact-file kinds; a `denied` value records failed initial construction. Resume validates the original identities and can derive only a narrower active scope without replacing the binding. Children stopped before binding keep `None`; amendment evidence then uses their captured creation-time upper bound. |
-| `delivery_scope_audit_pending` | `dict \| None` | Orchestrator | Dedicated versioned control marker containing the active delivery write actor (Implementer/Fixer or an allowlisted deterministic mutation phase), authoritative project prefix, immutable pre-call Git commit ID, absolute Git/common-directory bindings, Git-reference and Git-ignore fingerprints, typed lexical and resolved production roots, and lexical and resolved Fixer test-write roots authorized for that invocation. It is persisted before the private sparse worktree baseline and cleared only after the post-mutation or resume audit result is saved. Resume accepts only the current complete marker schema, verifies that Git discovery and reference authority still match those bindings, computes Git candidates against the saved commit, audits its immutable policy before applying current runtime-scope changes, and never derives or broadens authority from current `HEAD`, errors, config, filesystem aliases, or `active_operation`; malformed, incomplete, unsupported, unavailable, retargeted, mutated-ref, or orphaned marker/baseline state fails closed. |
+| `delivery_scope_audit_pending` | `dict \| None` | Orchestrator | Dedicated versioned control marker containing the active audited write actor (Implementer/Fixer or an allowlisted deterministic mutation phase), authoritative project prefix, immutable pre-call Git commit ID, absolute Git/common-directory bindings, Git-reference and Git-ignore fingerprints, typed lexical and resolved production roots, and lexical and resolved Fixer test-write roots authorized for that invocation. It is persisted before the private sparse worktree baseline and cleared only after the post-mutation or resume audit result is saved. Resume accepts only the current complete marker schema, verifies that Git discovery and reference authority still match those bindings, computes Git candidates against the saved commit, audits its immutable policy before applying current runtime-scope changes, and never derives or broadens authority from current `HEAD`, errors, config, filesystem aliases, or `active_operation`; malformed, incomplete, unsupported, unavailable, retargeted, mutated-ref, or orphaned marker/baseline state fails closed. |
 | `delivery_quarantine_candidates` | `list[dict]` | Delivery scope audit / Orchestrator | Current-process, bounded quarantine authority for ordinary-untracked regular files first observed after a successful Implementer or Fixer provider attempt. Each record binds a project-relative path to digest, mode, filesystem identity, and a random process-session token stored only in private task state. A new process uses a different token and clears the list, failed or violating attempts cannot mint authority, and starting a move consumes the matching record before filesystem mutation. |
 | `delivery_quarantine_records` | `list[dict]` | Orchestrator / cleanup | Durable audit and cleanup state for requested file quarantine. `moving` is saved before rename and blocks resume after interruption; an in-process failure known to leave the source unmoved or successfully restored changes it to non-blocking `aborted`. Quarantine-only cleanup changes `moving` to `cleaned` when the exact retained entry proves rename completed, or when an idempotent retry finds both the retained entry and original worktree path absent after cleanup. An existing original path remains blocked. `quarantined` proves the bytes were moved outside the worktree and semantic gates were invalidated; explicit forced cleanup/delete removes storage for `aborted` or retained records and changes them to `cleaned`. Records contain bounded path and file metadata, never file contents or the private storage path. |
 | `delivery_handoff_schema_version` | `int \| None` | `delivery run-next` / `cmd_run()` | Required schema marker on delivery children. Standalone tasks keep `None`; completed units with no child execution do not require handoff artifacts. |
@@ -3735,6 +3808,7 @@ Sikula processes at once is still unsupported.
 | `llm_usage_records` | `list[dict]` | `core/retry_history.py` / built-in LLM clients | Append-only, content-free record for each physical provider invocation attempt made while an agent is attached to task state. Records contain bounded agent/provider/model/operation identifiers, attempt relationship, outcome, elapsed time, input/output character counts when measurable, and optional structured provider-reported token counts. They never contain prompts, provider output, source excerpts, paths, credentials, or estimated tokens/costs, and never drive pipeline behavior. |
 | `review_diff` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / Orchestrator | PR-style diff passed to ReviewerAgent and SecurityReviewerAgent; initially set to `git diff base...branch` (three-dot) in `sikula review` mode; refreshed in `"review_fix"` mode before reviewer/security-reviewer calls so uncommitted fixes are included; `None` in standard `sikula run` flow (agents fall back to `GitTool.diff_head()`) |
 | `review_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Review task kind: `"review_report"` for report-only review (not reset or resumable) or `"review_fix"` for `sikula review --fix` (resumable via `sikula run --task-id`) |
+| `review_validation_pending` | `bool` | Orchestrator / quarantine recovery | Review-fix mutations still require configured validation; survives reset/resume and blocks the unchanged-review fast path until successful completion. Defaults to false for older state files. |
 | `review_base_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Base branch used to refresh `review_diff` in `"review_fix"` mode. Report-only review keeps the original frozen diff; review-fix refreshes against the merge base before reviewer/security-reviewer calls so fixes are reviewed against the current branch state. |
 | `review_delivery_mode` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` / `cmd_run()` in `sikula_cli/run.py` | Review-fix delivery strategy metadata. `None` for report-only review, normal `--branch` review-fix, and standard task runs. `"current_branch"` for `sikula review --fix --current-branch`; this tells resume/finalization to deliver the isolated fix commit back to the originally current branch instead of treating `worktree_branch` as a checked-out delivery branch. |
 | `review_target_branch` | `str \| None` | `cmd_review()` in `sikula_cli/review.py` | Named branch that was current when `--current-branch` started. Delivery and retry require the operator's checkout to still be on this branch before fast-forwarding or declaring a no-change result. |
@@ -3779,7 +3853,7 @@ Sikula processes at once is still unsupported.
 | `current_step` | `int` | Orchestrator | Index into `plan`; advances after each step completes its implement/review/security/test-write phases. With `run_build_per_step: true`, each step also passes build/fix before advancing; otherwise build/fix is deferred until all steps are complete. |
 | `step_implemented` | `bool` | Orchestrator | Set True after implementer succeeds for the current step; reset on step transition; guards re-runs on resume |
 | `step_file_tracking_enabled` | `bool` | Orchestrator | True only after the current Sikula version successfully creates a multi-step plan. Distinguishes trusted per-step file provenance from legacy resumed plans, which safely retain the default False and use complete TestWriter change context. |
-| `step_files_changed` | `list[str]` | Orchestrator | De-duplicated paths reported or adopted during the current planner step; reset on step transition. Used only to scope TestWriterAgent's current-step file list and live diff. It does not replace cumulative `files_changed`, and final full-task gates ignore it. |
+| `step_files_changed` | `list[str]` | Orchestrator | De-duplicated paths reported or adopted during the current planner step; reset on step transition. When per-step tracking is enabled, scopes TestWriterAgent's current-step file list and live diff and checks for a net implementation change at delivery step completion. It does not replace cumulative `files_changed`, and final full-task gates ignore it. |
 | `pid` | `int \| None` | `Orchestrator.run()` | PID of the orchestrator process; set at the start of every run (including resume); used by `sikula status` to detect interrupted tasks. A fresh `active_operation` heartbeat takes precedence when the PID is not visible across process namespaces; otherwise, if the PID is no longer running, status shows `INTERRUPTED`. |
 | `created_at` | `str` | `StateStore.create()` | ISO-8601 UTC timestamp set once at task creation; never overwritten |
 | `updated_at` | `str` | `JsonStateStore.save()` | ISO-8601 UTC timestamp refreshed on every save; reflects last mutation |

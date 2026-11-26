@@ -1191,11 +1191,16 @@ def _reset_failed_state(task_id: str, cfg: dict, store) -> None:
     # Reset iteration counters so their loops are not immediately blocked on resume.
     # review_approved, security_approved, and tests_up_to_date are intentionally kept —
     # if review/security already passed or tests were written, those phases should not run again.
-    state.review_iterations = 0
-    state.security_review_iterations = 0
-    state.build_iterations = 0
-    state.build_loop_key = None
-    state.build_loop_start_iteration = 0
+    from core.delivery_quarantine import quarantine_recovery_preserves_budgets
+
+    # Quarantine recovery resumes an already-consumed repair; it is not a new budget.
+    # Keep this protection until the orchestrator actually enters the pipeline.
+    if not quarantine_recovery_preserves_budgets(state.delivery_quarantine_records):
+        state.review_iterations = 0
+        state.security_review_iterations = 0
+        state.build_iterations = 0
+        state.build_loop_key = None
+        state.build_loop_start_iteration = 0
     # Clear pending error blobs so the fixer doesn't see stale errors from before the
     # failure if the build re-fails on the first resumed iteration.
     state.errors.clear()

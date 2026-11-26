@@ -550,10 +550,21 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   Missing re-triage output after another generated-test edit should be recoverable by
   restoring that pass and retrying once before validation is run again; a repeated omission
   should remain auditable without blocking an otherwise valid task solely on prompt format.
-- **Delivery Fixer quarantine** is the only supported removal path for ordinary-untracked
-  files created by a successful, provider-independent audited attempt in the current
-  process. It is offered only to modern isolated delivery children on platforms with
-  descriptor-relative no-follow filesystem operations. It is also available in Fixer's
+- **Agent-created file quarantine** is the only supported removal path for ordinary-untracked
+  files created by a successful, provider-independent audited Implementer or Fixer attempt
+  in the current process. It is offered to isolated standalone tasks and modern delivery
+  children on platforms with descriptor-relative no-follow filesystem operations.
+  Standalone authorization uses the configured sandbox scope; delivery children retain
+  their effective unit scope. Both require a certified provider attempt and use the
+  same quarantine tool. Standalone observation is process-local and optional for
+  ordinary execution: missing evidence or changed ignore rules revoke removal
+  authority without replacing sandbox enforcement. Delivery's required scope audit
+  and its durable recovery remain unchanged.
+  The Implementer may request it only while addressing semantic or security review
+  findings, never during initial implementation or for test files/configured test-write paths.
+  Removal-only repairs count as changes
+  and invalidate validation and approval gates without resetting consumed review,
+  security or build budgets. It is also available in Fixer's
   `production_confirmed` pass after test-failure or test-origin validation triage,
   bound to that pass's successful provider audit. It remains unavailable in
   `test_only` and `test_only_retry` passes, whose writes may still be restored.
@@ -565,11 +576,13 @@ Each agent has a fixed scope — crossing it silently breaks the pipeline:
   quarantine under the repository Git common directory. The pipeline must not unlink the
   content. Only explicit forced `cleanup`/`delete` removes the retained quarantine.
   Quarantine-only cleanup may clear an interrupted `moving` state only when its exact
-  retained entry proves that rename completed. It preserves the child worktree and
+  retained entry proves that rename completed. It preserves the task worktree and
   conservatively invalidates its pipeline gates. A pre-rename interruption must remain
   blocked because cleanup cannot safely remove the original worktree file. Quarantine must
   not let a delivery child or current planner step complete with neither a net
   implementation diff nor an explicit parser-validated `already_satisfied` outcome.
+  This check is independent of build timing. Interrupted Implementer quarantine
+  recovery must preserve consumed repair budgets through cleanup and `--reset-failed`.
   This reversible operation reduces accidental-loss risk but is not an OS isolation
   boundary against an adversarial concurrent process running as the same user.
 - **`ReviewerAgent` and `SecurityReviewerAgent`** must never write files — use `run_readonly_agent()` only.
